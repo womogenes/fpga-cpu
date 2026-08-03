@@ -5,6 +5,7 @@
 
 #define DDR_DATA __attribute__((section(".ddr.data")))
 #define DDR_BSS __attribute__((section(".ddr.bss")))
+#define DDR_NOINIT __attribute__((section(".ddr.noinit")))
 
 void uart_init(void);
 int puts(const char* string);

@@ -6,9 +6,10 @@ TARGET ?= $(notdir $(CURDIR))
 CROSS_COMPILE ?= riscv64-elf-
 CC := $(CROSS_COMPILE)gcc
 OBJCOPY := $(CROSS_COMPILE)objcopy
+OPTIMIZATION ?= -Os
 
 CFLAGS := \
-	-std=gnu99 -Os -g3 \
+	-std=gnu99 $(OPTIMIZATION) -g3 \
 	-march=rv32i2p0_m -mabi=ilp32 \
 	-D__vexriscv__ \
 	-ffreestanding -fno-builtin -fno-stack-protector \

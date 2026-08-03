@@ -111,6 +111,15 @@ SECTIONS
 		. = ALIGN(8);
 		_eddr_bss = .;
 	} > program_data
+
+	.ddr_noinit (NOLOAD) :
+	{
+		. = ALIGN(8);
+		_fddr_noinit = .;
+		*(.ddr.noinit .ddr.noinit.*)
+		. = ALIGN(8);
+		_eddr_noinit = .;
+	} > program_data
 }
 
 PROVIDE(_fstack = ORIGIN(sram) + LENGTH(sram));
@@ -118,7 +127,7 @@ PROVIDE(_fdata_rom = LOADADDR(.data));
 PROVIDE(_edata_rom = LOADADDR(.data) + SIZEOF(.data));
 PROVIDE(_fddr_data_rom = LOADADDR(.ddr_data));
 PROVIDE(_eddr_data_rom = LOADADDR(.ddr_data) + SIZEOF(.ddr_data));
-PROVIDE(_program_data_free = ALIGN(_eddr_bss, 16));
+PROVIDE(_program_data_free = ALIGN(_eddr_noinit, 16));
 PROVIDE(_program_data_end = ORIGIN(program_data) + LENGTH(program_data));
 
 ASSERT(_end <= ORIGIN(sram) + LENGTH(sram),
@@ -127,3 +136,5 @@ ASSERT(_eddr_data_rom <= ORIGIN(program) + LENGTH(program),
        "Program image exceeds the 128 MiB program region")
 ASSERT(_eddr_bss <= ORIGIN(program_data) + LENGTH(program_data),
        "DDR data exceeds the 894 MiB program-data region")
+ASSERT(_eddr_noinit <= ORIGIN(program_data) + LENGTH(program_data),
+       "DDR no-init data exceeds the 894 MiB program-data region")

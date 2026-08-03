@@ -27,9 +27,14 @@ Normal globals continue to use BRAM, so small frequently accessed state and the 
 ```c
 static uint8_t grid[1280 * 720] DDR_BSS;
 static uint32_t palette[] DDR_DATA = {0x00000000, 0x0000ffff};
+static uint32_t scratch[1280 * 720] DDR_NOINIT;
 ```
 
 `DDR_BSS` occupies no space in the uploaded binary and is cleared by `crt0.S`. `DDR_DATA` stores its initial value compactly in the program image; `crt0.S` copies it into the DDR data region before calling `main()`. The linker exports `_program_data_free` and `_program_data_end` for a future heap or manual arena after the explicitly allocated DDR objects.
+
+`DDR_NOINIT` also occupies no space in the uploaded binary, but startup does not
+clear it. Use it for large scratch buffers whose contents are always overwritten
+before being read.
 
 ## Shared runtime helpers
 
