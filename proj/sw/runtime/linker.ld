@@ -15,8 +15,7 @@ SECTIONS
 	.text :
 	{
 		_ftext = .;
-		*crt0*(.text)
-		KEEP(*crt0*(.text))
+		KEEP(*crt0*(.text .text.*))
 		KEEP(*(.text.isr))
 		*(.text .stub .text.* .gnu.linkonce.t.*)
 		_etext = .;
@@ -134,7 +133,9 @@ ASSERT(_end <= ORIGIN(sram) + LENGTH(sram),
        "BRAM globals exceed the 8 KiB SRAM region")
 ASSERT(_eddr_data_rom <= ORIGIN(program) + LENGTH(program),
        "Program image exceeds the 128 MiB program region")
-ASSERT(_eddr_bss <= ORIGIN(program_data) + LENGTH(program_data),
-       "DDR data exceeds the 894 MiB program-data region")
-ASSERT(_eddr_noinit <= ORIGIN(program_data) + LENGTH(program_data),
-       "DDR no-init data exceeds the 894 MiB program-data region")
+ASSERT(_program_data_end <= ORIGIN(program_data) + LENGTH(program_data),
+       "Application program-data limit exceeds the DDR region")
+ASSERT(_eddr_bss <= _program_data_end,
+       "DDR data exceeds the application program-data limit")
+ASSERT(_eddr_noinit <= _program_data_end,
+       "DDR no-init data exceeds the application program-data limit")

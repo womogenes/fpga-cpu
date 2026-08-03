@@ -1,8 +1,12 @@
+.DEFAULT_GOAL := all
+
 BUILD_DIR ?= ../../build/fpga_soc
 OUTPUT_DIR ?= build
 RUNTIME_DIR := ../runtime
 TARGET ?= $(notdir $(CURDIR))
 EXTRA_OBJECTS ?=
+EXTRA_CFLAGS ?=
+EXTRA_LDFLAGS ?=
 USE_LIBC ?= 0
 
 CROSS_COMPILE ?= riscv64-elf-
@@ -19,7 +23,8 @@ CFLAGS := \
 	-ffunction-sections -fdata-sections \
 	-Wall -Wextra -Wstrict-prototypes \
 	-I$(BUILD_DIR)/software/include \
-	-I$(RUNTIME_DIR)/include
+	-I$(RUNTIME_DIR)/include \
+	$(EXTRA_CFLAGS)
 
 LDFLAGS := \
 	$(ARCH_FLAGS) \
@@ -27,7 +32,8 @@ LDFLAGS := \
 	-Wl,--no-dynamic-linker \
 	-Wl,--build-id=none \
 	-Wl,--gc-sections \
-	-L$(BUILD_DIR)/software/include
+	-L$(BUILD_DIR)/software/include \
+	$(EXTRA_LDFLAGS)
 
 ELF := $(OUTPUT_DIR)/$(TARGET).elf
 BIN := $(OUTPUT_DIR)/$(TARGET).bin

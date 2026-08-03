@@ -1,4 +1,7 @@
-.PHONY: all setup build gateware diagnostic software framebuffer-demo flash load monitor upload sync clean
+UART_BAUD ?= 3000000
+UART_FIFO_DEPTH ?= 512
+
+.PHONY: all setup build gateware diagnostic software framebuffer-demo text-demo micropython-repl bad-apple flash load monitor upload sync clean
 
 # Allow `make upload <program>` while retaining `make upload` as a shorthand
 # for framebuffer_demo. The second command-line goal is a selector, not a
@@ -25,7 +28,7 @@ setup:
 build: gateware
 
 gateware:
-	./tools/build.sh
+	UART_BAUD="$(UART_BAUD)" UART_FIFO_DEPTH="$(UART_FIFO_DEPTH)" ./tools/build.sh
 
 diagnostic:
 	PATH="$(CURDIR)/.venv/bin:$(PATH)" .venv/bin/python hdl/diagnostics/hdmi_colorbars.py
@@ -33,6 +36,15 @@ diagnostic:
 
 software framebuffer-demo:
 	$(MAKE) -C sw/framebuffer_demo
+
+text-demo:
+	$(MAKE) -C sw/text_demo
+
+micropython-repl:
+	$(MAKE) -C sw/micropython_repl
+
+bad-apple:
+	$(MAKE) -C sw/bad_apple
 
 flash load:
 	./tools/load.sh
@@ -47,4 +59,4 @@ sync:
 	./tools/sync.sh
 
 clean:
-	$(RM) -r build sw/framebuffer_demo/build
+	$(RM) -r build sw/framebuffer_demo/build sw/text_demo/build sw/micropython_repl/build sw/bad_apple/build

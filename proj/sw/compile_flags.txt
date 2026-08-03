@@ -1,5 +1,11 @@
 --target=riscv32-unknown-elf
+--sysroot=/usr/riscv64-elf
 -std=gnu99
 -D__vexriscv__
 -I../build/fpga_soc/software/include
 -Iruntime/include
+-Itext_console/include
+-Imicropython_repl
+-Imicropython_repl/vendor/micropython
+-Imicropython_repl/build
+-DMICROPY_FLOAT_IMPL=MICROPY_FLOAT_IMPL_FLOAT

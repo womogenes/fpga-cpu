@@ -33,7 +33,7 @@ make setup
 - Cached VexRiscv instruction and data buses
 - 1280x720 at 60 Hz HDMI output
 - RGB565 framebuffer at `0x7fe00000`
-- LiteX BIOS and UART serial boot at 115200 baud
+- LiteX BIOS and UART serial boot at up to 3 Mbaud
 
 Physical SW0 selects the HDMI source: down shows hardware color bars and up shows the DDR framebuffer. The Genesys 2 platform's switch resource numbering is reversed, so physical SW0 is `user_sw[7]` in the gateware.
 
@@ -102,9 +102,29 @@ To upload another program from `sw/<program>/build/<program>.bin`:
 make upload game_of_life
 ```
 
+The MicroPython UART and HDMI REPL is built with a software-only target:
+
+```sh
+make micropython-repl
+make upload micropython_repl
+```
+
+This reuses the existing generated SoC headers and does not invoke Vivado or
+rebuild the FPGA bitstream.
+
 After connecting, type `reboot` and press Enter to make the BIOS request the new image. `make upload` without a program continues to select `framebuffer_demo`.
 
-Both commands remain attached as serial monitors until interrupted with Ctrl-C. The UART defaults to `/dev/ttyUSB0` at 115200 baud. Override it with, for example, `LITEX_UART=/dev/ttyUSB1 make monitor` or `LITEX_BAUD=1000000 make monitor`.
+Both commands remain attached as serial monitors until interrupted with Ctrl-C.
+The UART defaults to `/dev/ttyUSB0`. After a successful gateware build, its
+baud rate is recorded in `build/fpga_soc/uart_baud`, and the monitor and
+uploader use that rate automatically. Without that file they retain the legacy
+115200-baud default. Override either setting with, for example,
+`LITEX_UART=/dev/ttyUSB1 make monitor` or
+`LITEX_BAUD=1000000 make monitor`.
+
+New gateware builds default to the FT232R's maximum 3 Mbaud rate. Override it
+when building with `make gateware UART_BAUD=1000000`. The FPGA bitstream and
+host terminal must use the same baud rate.
 
 Framebuffer writers must call `flush_cpu_dcache()` and `flush_l2_cache()` after drawing so the independent video DMA sees the new pixels.
 
@@ -146,10 +166,13 @@ The loader uses `openFPGALoader -b genesys2 --freq 1000000`. Loading is volatile
 
 ## Remote workflow
 
-Mirror this project, including generated gateware and C binaries, to thinkmax:
+Synchronize the software tree, including compiled C binaries, to thinkmax:
 
 ```sh
 make sync
 ```
 
-`.venv`, editor state, and Python caches are not copied. On the remote host, run `cd ~/fpga/fpga-cpu && make setup` once, then use `make flash` and `make upload` from that directory. Set `REMOTE_PROJECT=user@host:path/ make sync` to use another destination.
+Only `proj/sw/` is updated; gateware, tools, and `proj/cva6/` are untouched.
+Python caches are not copied. The remote project checkout and tools must already
+exist. On the remote host, run `cd ~/fpga/fpga-cpu` and use `make upload`.
+Set `REMOTE_PROJECT=user@host:path/ make sync` to use another project root.

@@ -16,6 +16,24 @@ make text-demo
 make upload text_demo
 ```
 
+The UART-driven MicroPython REPL is also a software-only target:
+
+```sh
+make micropython-repl
+make upload micropython_repl
+```
+
+The Bad Apple demo converts and embeds a monochrome video, then loops it at 30 fps:
+
+```sh
+make bad-apple
+make upload bad_apple
+```
+
+Neither target invokes Vivado or rebuilds gateware. Both use the shared
+`sw/text_console` renderer; MicroPython accepts input from UART and mirrors its
+output to UART and HDMI.
+
 Its checked-in Spleen BDF is converted to a packed bitmap during the build and
 linked into the program as a read-only object. Set `FONT_SCALE` at compile time
 to enlarge each font pixel, for example `make -C sw/text_demo FONT_SCALE=2`.

@@ -21,7 +21,7 @@ int uart_write(const char* data, unsigned int length) {
   return (int)length;
 }
 
-int puts(const char* string) {
+__attribute__((weak)) int puts(const char* string) {
   while (*string != '\0') uart_putchar(*string++);
   uart_putchar('\r');
   uart_putchar('\n');

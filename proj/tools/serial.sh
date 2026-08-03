@@ -4,7 +4,12 @@ set -euo pipefail
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 litex_term="$project_dir/.venv/bin/litex_term"
 device="${LITEX_UART:-/dev/ttyUSB0}"
-speed="${LITEX_BAUD:-115200}"
+baud_file="$project_dir/build/fpga_soc/uart_baud"
+default_speed=115200
+if [[ -f "$baud_file" ]]; then
+    read -r default_speed < "$baud_file"
+fi
+speed="${LITEX_BAUD:-$default_speed}"
 
 if [[ ! -x "$litex_term" ]]; then
     echo "litex_term not found: $litex_term" >&2
