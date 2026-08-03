@@ -1,4 +1,4 @@
-.PHONY: all setup build gateware diagnostic software framebuffer-demo flash load upload sync clean
+.PHONY: all setup build gateware diagnostic software framebuffer-demo flash load monitor upload sync clean
 
 # Allow `make upload <program>` while retaining `make upload` as a shorthand
 # for framebuffer_demo. The second command-line goal is a selector, not a
@@ -36,6 +36,9 @@ software framebuffer-demo:
 
 flash load:
 	./tools/load.sh
+
+monitor:
+	./tools/serial.sh
 
 upload:
 	PROGRAM="$(PROGRAM)" ./tools/upload.sh

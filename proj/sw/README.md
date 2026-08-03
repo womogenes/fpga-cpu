@@ -2,12 +2,12 @@
 
 Applications are freestanding C programs. They do not use a hosted C library or operating system, so their APIs come from two places:
 
-| Source | Included header | What it provides |
-| ------ | --------------- | ---------------- |
-| `sw/runtime` | `runtime.h` | Project-owned UART and cache helpers |
+| Source         | Included header   | What it provides                                       |
+| -------------- | ----------------- | ------------------------------------------------------ |
+| `sw/runtime`   | `runtime.h`       | Project-owned UART and cache helpers                   |
 | Gateware build | `generated/csr.h` | Inline accessors for hardware control/status registers |
-| Gateware build | `generated/mem.h` | Memory-region addresses and sizes |
-| Gateware build | `generated/soc.h` | SoC configuration constants such as cache sizes |
+| Gateware build | `generated/mem.h` | Memory-region addresses and sizes                      |
+| Gateware build | `generated/soc.h` | SoC configuration constants such as cache sizes        |
 
 The generated headers live under `build/fpga_soc/software/include/generated/`. `make gateware` recreates them from the hardware defined in `hdl/soc.py`; applications should include them but must not edit them.
 
@@ -15,12 +15,12 @@ The generated headers live under `build/fpga_soc/software/include/generated/`. `
 
 The linker divides DDR into non-overlapping instruction, application-data, and framebuffer regions while retaining the small, fast BRAM SRAM:
 
-| Region | Address range | Capacity | Default contents |
-| ------ | ------------- | -------- | ---------------- |
-| BRAM SRAM | `0x10000000`–`0x10001fff` | 8 KiB | Ordinary `.data`, `.bss`, and stack |
-| Program | `0x40000000`–`0x47ffffff` | 128 MiB | Startup, instructions, constants, and initial values |
-| DDR program data | `0x48000000`–`0x7fdfffff` | 894 MiB | Explicit large initialized and zero-initialized objects |
-| Framebuffer reservation | `0x7fe00000`–`0x7fffffff` | 2 MiB | 1280x720 RGB565 image plus alignment padding |
+| Region                  | Address range             | Capacity | Default contents                                        |
+| ----------------------- | ------------------------- | -------- | ------------------------------------------------------- |
+| BRAM SRAM               | `0x10000000`–`0x10001fff` | 8 KiB    | Ordinary `.data`, `.bss`, and stack                     |
+| Program                 | `0x40000000`–`0x47ffffff` | 128 MiB  | Startup, instructions, constants, and initial values    |
+| DDR program data        | `0x48000000`–`0x7fdfffff` | 894 MiB  | Explicit large initialized and zero-initialized objects |
+| Framebuffer reservation | `0x7fe00000`–`0x7fffffff` | 2 MiB    | 1280x720 RGB565 image plus alignment padding            |
 
 Normal globals continue to use BRAM, so small frequently accessed state and the stack remain fast. They must collectively fit in 8 KiB. Put large objects in DDR with the attributes from `runtime.h`:
 
@@ -74,13 +74,13 @@ writes `1` to the `enable` register on the `video_framebuffer_vtg` module. These
 
 The framebuffer DMA continuously reads RGB565 pixels from DDR and feeds the HDMI pixel pipeline.
 
-| Accessor stem | Meaning |
-| ------------- | ------- |
-| `video_framebuffer_dma_base` | DDR byte address at which the image begins; defaults to `VIDEO_FRAMEBUFFER_BASE` (`0x7fe00000`) |
-| `video_framebuffer_dma_length` | Number of bytes read per pass; defaults to 1,843,200 bytes for 1280 x 720 RGB565 |
-| `video_framebuffer_dma_enable` | Writing `1` starts reads; writing `0` stops and resets DMA progress |
-| `video_framebuffer_dma_done` | Reads as `1` after a non-looping transfer reaches its end |
-| `video_framebuffer_dma_loop` | Writing `1` makes the DMA wrap to offset zero after each frame; the reset default is `1` |
+| Accessor stem                  | Meaning                                                                                                    |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------- |
+| `video_framebuffer_dma_base`   | DDR byte address at which the image begins; defaults to `VIDEO_FRAMEBUFFER_BASE` (`0x7fe00000`)            |
+| `video_framebuffer_dma_length` | Number of bytes read per pass; defaults to 1,843,200 bytes for 1280 x 720 RGB565                           |
+| `video_framebuffer_dma_enable` | Writing `1` starts reads; writing `0` stops and resets DMA progress                                        |
+| `video_framebuffer_dma_done`   | Reads as `1` after a non-looping transfer reaches its end                                                  |
+| `video_framebuffer_dma_loop`   | Writing `1` makes the DMA wrap to offset zero after each frame; the reset default is `1`                   |
 | `video_framebuffer_dma_offset` | Current progress in native DRAM words; useful for checking that reads are advancing, but not a byte offset |
 
 Each writable register has `_write(value)` and `_read()` accessors. Status-only registers such as `done` and `offset` only have `_read()`.
@@ -89,17 +89,17 @@ Each writable register has `_write(value)` and `_read()` accessors. Status-only 
 
 The video timing generator (VTG) creates data-enable, horizontal-sync, and vertical-sync timing. The gateware initializes these registers for 1280x720 at 60 Hz.
 
-| Accessor stem | Meaning |
-| ------------- | ------- |
-| `video_framebuffer_vtg_enable` | Writing `1` starts timing generation; writing `0` holds the generator reset |
-| `video_framebuffer_vtg_hres` | Number of visible pixels per line |
-| `video_framebuffer_vtg_hsync_start` | Horizontal counter at which the sync pulse starts |
-| `video_framebuffer_vtg_hsync_end` | Horizontal counter at which the sync pulse ends |
-| `video_framebuffer_vtg_hscan` | Final horizontal counter value; the complete line is `hscan + 1` pixel clocks |
-| `video_framebuffer_vtg_vres` | Number of visible lines per frame |
-| `video_framebuffer_vtg_vsync_start` | Vertical counter at which the sync pulse starts |
-| `video_framebuffer_vtg_vsync_end` | Vertical counter at which the sync pulse ends |
-| `video_framebuffer_vtg_vscan` | Final vertical counter value; the complete frame is `vscan + 1` lines |
+| Accessor stem                       | Meaning                                                                       |
+| ----------------------------------- | ----------------------------------------------------------------------------- |
+| `video_framebuffer_vtg_enable`      | Writing `1` starts timing generation; writing `0` holds the generator reset   |
+| `video_framebuffer_vtg_hres`        | Number of visible pixels per line                                             |
+| `video_framebuffer_vtg_hsync_start` | Horizontal counter at which the sync pulse starts                             |
+| `video_framebuffer_vtg_hsync_end`   | Horizontal counter at which the sync pulse ends                               |
+| `video_framebuffer_vtg_hscan`       | Final horizontal counter value; the complete line is `hscan + 1` pixel clocks |
+| `video_framebuffer_vtg_vres`        | Number of visible lines per frame                                             |
+| `video_framebuffer_vtg_vsync_start` | Vertical counter at which the sync pulse starts                               |
+| `video_framebuffer_vtg_vsync_end`   | Vertical counter at which the sync pulse ends                                 |
+| `video_framebuffer_vtg_vscan`       | Final vertical counter value; the complete frame is `vscan + 1` lines         |
 
 Disable the VTG before changing several timing registers, then re-enable it after the complete mode has been written. Partially updated timing can produce an invalid HDMI signal.
 
@@ -107,11 +107,11 @@ Disable the VTG before changing several timing registers, then re-enable it afte
 
 `generated/mem.h` describes the synthesized address map. Common symbols are:
 
-| Symbol | Current value | Meaning |
-| ------ | ------------- | ------- |
-| `MAIN_RAM_BASE` | `0x40000000` | Start of the 1 GiB DDR main-memory region |
-| `VIDEO_FRAMEBUFFER_BASE` | `0x7fe00000` | Start of the reserved framebuffer region |
-| `VIDEO_FRAMEBUFFER_SIZE` | `0x001c2000` | 1,843,200-byte visible RGB565 image |
+| Symbol                   | Current value | Meaning                                   |
+| ------------------------ | ------------- | ----------------------------------------- |
+| `MAIN_RAM_BASE`          | `0x40000000`  | Start of the 1 GiB DDR main-memory region |
+| `VIDEO_FRAMEBUFFER_BASE` | `0x7fe00000`  | Start of the reserved framebuffer region  |
+| `VIDEO_FRAMEBUFFER_SIZE` | `0x001c2000`  | 1,843,200-byte visible RGB565 image       |
 
 `generated/soc.h` provides hardware-dependent feature constants including `CONFIG_CPU_HAS_DCACHE`, `CONFIG_L2_SIZE`, framebuffer resolution, and pixel depth. These values can change when the gateware configuration changes.
 

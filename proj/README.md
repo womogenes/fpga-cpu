@@ -90,6 +90,12 @@ Upload it after loading the bitstream:
 make upload
 ```
 
+Open the serial console without uploading a program:
+
+```sh
+make monitor
+```
+
 To upload another program from `sw/<program>/build/<program>.bin`:
 
 ```sh
@@ -98,7 +104,7 @@ make upload game_of_life
 
 After connecting, type `reboot` and press Enter to make the BIOS request the new image. `make upload` without a program continues to select `framebuffer_demo`.
 
-The UART defaults to `/dev/ttyUSB0` at 115200 baud. Override it with, for example, `LITEX_UART=/dev/ttyUSB1 make upload`.
+Both commands remain attached as serial monitors until interrupted with Ctrl-C. The UART defaults to `/dev/ttyUSB0` at 115200 baud. Override it with, for example, `LITEX_UART=/dev/ttyUSB1 make monitor` or `LITEX_BAUD=1000000 make monitor`.
 
 Framebuffer writers must call `flush_cpu_dcache()` and `flush_l2_cache()` after drawing so the independent video DMA sees the new pixels.
 
