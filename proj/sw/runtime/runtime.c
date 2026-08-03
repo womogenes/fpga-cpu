@@ -10,15 +10,21 @@ void uart_init(void) {
   /* The BIOS has already configured the UART divisor. */
 }
 
-static void uart_write(char value) {
+static void uart_putchar(char value) {
   while (uart_txfull_read());
   uart_rxtx_write((uint32_t)value);
 }
 
+int uart_write(const char* data, unsigned int length) {
+  for (unsigned int i = 0; i < length; i++)
+    uart_putchar(data[i]);
+  return (int)length;
+}
+
 int puts(const char* string) {
-  while (*string != '\0') uart_write(*string++);
-  uart_write('\r');
-  uart_write('\n');
+  while (*string != '\0') uart_putchar(*string++);
+  uart_putchar('\r');
+  uart_putchar('\n');
   return 0;
 }
 

@@ -9,6 +9,23 @@ Applications are freestanding C programs. They do not use a hosted C library or 
 | Gateware build | `generated/mem.h` | Memory-region addresses and sizes                      |
 | Gateware build | `generated/soc.h` | SoC configuration constants such as cache sizes        |
 
+The text framebuffer MVP is built and uploaded with:
+
+```sh
+make text-demo
+make upload text_demo
+```
+
+Its checked-in Spleen BDF is converted to a packed bitmap during the build and
+linked into the program as a read-only object. Set `FONT_SCALE` at compile time
+to enlarge each font pixel, for example `make -C sw/text_demo FONT_SCALE=2`.
+Select a native Spleen face with `FONT_SIZE`, such as
+`make -C sw/text_demo FONT_SIZE=16x32`.
+
+Applications remain freestanding by default. An application can set
+`USE_LIBC := 1` before including `runtime/app.mk` to link Newlib Nano and the
+project's minimal UART/heap syscall layer. Standard output is routed to UART.
+
 The generated headers live under `build/fpga_soc/software/include/generated/`. `make gateware` recreates them from the hardware defined in `hdl/soc.py`; applications should include them but must not edit them.
 
 ## Application memory layout
