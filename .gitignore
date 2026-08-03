@@ -1,0 +1,9 @@
+# Machine-local editor and Python state.
+.vscode/
+**/.venv/
+**/__pycache__/
+*.py[cod]
+
+# Generated output outside a self-contained project directory.
+/build/
+*.obj

@@ -1,0 +1,5 @@
+--target=riscv32-unknown-elf
+-std=gnu99
+-D__vexriscv__
+-I../../build/genesys2_mvp/software/include
+-I../runtime/include

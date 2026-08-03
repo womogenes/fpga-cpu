@@ -1,0 +1,8 @@
+git+https://git.m-labs.hk/M-Labs/migen.git@4c2ae8dfeea37f235b52acb8166f12acaaae4f7c
+git+https://github.com/enjoy-digital/litex.git@3f01ef9658376d0cbd5d21a1db720163e605f71e
+git+https://github.com/litex-hub/litex-boards.git@5fd0ff45434bd896f33f2ba20b1bf0ac382a61b8
+git+https://github.com/enjoy-digital/litedram.git@1b7cc79add189989fb5604a93f59a9837eaa24b8
+git+https://github.com/litex-hub/pythondata-cpu-vexriscv.git@642ecfed1c84460555d6d803d660cc60cfc1ecb6
+git+https://github.com/litex-hub/pythondata-software-picolibc.git@6a13ccce7c575b32c102dd9dc52178505b81fe39
+git+https://github.com/litex-hub/pythondata-software-compiler_rt.git@6eb76609c9627bf26635e57c63fb22cda7115887
+meson==1.11.2

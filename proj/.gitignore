@@ -1,0 +1,13 @@
+# Downloaded Python dependencies and generated gateware/software.
+/.venv/
+/build/
+**/__pycache__/
+*.py[cod]
+
+# C build artifacts. These remain on disk and are still copied by rsync.
+/sw/**/build/
+/sw/**/*.bin
+/sw/**/*.d
+/sw/**/*.elf
+/sw/**/*.map
+/sw/**/*.o
