@@ -20,20 +20,43 @@ _start:
 	addi t2, t2, 4
 	j 1b
 
-	/* Clear BSS. */
+	/* Copy explicitly DDR-resident initialized data from the program image. */
 2:
-	la t0, _fbss
-	la t1, _ebss
+	la t0, _fddr_data
+	la t1, _eddr_data
+	la t2, _fddr_data_rom
 3:
 	beq t0, t1, 4f
-	sw zero, 0(t0)
+	lw t3, 0(t2)
+	sw t3, 0(t0)
 	addi t0, t0, 4
+	addi t2, t2, 4
 	j 3b
 
+	/* Clear BRAM BSS. */
 4:
-	call main
+	la t0, _fbss
+	la t1, _ebss
 5:
+	beq t0, t1, 6f
+	sw zero, 0(t0)
+	addi t0, t0, 4
 	j 5b
+
+	/* Clear explicitly DDR-resident BSS. */
+6:
+	la t0, _fddr_bss
+	la t1, _eddr_bss
+7:
+	beq t0, t1, 8f
+	sw zero, 0(t0)
+	addi t0, t0, 4
+	j 7b
+
+8:
+	call main
+9:
+	j 9b
 
 trap_entry:
 	j trap_entry

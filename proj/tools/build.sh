@@ -15,5 +15,5 @@ export PATH="$project_dir/.venv/bin:$PATH"
 cd "$project_dir"
 exec "$python" hdl/soc.py \
     --build \
-    --output-dir "$project_dir/build/genesys2_mvp" \
+    --output-dir "$project_dir/build/fpga_soc" \
     "$@"

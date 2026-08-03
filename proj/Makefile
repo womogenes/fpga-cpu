@@ -1,5 +1,22 @@
 .PHONY: all setup build gateware diagnostic software framebuffer-demo flash load upload sync clean
 
+# Allow `make upload <program>` while retaining `make upload` as a shorthand
+# for framebuffer_demo. The second command-line goal is a selector, not a
+# recipe of its own.
+ifeq ($(firstword $(MAKECMDGOALS)),upload)
+ifneq ($(words $(MAKECMDGOALS)),1)
+ifneq ($(words $(MAKECMDGOALS)),2)
+$(error usage: make upload [program])
+endif
+UPLOAD_GOAL := $(word 2,$(MAKECMDGOALS))
+.PHONY: $(UPLOAD_GOAL)
+$(UPLOAD_GOAL):
+	@:
+endif
+endif
+
+PROGRAM ?= $(or $(UPLOAD_GOAL),framebuffer_demo)
+
 all: gateware software
 
 setup:
@@ -21,7 +38,7 @@ flash load:
 	./tools/load.sh
 
 upload:
-	./tools/upload.sh
+	PROGRAM="$(PROGRAM)" ./tools/upload.sh
 
 sync:
 	./tools/sync.sh

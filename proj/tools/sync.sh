@@ -2,7 +2,7 @@
 set -euo pipefail
 
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-destination="${REMOTE_PROJECT:-thinkmax:~/fpga/litex-cpu/}"
+destination="${REMOTE_PROJECT:-thinkmax:~/fpga/fpga-cpu/}"
 
 exec rsync -az --delete \
     --exclude='.git/' \

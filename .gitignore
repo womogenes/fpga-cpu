@@ -1,5 +1,4 @@
 # Machine-local editor and Python state.
-.vscode/
 **/.venv/
 **/__pycache__/
 *.py[cod]

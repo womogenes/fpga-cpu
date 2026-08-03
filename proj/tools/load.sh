@@ -2,7 +2,8 @@
 set -euo pipefail
 
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-bitstream="$project_dir/build/genesys2_mvp/gateware/digilent_genesys2.bit"
+bitstream="$project_dir/build/fpga_soc/gateware/digilent_genesys2.bit"
+frequency="${JTAG_FREQ:-1000000}"
 
 if [[ ! -f "$bitstream" ]]; then
     echo "Bitstream not found: $bitstream" >&2
@@ -10,4 +11,4 @@ if [[ ! -f "$bitstream" ]]; then
     exit 1
 fi
 
-exec openFPGALoader -b genesys2 --freq 1000000 "$@" "$bitstream"
+exec openFPGALoader -b genesys2 --freq "$frequency" "$@" "$bitstream"
