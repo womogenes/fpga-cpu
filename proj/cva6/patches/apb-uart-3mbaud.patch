@@ -16,8 +16,8 @@ index ccd00d0..91b5333 100644
      -- Baudrate generator
      iBaudgenDiv <= iDLM & iDLL;
 +    -- The Genesys 2 FT232R supports up to exactly 3 MBaud. Suppress one baud
-+    -- generator enable out of every 25 50 MHz cycles to provide an effective
-+    -- 48 MHz reference without introducing another clock domain.
++    -- generator enable out of every 25 system-clock cycles to provide an
++    -- exact 24/25-rate reference without introducing another clock domain.
 +    iBaudClockEnable <= '0' when iBaudClockPhase = 24 else '1';
 +    UART_BAUD_PHASE: process (CLK, iRST)
 +    begin

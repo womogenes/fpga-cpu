@@ -3,10 +3,12 @@
 module lfm_matvec_accelerator_tb;
 
     localparam logic [29:0] MODEL_BASE = 30'h3000_0000;
-    localparam integer MEMORY_BYTES = 65536;
-    localparam integer INPUT_OFFSET = 16'h0000;
-    localparam integer WEIGHT_OFFSET = 16'h2000;
-    localparam integer OUTPUT_OFFSET = 16'h6000;
+    localparam integer MEMORY_BYTES = 4 * 1024 * 1024;
+    localparam integer INPUT_OFFSET = 32'h0000_0000;
+    // Match the 0xae0 page offset of blk.1.ffn_down.weight, the first
+    // production tensor whose hardware result diverged.
+    localparam integer WEIGHT_OFFSET = 32'h0000_2ae0;
+    localparam integer OUTPUT_OFFSET = 32'h0030_0000;
 
     logic clk = 1'b0;
     logic rst_n = 1'b0;
@@ -25,7 +27,13 @@ module lfm_matvec_accelerator_tb;
     ) axi();
 
     always #2.5 clk = ~clk;
-    assign grant = request;
+    // Match the real arbiter's registered grant/release behavior.
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            grant <= 1'b0;
+        else
+            grant <= request;
+    end
 
     lfm_matvec_accelerator #(
         .ID_WIDTH(5)
@@ -86,12 +94,17 @@ module lfm_matvec_accelerator_tb;
                 axi.r_valid <= 1'b1;
             end
             if (axi.r_valid && axi.r_ready) begin
-                axi.r_valid <= 1'b0;
                 if (axi.r_last) begin
+                    axi.r_valid <= 1'b0;
                     read_active <= 1'b0;
                 end else begin
                     read_address <= read_address + 8;
                     read_beats <= read_beats - 1'b1;
+                    memory_index = read_address + 8 - MODEL_BASE;
+                    for (i = 0; i < 8; i = i + 1)
+                        axi.r_data[i*8 +: 8] <= memory[memory_index + i];
+                    axi.r_last <= read_beats == 2;
+                    axi.r_valid <= 1'b1;
                 end
             end
 
@@ -116,7 +129,7 @@ module lfm_matvec_accelerator_tb;
         end
     end
 
-    function automatic signed [63:0] fp16_product_q40(
+    function automatic signed [63:0] fp16_product_q30(
         input logic [15:0] a,
         input logic [15:0] b
     );
@@ -135,7 +148,7 @@ module lfm_matvec_accelerator_tb;
             fa = a & 1023;
             fb = b & 1023;
             if ((ea == 0 && fa == 0) || (eb == 0 && fb == 0)) begin
-                fp16_product_q40 = 0;
+                fp16_product_q30 = 0;
             end else begin
                 product = (ea == 0 ? fa : 1024 + fa) *
                           (eb == 0 ? fb : 1024 + fb);
@@ -143,12 +156,12 @@ module lfm_matvec_accelerator_tb;
                     product = -product;
                 pa = ea == 0 ? -24 : ea - 25;
                 pb = eb == 0 ? -24 : eb - 25;
-                shift = pa + pb + 40;
+                shift = pa + pb + 30;
                 if (shift >= 0) begin
-                    fp16_product_q40 = product <<< shift;
+                    fp16_product_q30 = product <<< shift;
                 end else begin
                     bias = 64'sd1 <<< (-shift - 1);
-                    fp16_product_q40 = product >= 0 ?
+                    fp16_product_q30 = product >= 0 ?
                         (product + bias) >>> -shift :
                         -((-product + bias) >>> -shift);
                 end
@@ -175,12 +188,14 @@ module lfm_matvec_accelerator_tb;
         integer timeout;
         begin
             timeout = 0;
-            while (status[28] == previous_toggle && timeout < 2000000) begin
+            while (status[28] == previous_toggle && timeout < 20000000) begin
                 @(posedge clk);
                 timeout = timeout + 1;
             end
-            if (timeout == 2000000)
+            if (timeout == 20000000)
                 $fatal(1, "accelerator timeout state=%0d status=%08x", dut.state, status);
+            if (request || grant)
+                $fatal(1, "DONE became visible before DDR was released");
             if (status[29])
                 $fatal(1, "accelerator reported an error");
         end
@@ -248,7 +263,7 @@ module lfm_matvec_accelerator_tb;
                     weight_d = {memory[address + 1], memory[address]};
                     input_d = {memory[INPUT_OFFSET + block * 34 + 1],
                                memory[INPUT_OFFSET + block * 34]};
-                    expected = expected + dot * fp16_product_q40(weight_d, input_d);
+                    expected = expected + dot * fp16_product_q30(weight_d, input_d);
                 end
                 actual = 0;
                 for (j = 0; j < 8; j = j + 1)
@@ -256,7 +271,86 @@ module lfm_matvec_accelerator_tb;
                 if (actual !== expected)
                     $fatal(1, "Q4 row %0d mismatch: got %0d expected %0d", row, actual, expected);
             end
-            $display("PASS: Q4_0 exact Q40 matrix-vector output");
+            $display("PASS: Q4_0 exact Q30 matrix-vector output");
+        end
+    endtask
+
+    task automatic run_q4_large_input_test;
+        integer block;
+        integer row;
+        integer j;
+        integer address;
+        integer packed_q;
+        integer qlo;
+        integer qhi;
+        integer ilo;
+        integer ihi;
+        integer dot;
+        longint signed expected;
+        longint signed actual;
+        logic [15:0] input_d;
+        logic [15:0] weight_d;
+        logic old_done;
+        begin
+            for (block = 0; block < 144; block = block + 1) begin
+                address = INPUT_OFFSET + block * 34;
+                input_d = 16'h2800 + (block % 32) * 16'h0020;
+                write_u16(address, input_d);
+                for (j = 0; j < 32; j = j + 1)
+                    memory[address + 2 + j] = byte'(((block * 37 + j * 11) % 255) - 127);
+            end
+            for (row = 0; row < 1024; row = row + 1) begin
+                for (block = 0; block < 144; block = block + 1) begin
+                    address = WEIGHT_OFFSET + (row * 144 + block) * 18;
+                    // Keep the synthetic scale product within signed Q30's
+                    // [-2, 2) range. Row-dependent packed weights still vary
+                    // every dot product and exercise the production-sized
+                    // 1024x4608 stream that exposed the hardware failure.
+                    weight_d = 16'h2400 + (row % 8) * 16'h0040 +
+                               (block % 32) * 16'h0010;
+                    write_u16(address, weight_d);
+                    for (j = 0; j < 16; j = j + 1) begin
+                        qlo = (row * 3 + block * 5 + j * 7) & 15;
+                        qhi = (row * 11 + block * 2 + j * 3) & 15;
+                        memory[address + 2 + j] = (qhi << 4) | qlo;
+                    end
+                end
+            end
+
+            old_done = status[28];
+            send_register(0, WEIGHT_OFFSET >> 3);
+            send_register(1, INPUT_OFFSET >> 3);
+            send_register(2, OUTPUT_OFFSET >> 3);
+            send_register(3, 4608);
+            send_register(4, 1024);
+            send_register(5, 1);
+            wait_done(old_done);
+
+            for (row = 0; row < 1024; row = row + 1) begin
+                expected = 0;
+                for (block = 0; block < 144; block = block + 1) begin
+                    dot = 0;
+                    address = WEIGHT_OFFSET + (row * 144 + block) * 18;
+                    for (j = 0; j < 16; j = j + 1) begin
+                        packed_q = memory[address + 2 + j];
+                        qlo = (packed_q & 15) - 8;
+                        qhi = (packed_q >> 4) - 8;
+                        ilo = $signed(memory[INPUT_OFFSET + block * 34 + 2 + j]);
+                        ihi = $signed(memory[INPUT_OFFSET + block * 34 + 18 + j]);
+                        dot = dot + qlo * ilo + qhi * ihi;
+                    end
+                    weight_d = {memory[address + 1], memory[address]};
+                    input_d = {memory[INPUT_OFFSET + block * 34 + 1],
+                               memory[INPUT_OFFSET + block * 34]};
+                    expected = expected + dot * fp16_product_q30(weight_d, input_d);
+                end
+                actual = 0;
+                for (j = 0; j < 8; j = j + 1)
+                    actual[j*8 +: 8] = memory[OUTPUT_OFFSET + row * 8 + j];
+                if (actual !== expected)
+                    $fatal(1, "large Q4 row %0d mismatch: got %0d expected %0d", row, actual, expected);
+            end
+            $display("PASS: Q4_0 exact 4608-element output");
         end
     endtask
 
@@ -343,7 +437,7 @@ module lfm_matvec_accelerator_tb;
                     weight_d = {memory[address + 209], memory[address + 208]};
                     input_d = {memory[INPUT_OFFSET + block * 258 + 1],
                                memory[INPUT_OFFSET + block * 258]};
-                    score = score + isum * fp16_product_q40(weight_d, input_d);
+                    score = score + isum * fp16_product_q30(weight_d, input_d);
                 end
                 if (score > expected_best_score) begin
                     expected_best_score = score;
@@ -363,7 +457,7 @@ module lfm_matvec_accelerator_tb;
                 $fatal(1, "Q6 argmax mismatch: got %0d expected %0d", status[23:8], expected_token);
             if (dut.best_score !== expected_best_score)
                 $fatal(1, "Q6 score mismatch: got %0d expected %0d", dut.best_score, expected_best_score);
-            $display("PASS: Q6_K exact Q40 argmax output");
+            $display("PASS: Q6_K exact Q30 argmax output");
         end
     endtask
 
@@ -375,6 +469,13 @@ module lfm_matvec_accelerator_tb;
         repeat (5) @(posedge clk);
         if (!status[31])
             $fatal(1, "accelerator presence bit is absent");
+        run_q4_test();
+        run_q4_large_input_test();
+        run_q4_test();
+        run_q4_large_input_test();
+        run_q4_test();
+        run_q4_large_input_test();
+        run_q6_test();
         run_q4_test();
         run_q6_test();
         $display("PASS: LFM accelerator regression complete");

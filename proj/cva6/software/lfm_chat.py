@@ -124,7 +124,7 @@ def run_chat(args, tokens, token_to_id, merge_rank):
     decoder = byte_decoder()
     messages = []
     print(f"LFM2.5-350M standalone chat ({args.threads} worker). Commands: /clear, /quit")
-    print("This single 50 MHz hart is a correctness demo; generation can take about 40 seconds per token.")
+    print("FPGA-accelerated generation; measured prompt and decode rates are printed after each reply.")
     try:
         while True:
             user = input("\nyou> ").strip()

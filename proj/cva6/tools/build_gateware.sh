@@ -7,6 +7,8 @@ output="$root/build/gateware"
 bitstream="$output/cva6_genesys2_hdmi.bit"
 hash_file="$output/inputs.sha256"
 uart_baud="${UART_BAUD:-3000000}"
+cpu_frequency=100000000
+uart_reference_frequency=96000000
 
 mkdir -p "$output"
 "$root/tools/apply_patches.sh"
@@ -55,12 +57,15 @@ export RISCV
 export CROSSCOMPILE
 export VIVADOFLAGS="-nojournal -mode batch -source scripts/prologue.tcl -source $root/scripts/hdmi_hook.tcl"
 
-bootrom_cflags="-DCLOCK_FREQUENCY=50000000 -DUART_CLOCK_FREQUENCY=48000000 -DUART_BITRATE=$uart_baud -DPLAT_XILINX -DXLEN=64 -Os -ggdb -march=rv64im_zicsr -mabi=lp64 -Wall -mcmodel=medany -mexplicit-relocs -ffreestanding -fpermissive"
+bootrom_cflags="-DCLOCK_FREQUENCY=$cpu_frequency -DUART_CLOCK_FREQUENCY=$uart_reference_frequency -DUART_BITRATE=$uart_baud -DPLAT_XILINX -DXLEN=64 -Os -ggdb -march=rv64im_zicsr -mabi=lp64 -Wall -mcmodel=medany -mexplicit-relocs -ffreestanding -fpermissive"
 make -C "$hardware/corev_apu/fpga/src/bootrom" \
     -B \
     BOARD=genesys2 \
     PLATFORM=PLAT_XILINX \
     XLEN=64 \
+    CLOCK_FREQUENCY="$cpu_frequency" \
+    HALF_CLOCK_FREQUENCY="$((cpu_frequency / 2))" \
+    UART_CLOCK_FREQUENCY="$uart_reference_frequency" \
     UART_BITRATE="$uart_baud" \
     CFLAGS="$bootrom_cflags" \
     bootrom_64.sv

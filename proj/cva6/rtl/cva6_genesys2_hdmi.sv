@@ -58,8 +58,10 @@ module cva6_genesys2_hdmi #(
 );
 
     logic software_video_ready;
+    logic software_video_command_ack;
     logic [31:0] soc_gpio;
-    wire [7:0] soc_sw = {sw[7], software_video_ready, sw[5:0]};
+    wire [7:0] soc_sw = {sw[7], software_video_ready,
+                         software_video_command_ack, sw[4:0]};
     assign led = soc_gpio[7:0];
 
     ariane_xilinx i_soc (
@@ -126,6 +128,7 @@ module cva6_genesys2_hdmi #(
         .software_video_bus(soc_gpio),
         .force_terminal(sw[7]),
         .software_video_ready,
+        .software_video_command_ack,
         .hdmi_clk_p(hdmi_out_clk_p),
         .hdmi_clk_n(hdmi_out_clk_n),
         .hdmi_data_p(hdmi_out_data_p),

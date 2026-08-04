@@ -12,6 +12,7 @@ module software_video_plane_tb;
     logic [10:0] pixel_x = 0;
     logic [9:0] pixel_y = 0;
     logic ready;
+    logic command_ack;
     logic active;
     logic [7:0] red;
     logic [7:0] green;
@@ -31,6 +32,7 @@ module software_video_plane_tb;
         .pixel_x,
         .pixel_y,
         .ready,
+        .command_ack,
         .active,
         .red,
         .green,
@@ -38,13 +40,21 @@ module software_video_plane_tb;
     );
 
     task automatic send_packet(input logic [27:0] pixels);
-        command_bus <= {~command_bus[31], 3'b000, pixels};
-        repeat (10) @(posedge clk);
+        logic next_toggle;
+        next_toggle = ~command_bus[31];
+        command_bus <= {next_toggle, 3'b000, pixels};
+        @(posedge clk);
+        wait (command_ack == next_toggle);
+        @(posedge clk);
     endtask
 
     task automatic send_command(input logic [6:0] command);
-        command_bus <= {~command_bus[31], 3'b001, 21'b0, command};
-        repeat (5) @(posedge clk);
+        logic next_toggle;
+        next_toggle = ~command_bus[31];
+        command_bus <= {next_toggle, 3'b001, 21'b0, command};
+        @(posedge clk);
+        wait (command_ack == next_toggle);
+        @(posedge clk);
     endtask
 
     initial begin
@@ -57,6 +67,8 @@ module software_video_plane_tb;
             $fatal(1, "video plane stayed ready while loading");
         send_packet({7'd3, 7'd2, 7'd1, 7'd0});
         send_packet({7'd7, 7'd6, 7'd5, 7'd4});
+        wait (!dut.loading);
+        @(posedge clk);
         for (int index = 0; index < FRAME_PIXELS; index++) begin
             if (dut.frame_buffer[FRAME_PIXELS + index] !== index[6:0])
                 $fatal(1, "packed pixel %0d was unpacked incorrectly", index);
@@ -89,6 +101,12 @@ module software_video_plane_tb;
         repeat (3) @(posedge clk);
         if (active)
             $fatal(1, "software terminal command did not disable graphics");
+
+        send_command(7'h01);
+        send_packet({7'd3, 7'd2, 7'd1, 7'd0});
+        send_command(7'h00);
+        if (!ready || dut.loading || dut.unpacking)
+            $fatal(1, "terminal command did not abort a partial frame");
 
         $display("software_video_plane_tb passed");
         $finish;

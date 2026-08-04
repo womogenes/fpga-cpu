@@ -18,6 +18,9 @@
 static volatile uint32_t *lfm_accel_gpio;
 static volatile uint8_t *lfm_accel_scratch;
 static uint32_t lfm_accel_toggle;
+#ifdef LFM_ACCELERATOR_VERIFY
+static uint32_t lfm_accel_verify_q4_calls;
+#endif
 
 static void lfm_accel_fence(void) {
   __asm__ volatile("fence iorw, iorw" ::: "memory");
@@ -48,6 +51,11 @@ static void lfm_accel_register(uint32_t index, uint32_t value) {
   lfm_accel_gpio[0] = lfm_accel_toggle | 0x20000000u |
                       ((index & 7u) << 25) | (value & 0x01ffffffu);
   lfm_accel_fence();
+  /* The command word crosses from the 100 MHz GPIO clock into the 200 MHz DDR
+     clock through a two-flop toggle synchronizer. Keep successive toggle
+     edges separated long enough that neither can be hidden by that CDC. */
+  for (volatile uint32_t settle = 0; settle < 64u; ++settle)
+    __asm__ volatile("nop");
 }
 
 static uint32_t lfm_accel_weight_words(const uint8_t *data) {
@@ -92,12 +100,87 @@ static void parallel_q4(float *out, const struct tensor *weight,
       *dst++ = (uint8_t)input[block].qs[j];
   }
   lfm_accel_fence();
+#ifdef LFM_ACCELERATOR_VERIFY
+  if (lfm_accel_verify_q4_calls < 5u || lfm_accel_verify_q4_calls == 9u ||
+      lfm_accel_verify_q4_calls == 16u) {
+    uint32_t bytes = blocks * 34u;
+    uint32_t mismatches = 0;
+    uint32_t first = 0;
+    for (uint32_t block = 0; block < blocks; ++block) {
+      fp16_t scale = float_to_half(input[block].d);
+      for (uint32_t j = 0; j < 34u; ++j) {
+        uint8_t expected = j == 0u ? (uint8_t)scale :
+                           j == 1u ? (uint8_t)(scale >> 8) :
+                           (uint8_t)input[block].qs[j - 2u];
+        uint32_t i = block * 34u + j;
+        if (lfm_accel_scratch[i] != expected) {
+          if (mismatches == 0u) first = i;
+          ++mismatches;
+        }
+      }
+    }
+    fprintf(stderr, "VERIFY Q4 call=%u scratch_bytes=%u mismatches=%u first=%u\n",
+            lfm_accel_verify_q4_calls, bytes, mismatches, first);
+    if (lfm_accel_verify_q4_calls == 9u) {
+      int dump = open("/tmp/lfm-call9-input.bin",
+                      O_WRONLY | O_CREAT | O_TRUNC, 0600);
+      if (dump >= 0) {
+        for (uint32_t block = 0; block < blocks; ++block) {
+          fp16_t scale = float_to_half(input[block].d);
+          (void)write(dump, &scale, sizeof(scale));
+          (void)write(dump, input[block].qs, sizeof(input[block].qs));
+        }
+        (void)close(dump);
+      }
+    }
+    lfm_accel_fence();
+  }
+#endif
   (void)lfm_accel_run(weight->data, weight->ne0, weight->ne1, 1u);
   volatile const int64_t *raw =
       (volatile const int64_t *)(lfm_accel_scratch + LFM_OUTPUT_LOCAL);
-  const float q40 = 1.0f / 1099511627776.0f;
+  const float q30 = 1.0f / 1073741824.0f;
   for (uint32_t row = 0; row < weight->ne1; ++row)
-    out[row] = (float)raw[row] * q40;
+    out[row] = (float)raw[row] * q30;
+#ifdef LFM_ACCELERATOR_VERIFY
+  if (lfm_accel_verify_q4_calls == 9u) {
+    int dump = open("/tmp/lfm-call9-output.bin",
+                    O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (dump >= 0) {
+      (void)write(dump, (const void *)raw,
+                  weight->ne1 * (uint32_t)sizeof(*raw));
+      (void)close(dump);
+    }
+  }
+  {
+    const struct block_q4_0 *rows = (const struct block_q4_0 *)weight->data;
+    uint32_t row_blocks = weight->ne0 / 32u;
+    float maximum_error = 0.0f;
+    uint32_t maximum_row = 0;
+    float maximum_hardware = 0.0f;
+    float maximum_reference = 0.0f;
+    for (uint32_t row = 0; row < weight->ne1; ++row) {
+      float reference = dot_q4_q8(rows + row * row_blocks, input, weight->ne0);
+      float error = abs_f(out[row] - reference);
+      if (error > maximum_error) {
+        maximum_error = error;
+        maximum_row = row;
+        maximum_hardware = out[row];
+        maximum_reference = reference;
+      }
+    }
+    if (maximum_error > 0.0001f || lfm_accel_verify_q4_calls < 5u ||
+        lfm_accel_verify_q4_calls == 9u ||
+        lfm_accel_verify_q4_calls == 16u ||
+        lfm_accel_verify_q4_calls == 64u) {
+      fprintf(stderr,
+              "VERIFY Q4 call=%u rows=%u max_row=%u hw=%.9g ref=%.9g error=%.9g\n",
+              lfm_accel_verify_q4_calls, weight->ne1, maximum_row,
+              maximum_hardware, maximum_reference, maximum_error);
+    }
+  }
+  ++lfm_accel_verify_q4_calls;
+#endif
 }
 
 static uint32_t parallel_q6_argmax(const struct block_q6_k *rows,
@@ -112,7 +195,49 @@ static uint32_t parallel_q6_argmax(const struct block_q6_k *rows,
       *dst++ = (uint8_t)input[block].qs[j];
   }
   lfm_accel_fence();
+#ifdef LFM_ACCELERATOR_VERIFY
+  uint32_t input_mismatches = 0;
+  uint32_t input_first = 0;
+  for (uint32_t block = 0; block < LFM_DIM / 256u; ++block) {
+    fp16_t scale = float_to_half(input[block].d);
+    for (uint32_t j = 0; j < 258u; ++j) {
+      uint8_t expected = j == 0u ? (uint8_t)scale :
+                         j == 1u ? (uint8_t)(scale >> 8) :
+                         (uint8_t)input[block].qs[j - 2u];
+      uint32_t i = block * 258u + j;
+      if (lfm_accel_scratch[i] != expected) {
+        if (input_mismatches == 0u) input_first = i;
+        ++input_mismatches;
+      }
+    }
+  }
+  fprintf(stderr, "VERIFY Q6 input mismatches=%u first=%u\n",
+          input_mismatches, input_first);
+  lfm_accel_fence();
+#endif
   uint32_t status = lfm_accel_run((const uint8_t *)rows, LFM_DIM,
                                   LFM_VOCAB, 2u);
-  return (status >> 8) & 0xffffu;
+  uint32_t hardware_best = (status >> 8) & 0xffffu;
+#ifdef LFM_ACCELERATOR_VERIFY
+  static uint32_t verified;
+  static uint32_t q6_calls;
+  fprintf(stderr, "VERIFY Q6 call=%u hw=%u\n", q6_calls, hardware_best);
+  if (verified < 2u) {
+    uint32_t reference_best = 0;
+    float reference_score = -3.402823466e38f;
+    uint32_t row_blocks = LFM_DIM / 256u;
+    for (uint32_t row = 0; row < LFM_VOCAB; ++row) {
+      float score = dot_q6_q8k(rows + row * row_blocks, input, LFM_DIM);
+      if (score > reference_score) {
+        reference_score = score;
+        reference_best = row;
+      }
+    }
+    fprintf(stderr, "VERIFY Q6 call=%u hw=%u ref=%u score=%.9g\n",
+            q6_calls, hardware_best, reference_best, reference_score);
+    ++verified;
+  }
+  ++q6_calls;
+#endif
+  return hardware_best;
 }

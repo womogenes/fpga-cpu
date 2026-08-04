@@ -105,6 +105,9 @@ module terminal_buffer #(
     logic current_inverse;
     logic cursor_visible;
     logic [2:0] cursor_style;
+    logic [15:0] cursor_blink_half_period_frames;
+    logic [15:0] cursor_blink_frame_counter;
+    logic cursor_blink_phase;
     logic wrap_enabled;
     logic wrap_pending;
     logic origin_mode;
@@ -388,6 +391,9 @@ module terminal_buffer #(
             current_inverse <= 1'b0;
             cursor_visible <= 1'b1;
             cursor_style <= 0;
+            cursor_blink_half_period_frames <= 30;
+            cursor_blink_frame_counter <= 0;
+            cursor_blink_phase <= 1'b1;
             wrap_enabled <= 1'b1;
             wrap_pending <= 1'b0;
             origin_mode <= 1'b0;
@@ -436,6 +442,15 @@ module terminal_buffer #(
             direct_write_address <= 0;
             direct_write_data <= DEFAULT_CELL;
         end else begin
+            if (pixel_x == 1649 && pixel_y == 749) begin
+                if (cursor_blink_frame_counter == cursor_blink_half_period_frames - 1'b1) begin
+                    cursor_blink_frame_counter <= 0;
+                    cursor_blink_phase <= ~cursor_blink_phase;
+                end else begin
+                    cursor_blink_frame_counter <= cursor_blink_frame_counter + 1'b1;
+                end
+            end
+
             if (operation_state == OP_CLEAR) begin
                 if (operation_remaining == 1) begin
                     operation_state <= OP_IDLE;
@@ -546,6 +561,9 @@ module terminal_buffer #(
                                 current_inverse <= 1'b0;
                                 cursor_visible <= 1'b1;
                                 cursor_style <= 0;
+                                cursor_blink_half_period_frames <= 30;
+                                cursor_blink_frame_counter <= 0;
+                                cursor_blink_phase <= 1'b1;
                                 wrap_enabled <= 1'b1;
                                 wrap_pending <= 1'b0;
                                 origin_mode <= 1'b0;
@@ -744,6 +762,11 @@ module terminal_buffer #(
                                         default: begin end
                                     endcase
                                 end
+                                "z": if (private_mode) begin
+                                    cursor_blink_half_period_frames <= (parameters[0] == 0) ? 30 : parameters[0];
+                                    cursor_blink_frame_counter <= 0;
+                                    cursor_blink_phase <= 1'b1;
+                                end
                                 "h": if (private_mode) begin
                                     for (parser_index = 0; parser_index < 8; parser_index = parser_index + 1) begin
                                         if (parser_index <= parameter_index) begin
@@ -804,17 +827,9 @@ module terminal_buffer #(
     logic cursor_blink_on;
     logic cursor_draw;
     logic cursor_block;
-    logic [23:0] blink_counter;
     logic [23:0] foreground_color;
     logic [23:0] background_color;
     logic [23:0] pixel_color;
-
-    always_ff @(posedge clk) begin
-        if (reset)
-            blink_counter <= 0;
-        else
-            blink_counter <= blink_counter + 1'b1;
-    end
 
     always_comb begin
         character = render_cell[7:0];
@@ -833,7 +848,7 @@ module terminal_buffer #(
         background_color = ansi_color(background_index);
         pixel_color = glyph_pixel ? foreground_color : background_color;
         cursor_cell = render_active && (render_x >> 3) == cursor_x && (render_y >> 4) == cursor_y;
-        cursor_blink_on = cursor_style[0] || blink_counter[23];
+        cursor_blink_on = cursor_style[0] || cursor_blink_phase;
         cursor_block = cursor_style <= 1;
         case (cursor_style)
             0, 1: cursor_draw = 1'b1;

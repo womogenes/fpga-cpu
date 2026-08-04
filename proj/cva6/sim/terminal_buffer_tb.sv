@@ -76,6 +76,17 @@ module terminal_buffer_tb;
         end
     endtask
 
+    task automatic end_frame;
+        begin
+            @(negedge clk);
+            pixel_x = 1649;
+            pixel_y = 749;
+            @(negedge clk);
+            pixel_x = 0;
+            pixel_y = 0;
+        end
+    endtask
+
     task automatic expect_char(
         input integer bank,
         input integer row,
@@ -216,6 +227,22 @@ module terminal_buffer_tb;
         send_csi("?25h");
         if (!dut.cursor_visible)
             $fatal(1, "cursor visibility did not enable");
+
+        if (dut.cursor_blink_half_period_frames !== 30)
+            $fatal(1, "cursor blink did not reset to a 1 Hz period");
+        send_csi("?2z");
+        if (dut.cursor_blink_half_period_frames !== 2 || !dut.cursor_blink_phase)
+            $fatal(1, "cursor blink period was not configured");
+        end_frame();
+        if (!dut.cursor_blink_phase)
+            $fatal(1, "cursor blink phase changed too early");
+        end_frame();
+        if (dut.cursor_blink_phase)
+            $fatal(1, "cursor blink phase did not change");
+        end_frame();
+        end_frame();
+        if (!dut.cursor_blink_phase)
+            $fatal(1, "cursor blink phase did not return");
 
         reset_screen();
         send_byte(8'h1b);

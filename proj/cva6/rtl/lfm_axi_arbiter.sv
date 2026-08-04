@@ -16,12 +16,14 @@ module lfm_axi_arbiter (
 
     logic [7:0] cpu_reads_outstanding;
     logic [7:0] cpu_writes_outstanding;
+    logic [7:0] cpu_write_data_pending;
 
     always_ff @(posedge clk_i or negedge rst_ni) begin
         if (!rst_ni) begin
             accelerator_grant_o   <= 1'b0;
             cpu_reads_outstanding <= '0;
             cpu_writes_outstanding <= '0;
+            cpu_write_data_pending <= '0;
         end else begin
             case ({cpu.ar_valid && cpu.ar_ready,
                    cpu.r_valid && cpu.r_ready && cpu.r_last})
@@ -35,12 +37,18 @@ module lfm_axi_arbiter (
                 2'b01: cpu_writes_outstanding <= cpu_writes_outstanding - 1'b1;
                 default: cpu_writes_outstanding <= cpu_writes_outstanding;
             endcase
+            case ({cpu.aw_valid && cpu.aw_ready,
+                   cpu.w_valid && cpu.w_ready && cpu.w_last})
+                2'b10: cpu_write_data_pending <= cpu_write_data_pending + 1'b1;
+                2'b01: cpu_write_data_pending <= cpu_write_data_pending - 1'b1;
+                default: cpu_write_data_pending <= cpu_write_data_pending;
+            endcase
 
             if (!accelerator_grant_o) begin
                 if (accelerator_request_i &&
                     cpu_reads_outstanding == 0 &&
                     cpu_writes_outstanding == 0 &&
-                    !cpu.w_valid)
+                    cpu_write_data_pending == 0)
                     accelerator_grant_o <= 1'b1;
             end else if (!accelerator_request_i) begin
                 accelerator_grant_o <= 1'b0;
@@ -175,8 +183,16 @@ module lfm_axi_arbiter (
             ddr.w_strb    = cpu.w_strb;
             ddr.w_last    = cpu.w_last;
             ddr.w_user    = cpu.w_user;
-            ddr.w_valid   = cpu.w_valid;
-            cpu.w_ready   = ddr.w_ready;
+            // AXI write address and data channels are independent. Once an
+            // accelerator request blocks new AW transactions, forward only W
+            // beats belonging to an address that DDR already accepted. This
+            // prevents an orphan CPU beat from pairing with an accelerator AW.
+            ddr.w_valid   = cpu.w_valid &&
+                            (cpu_write_data_pending != 0 ||
+                             (cpu.aw_valid && cpu.aw_ready));
+            cpu.w_ready   = ddr.w_ready &&
+                            (cpu_write_data_pending != 0 ||
+                             (cpu.aw_valid && cpu.aw_ready));
             cpu.b_id      = ddr.b_id;
             cpu.b_resp    = ddr.b_resp;
             cpu.b_user    = ddr.b_user;

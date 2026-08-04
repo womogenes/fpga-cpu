@@ -8,10 +8,11 @@ module lfm_axi_byte_reader #(
     input  logic                start_i,
     input  logic [29:0]         address_i,
     input  logic [31:0]         byte_count_i,
+    input  logic                word_mode_i,
     output logic                busy_o,
     output logic                done_o,
     output logic                error_o,
-    output logic [7:0]          byte_o,
+    output logic [15:0]         data_o,
     output logic                byte_valid_o,
     input  logic                byte_ready_i,
     output logic [ID_WIDTH-1:0] arid_o,
@@ -36,6 +37,8 @@ module lfm_axi_byte_reader #(
     logic [63:0] beat_data;
     logic [2:0]  byte_index;
     logic        beat_valid;
+    logic        last_unit;
+    logic        consume_last;
 
     function automatic [8:0] choose_burst(
         input logic [29:0] address,
@@ -57,9 +60,14 @@ module lfm_axi_byte_reader #(
     assign arid_o       = {ID_WIDTH{1'b1}};
     assign arsize_o     = 3'd3;
     assign arburst_o    = 2'b01;
-    assign byte_o       = beat_data[7:0];
+    assign data_o       = beat_data[15:0];
     assign byte_valid_o = beat_valid;
-    assign rready_o     = busy_o && !beat_valid;
+    assign last_unit    = (!word_mode_i && byte_index == 3'd7) ||
+                          (word_mode_i && byte_index == 3'd6);
+    assign consume_last = beat_valid && byte_ready_i && last_unit;
+    // Replace a consumed beat directly from RDATA when the next AXI beat is
+    // already waiting. This removes the former one-cycle bubble per 64 bits.
+    assign rready_o     = busy_o && (!beat_valid || consume_last);
 
     always_ff @(posedge clk_i or negedge rst_ni) begin
         if (!rst_ni) begin
@@ -123,16 +131,23 @@ module lfm_axi_byte_reader #(
             end
 
             if (beat_valid && byte_ready_i) begin
-                if (byte_index == 3'd7) begin
-                    beat_valid <= 1'b0;
-                    if (beats_unissued == 0 && beats_in_flight == 0 &&
-                        !arvalid_o) begin
-                        busy_o <= 1'b0;
-                        done_o <= 1'b1;
+                if (last_unit) begin
+                    if (!(rvalid_i && rready_o)) begin
+                        beat_valid <= 1'b0;
+                        if (beats_unissued == 0 && beats_in_flight == 0 &&
+                            !arvalid_o) begin
+                            busy_o <= 1'b0;
+                            done_o <= 1'b1;
+                        end
                     end
                 end else begin
-                    beat_data  <= {8'b0, beat_data[63:8]};
-                    byte_index <= byte_index + 1'b1;
+                    if (word_mode_i) begin
+                        beat_data  <= {16'b0, beat_data[63:16]};
+                        byte_index <= byte_index + 2'd2;
+                    end else begin
+                        beat_data  <= {8'b0, beat_data[63:8]};
+                        byte_index <= byte_index + 1'b1;
+                    end
                 end
             end
         end

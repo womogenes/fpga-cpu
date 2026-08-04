@@ -10,6 +10,7 @@ module software_video_plane #(
     input  logic [10:0] pixel_x,
     input  logic [9:0]  pixel_y,
     output logic        ready,
+    output logic        command_ack,
     output logic        active,
     output logic [7:0]  red,
     output logic [7:0]  green,
@@ -106,27 +107,41 @@ module software_video_plane #(
             end
 
             if (command_sync[31] != command_toggle) begin
-                command_toggle <= command_sync[31];
-                if (loading) begin
+                // Terminal mode is also an abort command, so a killed writer
+                // cannot leave the plane permanently stuck on a partial frame.
+                if (command_sync[30:28] == 3'b001 &&
+                    command_sync[6:0] == 7'h00) begin
+                    command_toggle <= command_sync[31];
+                    loading <= 0;
+                    unpacking <= 0;
+                    pending_swap <= 0;
+                    write_index <= 0;
+                    graphics_enabled <= 0;
+                end else if (loading) begin
+                    // Do not acknowledge a packet until the previous four
+                    // pixels have been unpacked. The source holds its command
+                    // stable while waiting for command_ack to follow its toggle.
                     if (!unpacking && command_sync[30:28] == 3'b000) begin
+                        command_toggle <= command_sync[31];
                         packet_data <= command_sync[27:0];
                         packet_index <= 0;
                         unpacking <= 1;
                     end
-                end else if (command_sync[30:28] == 3'b001) begin
-                    case (command_sync[6:0])
-                        7'h00: begin
-                            graphics_enabled <= 0;
-                            pending_swap <= 0;
-                        end
-                        7'h01: begin
-                            write_bank <= ~display_bank;
-                            write_index <= 0;
-                            loading <= 1;
-                        end
-                        7'h02: graphics_enabled <= 1;
-                        default: begin end
-                    endcase
+                end else begin
+                    // Consume even harmless out-of-state words so software can
+                    // always resynchronize the request/acknowledgement toggle.
+                    command_toggle <= command_sync[31];
+                    if (command_sync[30:28] == 3'b001) begin
+                        case (command_sync[6:0])
+                            7'h01: begin
+                                write_bank <= ~display_bank;
+                                write_index <= 0;
+                                loading <= 1;
+                            end
+                            7'h02: graphics_enabled <= 1;
+                            default: begin end
+                        endcase
+                    end
                 end
             end
         end
@@ -134,6 +149,7 @@ module software_video_plane #(
 
     always_comb begin
         ready = !loading && !pending_swap;
+        command_ack = command_toggle;
         active = graphics_enabled && !force_terminal;
         if (pixel_active) begin
             red = {pixel_data[6:5], pixel_data[6:5], pixel_data[6:5], pixel_data[6:5]};

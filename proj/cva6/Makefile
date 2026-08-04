@@ -1,4 +1,4 @@
-.PHONY: help init sim lint gateware image ram-image stage2-loader upload-ram upload-ram-model upload-model monitor deploy-remote remote-boot remote-boot-model deploy-model-remote remote-model status
+.PHONY: help init sim lint timing-accelerator gateware image ram-image stage2-loader upload-ram upload-ram-model upload-model monitor deploy-remote remote-boot remote-boot-model deploy-model-remote remote-model status
 
 ROOT := $(abspath ../..)
 OUTPUT := $(CURDIR)/build/sdk
@@ -20,6 +20,7 @@ help:
 	@echo "make init      Initialize all pinned CVA6 dependencies"
 	@echo "make sim       Run the hardware terminal regression test"
 	@echo "make lint      Elaborate the HDMI terminal RTL with Vivado"
+	@echo "make timing-accelerator Route only the LFM accelerator at its 200 MHz clock"
 	@echo "make gateware Build the CVA6 Genesys 2 HDMI bitstream"
 	@echo "make image    Build the 64-bit Linux userspace and SD-card image"
 	@echo "make ram-image Build Linux with the root filesystem embedded in DRAM firmware"
@@ -48,9 +49,14 @@ sim:
 	cd $(CURDIR) && vvp build/sim/software_video_plane_tb
 	verilator --binary --timing -Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-DECLFILENAME -Wno-TIMESCALEMOD -Ihardware/vendor/pulp-platform/axi/include --top-module lfm_matvec_accelerator_tb --Mdir build/sim/lfm/obj hardware/vendor/pulp-platform/axi/src/axi_pkg.sv hardware/vendor/pulp-platform/axi/src/axi_intf.sv rtl/lfm_axi_byte_reader.sv rtl/lfm_matvec_accelerator.sv sim/lfm_matvec_accelerator_tb.sv
 	build/sim/lfm/obj/Vlfm_matvec_accelerator_tb
+	verilator --binary --timing -Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-DECLFILENAME -Wno-TIMESCALEMOD -Ihardware/vendor/pulp-platform/axi/include --top-module lfm_axi_arbiter_tb --Mdir build/sim/arbiter/obj hardware/vendor/pulp-platform/axi/src/axi_pkg.sv hardware/vendor/pulp-platform/axi/src/axi_intf.sv rtl/lfm_axi_arbiter.sv sim/lfm_axi_arbiter_tb.sv
+	build/sim/arbiter/obj/Vlfm_axi_arbiter_tb
 
 lint:
 	cd hardware/corev_apu/fpga && CVA6_HDMI_ROOT=$(CURDIR) CVA6_UART_BAUD=$(UART_BAUD) vivado -nojournal -nolog -mode batch -source $(CURDIR)/scripts/lint_hdmi.tcl
+
+timing-accelerator:
+	CVA6_HDMI_ROOT=$(CURDIR) vivado -nojournal -nolog -mode batch -source $(CURDIR)/scripts/timing_accelerator.tcl
 
 gateware:
 	UART_BAUD=$(UART_BAUD) ./tools/build_gateware.sh

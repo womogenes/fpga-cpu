@@ -1,6 +1,11 @@
 set cva6_hdmi_root [file normalize $::env(CVA6_HDMI_ROOT)]
 set cva6_hdmi_prepared 0
 
+# Keep synthesis below the host's memory ceiling. The accelerator's replicated
+# activation BRAMs are inexpensive, but unrestricted parallel synthesis can
+# still exhaust RAM while Vivado performs technology mapping.
+set_param general.maxThreads 4
+
 proc cva6_hdmi_prepare {command operation} {
     global cva6_hdmi_root
     global cva6_hdmi_prepared
