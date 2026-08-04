@@ -1,0 +1,13 @@
+diff --git a/corev_apu/fpga/src/bootrom/src/main.c b/corev_apu/fpga/src/bootrom/src/main.c
+index fa11e446..62c8d88c 100644
+--- a/corev_apu/fpga/src/bootrom/src/main.c
++++ b/corev_apu/fpga/src/bootrom/src/main.c
+@@ -49,7 +49,7 @@ int main()
+ 
+ 
+     #ifndef PLAT_AGILEX
+-    init_uart(CLOCK_FREQUENCY, UART_BITRATE); //not needed in intel setup as UART IP is already configured via HW
++    init_uart(UART_CLOCK_FREQUENCY, UART_BITRATE); //not needed in intel setup as UART IP is already configured via HW
+     #endif 
+     print_uart("Hello World!\r\n");
+ 

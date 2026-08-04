@@ -1,0 +1,26 @@
+#!/bin/bash
+set -euo pipefail
+
+echo "Kernel: $(uname -srmo)"
+echo "Shell:  $BASH_VERSION"
+python3 - <<'PY'
+import bz2, curses, decimal, json, lzma, pathlib, readline, sqlite3, ssl, zlib
+import sys
+import numpy
+
+assert sys.version_info >= (3, 12)
+print("Python:", sys.version.split()[0], "with representative standard-library modules")
+print("NumPy: ", numpy.__version__)
+PY
+vim --version | sed -n '1s/^/Vim:     /p'
+tmux -V | sed 's/^/Tmux:    /'
+cc -O2 -Wall -Wextra /root/examples/hello.c -o /tmp/hello-cva6
+/tmp/hello-cva6
+echo "Native C compilation: OK"
+lfm-chat --self-test
+if test -s /root/models/LFM2.5-350M-Q4_0.gguf; then
+    echo "LFM model: present"
+else
+    echo "LFM model: not uploaded (run make remote-model from the host)"
+fi
+echo "Workstation software check: PASS"

@@ -1,0 +1,7 @@
+
+  CVA6 Linux workstation — 160x45 HDMI terminal at 3 Mbaud
+
+  Try: python, numpy-bench, lfm-chat, vim, tmux, snake, tetris,
+       ascii-invaders, mandelbrot, or badapple. Raise SW7 for TTY.
+
+  Run workstation-check for a quick test. Use remote-boot-model for LFM.

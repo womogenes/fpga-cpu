@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+hardware="$root/hardware"
+output="$root/build/gateware"
+bitstream="$output/cva6_genesys2_hdmi.bit"
+hash_file="$output/inputs.sha256"
+uart_baud="${UART_BAUD:-3000000}"
+
+mkdir -p "$output"
+"$root/tools/apply_patches.sh"
+
+if [[ -z "${RISCV:-}" || -z "${CROSSCOMPILE:-}" ]]; then
+    bootrom_cc="$(command -v riscv64-elf-gcc || command -v riscv64-unknown-elf-gcc || true)"
+    if [[ -z "$bootrom_cc" ]]; then
+        echo "No bare-metal RISC-V compiler was found." >&2
+        echo "Install riscv64-elf-gcc or set RISCV and CROSSCOMPILE." >&2
+        exit 1
+    fi
+    RISCV="$(cd "$(dirname "$bootrom_cc")/.." && pwd)"
+    CROSSCOMPILE="$(basename "$bootrom_cc")"
+    CROSSCOMPILE="${CROSSCOMPILE%gcc}"
+else
+    bootrom_cc="$RISCV/bin/${CROSSCOMPILE}gcc"
+fi
+
+input_hash="$({
+    vivado -version | sed -n '1p'
+    "$bootrom_cc" --version | sed -n '1p'
+    git -C "$hardware" rev-parse HEAD
+    git -C "$hardware" submodule status --recursive
+    git -C "$hardware" diff --binary HEAD
+    sha256sum \
+        "$hardware/corev_apu/fpga/src/apb_uart/src/vhdl_orig/apb_uart.vhd" \
+        "$hardware/corev_apu/fpga/src/apb_uart/src/vhdl_orig/uart_baudgen.vhd" \
+        "$hardware/corev_apu/fpga/src/bootrom/src/main.c"
+    printf 'UART_BAUD=%s\n' "$uart_baud"
+    find "$root/rtl" "$root/constraints" "$root/scripts" -type f -print0 | sort -z | xargs -0 sha256sum
+} | sha256sum | cut -d' ' -f1)"
+
+if [[ "${FORCE:-0}" != 1 && -f "$bitstream" && -f "$hash_file" && "$(<"$hash_file")" == "$input_hash" ]]; then
+    echo "Reusing cached $bitstream"
+    exit 0
+fi
+
+if pgrep -f '[V]ivado/bin/(vivado|loader)|[V]ivado/.*/unwrapped/.*/vivado|[p]arallel_synth_helper' >/dev/null; then
+    echo "Another Vivado build is already active; refusing to start a second one." >&2
+    exit 1
+fi
+
+export CVA6_HDMI_ROOT="$root"
+export CVA6_UART_BAUD="$uart_baud"
+export RISCV
+export CROSSCOMPILE
+export VIVADOFLAGS="-nojournal -mode batch -source scripts/prologue.tcl -source $root/scripts/hdmi_hook.tcl"
+
+bootrom_cflags="-DCLOCK_FREQUENCY=50000000 -DUART_CLOCK_FREQUENCY=48000000 -DUART_BITRATE=$uart_baud -DPLAT_XILINX -DXLEN=64 -Os -ggdb -march=rv64im_zicsr -mabi=lp64 -Wall -mcmodel=medany -mexplicit-relocs -ffreestanding -fpermissive"
+make -C "$hardware/corev_apu/fpga/src/bootrom" \
+    -B \
+    BOARD=genesys2 \
+    PLATFORM=PLAT_XILINX \
+    XLEN=64 \
+    UART_BITRATE="$uart_baud" \
+    CFLAGS="$bootrom_cflags" \
+    bootrom_64.sv
+
+rm -f "$hardware/corev_apu/fpga/work-fpga/ariane_xilinx.bit"
+make -C "$hardware" BOARD=genesys2 XLEN=64 fpga
+cp "$hardware/corev_apu/fpga/work-fpga/ariane_xilinx.bit" "$bitstream"
+cp "$hardware/corev_apu/fpga/reports/ariane.timing.rpt" "$output/timing.rpt"
+cp "$hardware/corev_apu/fpga/reports/ariane.utilization.rpt" "$output/utilization.rpt"
+printf '%s\n' "$input_hash" > "$hash_file"
+
+echo "Built $bitstream"

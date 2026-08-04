@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+real_cxx="${CVA6_REAL_CXX:-/usr/bin/c++}"
+
+if [[ ! -x "$real_cxx" ]]; then
+  echo "C++ compiler not found at $real_cxx; set CVA6_REAL_CXX" >&2
+  exit 1
+fi
+
+exec "$real_cxx" -std=gnu++17 "$@"

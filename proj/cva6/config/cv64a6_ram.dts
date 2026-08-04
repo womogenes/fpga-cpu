@@ -1,0 +1,10 @@
+/include/ "cv64a6_imafdc_sv39.dts"
+
+/ {
+  memory@80000000 {
+    reg = <0x0 0x80000000 0x0 0x30000000>;
+  };
+  chosen {
+    bootargs = "earlycon console=ttyS0,3000000n8 rdinit=/sbin/init rw fpga_model_size=219309792";
+  };
+};

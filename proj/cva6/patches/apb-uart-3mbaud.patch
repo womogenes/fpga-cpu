@@ -1,0 +1,89 @@
+diff --git a/src/vhdl_orig/apb_uart.vhd b/src/vhdl_orig/apb_uart.vhd
+index ccd00d0..91b5333 100644
+--- a/src/vhdl_orig/apb_uart.vhd
++++ b/src/vhdl_orig/apb_uart.vhd
+@@ -307,6 +307,8 @@ architecture rtl of apb_uart is
+     signal iBaudgenDiv      : std_logic_vector(15 downto 0);    -- Baudrate divider
+     signal iBaudtick16x     : std_logic;                        -- 16x Baudrate output from baudrate generator
+     signal iBaudtick2x      : std_logic;                        -- 2x Baudrate for transmitter
++    signal iBaudClockPhase  : unsigned(4 downto 0);             -- 24/25 fractional reference phase
++    signal iBaudClockEnable : std_logic;                        -- Effective 48 MHz UART clock enable
+     signal iRCLK            : std_logic;                        -- 16x Baudrate for receiver
+     signal iBAUDOUTN        : std_logic;
+ 
+@@ -742,9 +744,25 @@ begin
+ 
+     -- Baudrate generator
+     iBaudgenDiv <= iDLM & iDLL;
++    -- The Genesys 2 FT232R supports up to exactly 3 MBaud. Suppress one baud
++    -- generator enable out of every 25 50 MHz cycles to provide an effective
++    -- 48 MHz reference without introducing another clock domain.
++    iBaudClockEnable <= '0' when iBaudClockPhase = 24 else '1';
++    UART_BAUD_PHASE: process (CLK, iRST)
++    begin
++        if (iRST = '1') then
++            iBaudClockPhase <= (others => '0');
++        elsif (CLK'event and CLK = '1') then
++            if (iBaudClockPhase = 24) then
++                iBaudClockPhase <= (others => '0');
++            else
++                iBaudClockPhase <= iBaudClockPhase + 1;
++            end if;
++        end if;
++    end process;
+     UART_BG16: uart_baudgen port map (CLK         => CLK,
+                                       RST         => iRST,
+-                                      CE          => '1',
++                                      CE          => iBaudClockEnable,
+                                       CLEAR       => '0',
+                                       DIVIDER     => iBaudgenDiv,
+                                       BAUDTICK    => iBaudtick16x
+@@ -755,11 +773,11 @@ begin
+                                           CE    => iBaudtick16x,
+                                           Q     => iBaudtick2x
+                                          );
+-    UART_RCLK: slib_edge_detect port map (CLK => CLK,
+-                                          RST => iRST,
+-                                          D   => iBAUDOUTN,
+-                                          RE  => iRCLK
+-                                         );
++    -- RXCLK is a clock-enable pulse, not a free-running clock. The original
++    -- BAUDOUTN edge reconstruction loses consecutive ticks when DIVIDER=1;
++    -- drive the receiver from the generator pulse so 3 MBaud retains all 16
++    -- samples per symbol on the 48 MHz fractional reference.
++    iRCLK <= iBaudtick16x;
+ 
+     -- Transmitter FIFO
+     UART_TXFF: slib_fifo generic map (WIDTH => 8, SIZE_E => 6)
+diff --git a/src/vhdl_orig/uart_baudgen.vhd b/src/vhdl_orig/uart_baudgen.vhd
+index 75f26aa..2b43d3f 100644
+--- a/src/vhdl_orig/uart_baudgen.vhd
++++ b/src/vhdl_orig/uart_baudgen.vhd
+@@ -48,20 +48,19 @@ begin
+             iCounter <= (others => '0');
+             BAUDTICK <= '0';
+         elsif (CLK'event and CLK = '1') then
++            BAUDTICK <= '0';
+             if (CLEAR = '1') then
+                 iCounter <= (others => '0');
+             elsif (CE = '1') then
+-                iCounter <= iCounter - 1;
+-            end if;
+-
+-            BAUDTICK <= '0';
+-            if (unsigned(iCounter) = 0) then
+-                iCounter <= unsigned(DIVIDER) - 1;
+-                BAUDTICK <= '1';
++                if (unsigned(iCounter) = 0) then
++                    iCounter <= unsigned(DIVIDER) - 1;
++                    BAUDTICK <= '1';
++                else
++                    iCounter <= iCounter - 1;
++                end if;
+             end if;
+         end if;
+     end process;
+ 
+ end rtl;
+ 
+-

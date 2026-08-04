@@ -1,0 +1,20 @@
+--- main.c
++++ main.c
+@@ -731,6 +731,7 @@
+   return epoch;
+ }
+ 
++#ifndef LFM_ACCELERATOR
+ static void parallel_q4(float *out, const struct tensor *weight,
+                         const struct block_q8_0 *input) {
+   g_job.out = out;
+@@ -762,6 +763,9 @@
+   }
+   return best;
+ }
++#else
++#include "lfm_accelerator_backend.inc"
++#endif
+ 
+ static void embedding_row(float *out, const struct tensor *embedding, uint32_t token) {
+   if (embedding->type != LFM_Q6_K || token >= embedding->ne1 || embedding->ne0 != LFM_DIM)
