@@ -72,7 +72,7 @@ def main() -> None:
     parser.add_argument("--baud", type=int, default=3_000_000)
     parser.add_argument("--rate-kib", type=int, default=10)
     parser.add_argument("--chunk-size", type=int, default=32)
-    parser.add_argument("--destination", default="/root/models/LFM2.5-350M-Q4_0.gguf")
+    parser.add_argument("--destination", default="@0xb0000000")
     parser.add_argument("--already-logged-in", action="store_true")
     args = parser.parse_args()
 

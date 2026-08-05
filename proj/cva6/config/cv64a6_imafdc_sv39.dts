@@ -18,7 +18,7 @@
       reg = <0>;
       status = "okay";
       compatible = "eth, cva6", "riscv";
-      riscv,base = "rv64i";
+      riscv,isa-base = "rv64i";
       riscv,isa-extensions = "i", "m", "a", "f", "d", "c", "b",
                              "zifencei", "zicsr",
                              "zicntr", "zihpm",
@@ -26,6 +26,44 @@
       mmu-type = "riscv,sv39";
       tlb-split;
       CPU0_intc: interrupt-controller {
+        #interrupt-cells = <1>;
+        interrupt-controller;
+        compatible = "riscv,cpu-intc";
+      };
+    };
+    CPU1: cpu@1 {
+      clock-frequency = <100000000>;
+      device_type = "cpu";
+      reg = <1>;
+      status = "okay";
+      compatible = "eth, cva6", "riscv";
+      riscv,isa-base = "rv64i";
+      riscv,isa-extensions = "i", "m", "a", "f", "d", "c", "b",
+                             "zifencei", "zicsr",
+                             "zicntr", "zihpm",
+                             "zbc", "zcb", "zkn";
+      mmu-type = "riscv,sv39";
+      tlb-split;
+      CPU1_intc: interrupt-controller {
+        #interrupt-cells = <1>;
+        interrupt-controller;
+        compatible = "riscv,cpu-intc";
+      };
+    };
+    CPU2: cpu@2 {
+      clock-frequency = <100000000>;
+      device_type = "cpu";
+      reg = <2>;
+      status = "okay";
+      compatible = "eth, cva6", "riscv";
+      riscv,isa-base = "rv64i";
+      riscv,isa-extensions = "i", "m", "a", "f", "d", "c", "b",
+                             "zifencei", "zicsr",
+                             "zicntr", "zihpm",
+                             "zbc", "zcb", "zkn";
+      mmu-type = "riscv,sv39";
+      tlb-split;
+      CPU2_intc: interrupt-controller {
         #interrupt-cells = <1>;
         interrupt-controller;
         compatible = "riscv,cpu-intc";
@@ -43,7 +81,9 @@
     ranges;
     clint@2000000 {
       compatible = "riscv,clint0";
-      interrupts-extended = <&CPU0_intc 3 &CPU0_intc 7>;
+      interrupts-extended = <&CPU0_intc 3 &CPU0_intc 7
+                             &CPU1_intc 3 &CPU1_intc 7
+                             &CPU2_intc 3 &CPU2_intc 7>;
       reg = <0x0 0x2000000 0x0 0xc0000>;
       reg-names = "control";
     };
@@ -52,7 +92,9 @@
       #interrupt-cells = <1>;
       compatible = "riscv,plic0";
       interrupt-controller;
-      interrupts-extended = <&CPU0_intc 11 &CPU0_intc 9>;
+      interrupts-extended = <&CPU0_intc 11 &CPU0_intc 9
+                             &CPU1_intc 11 &CPU1_intc 9
+                             &CPU2_intc 11 &CPU2_intc 9>;
       reg = <0x0 0xc000000 0x0 0x4000000>;
       riscv,max-priority = <7>;
       riscv,ndev = <30>;

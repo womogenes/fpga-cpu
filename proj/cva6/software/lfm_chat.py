@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 
-DEFAULT_MODEL = Path("/root/models/LFM2.5-350M-Q4_0.gguf")
+DEFAULT_MODEL = Path("/dev/mem")
 DEFAULT_TOKENIZER = Path("/usr/share/lfm/tokenizer.pickle")
 DEFAULT_DECODER = Path("/usr/bin/lfm")
 PRETOKEN = re.compile(r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|(?:[^\r\n\w]|_)?[^\W\d_]+|\d{1,3}| ?(?:[^\s\w]|_)+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+", re.UNICODE)

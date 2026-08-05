@@ -14,6 +14,8 @@
     .equ RELOC_BASE,      0xbf000000
     .equ IMAGE_DEST,      0x80000000
     .equ MODEL_DEST,      0xb0000000
+    .equ SMP_MAILBOX,     0xbffffe00
+    .equ SMP_RELEASE,     0x534d504c
     .equ MAX_IMAGE_SIZE,  0x30000000
     .equ MAX_MODEL_SIZE,  0x0e000000
     .equ BLOCK_SIZE,      4096
@@ -42,6 +44,13 @@ _start:
 relocated_entry:
     li      sp, 0xbff00000
     li      s0, UART_BASE
+
+    /* The boot ROM used this word to release harts into stage 2. Clear it
+       before a delayed secondary performs its first safe DDR read; launch
+       publishes the completed payload with the same release protocol. */
+    li      t0, SMP_MAILBOX
+    sd      zero, 16(t0)
+    fence   rw, rw
 
     /* Preserve the existing 3 MBaud divisor and enable the 64-byte FIFOs. */
     li      t0, 0xe7
@@ -87,18 +96,10 @@ model_header_ready:
     li      s2, MODEL_DEST
     call    receive_segment
 
-    /* Re-read RAM so the final checksum covers stored memory, not registers. */
+    /* Block ACKs plus this target-side receive checksum validate transport.
+       Avoid rereading hundreds of MiB here: uncached DDR verification took
+       several minutes and left the host unable to capture early boot logs. */
     fence   rw, rw
-    li      a0, IMAGE_DEST
-    mv      a1, s4
-    li      a2, 2166136261
-    call    checksum_segment
-    mv      a2, a0
-    li      a0, MODEL_DEST
-    mv      a1, s6
-    call    checksum_segment
-    bne     a0, s3, loader_error
-
     la      a0, done_message
     call    uart_puts
     call    uart_getc
@@ -117,6 +118,14 @@ model_header_ready:
     bne     a0, t0, loader_error
 
 launch:
+    /* Publish the payload to boot-ROM parked secondary harts. */
+    li      t0, SMP_MAILBOX
+    li      t1, IMAGE_DEST
+    sd      t1, 0(t0)
+    sd      s11, 8(t0)
+    fence   rw, rw
+    li      t1, SMP_RELEASE
+    sd      t1, 16(t0)
     fence   rw, rw
     fence.i
     li      a0, 0
@@ -174,23 +183,6 @@ byte_loop:
 segment_done:
     ld      ra, 0(sp)
     addi    sp, sp, 16
-    ret
-
-checksum_segment:
-    mv      t0, a0
-    mv      t1, a1
-    mv      t2, a2
-    li      t3, 16777619
-12:
-    beqz    t1, 13f
-    lbu     t4, 0(t0)
-    xor     t2, t2, t4
-    mul     t2, t2, t3
-    addi    t0, t0, 1
-    addi    t1, t1, -1
-    j       12b
-13:
-    mv      a0, t2
     ret
 
 uart_getc:

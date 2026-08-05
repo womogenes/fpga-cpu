@@ -11,7 +11,9 @@ cpu_frequency=100000000
 uart_reference_frequency=96000000
 
 mkdir -p "$output"
-"$root/tools/apply_patches.sh"
+if [[ "${SKIP_PATCHES:-0}" != 1 ]]; then
+    "$root/tools/apply_patches.sh"
+fi
 
 if [[ -z "${RISCV:-}" || -z "${CROSSCOMPILE:-}" ]]; then
     bootrom_cc="$(command -v riscv64-elf-gcc || command -v riscv64-unknown-elf-gcc || true)"
@@ -57,7 +59,7 @@ export RISCV
 export CROSSCOMPILE
 export VIVADOFLAGS="-nojournal -mode batch -source scripts/prologue.tcl -source $root/scripts/hdmi_hook.tcl"
 
-bootrom_cflags="-DCLOCK_FREQUENCY=$cpu_frequency -DUART_CLOCK_FREQUENCY=$uart_reference_frequency -DUART_BITRATE=$uart_baud -DPLAT_XILINX -DXLEN=64 -Os -ggdb -march=rv64im_zicsr -mabi=lp64 -Wall -mcmodel=medany -mexplicit-relocs -ffreestanding -fpermissive"
+bootrom_cflags="-DCLOCK_FREQUENCY=$cpu_frequency -DUART_CLOCK_FREQUENCY=$uart_reference_frequency -DUART_BITRATE=$uart_baud -DPLAT_XILINX -DXLEN=64 -Os -ggdb -march=rv64im_zicsr_zifencei -mabi=lp64 -Wall -mcmodel=medany -mexplicit-relocs -ffreestanding -fpermissive"
 make -C "$hardware/corev_apu/fpga/src/bootrom" \
     -B \
     BOARD=genesys2 \

@@ -1,4 +1,4 @@
-.PHONY: help init sim lint timing-accelerator gateware image ram-image stage2-loader upload-ram upload-ram-model upload-model monitor deploy-remote remote-boot remote-boot-model deploy-model-remote remote-model status
+.PHONY: help init sim lint timing-accelerator gateware smp-smoke image ram-image stage2-loader upload-ram upload-ram-model upload-model monitor deploy-remote remote-boot remote-boot-model deploy-model-remote remote-model status
 
 ROOT := $(abspath ../..)
 OUTPUT := $(CURDIR)/build/sdk
@@ -22,6 +22,7 @@ help:
 	@echo "make lint      Elaborate the HDMI terminal RTL with Vivado"
 	@echo "make timing-accelerator Route only the LFM accelerator at its 200 MHz clock"
 	@echo "make gateware Build the CVA6 Genesys 2 HDMI bitstream"
+	@echo "make smp-smoke Build the three-hart bare-metal smoke test"
 	@echo "make image    Build the 64-bit Linux userspace and SD-card image"
 	@echo "make ram-image Build Linux with the root filesystem embedded in DRAM firmware"
 	@echo "make stage2-loader Build the flow-controlled fast RAM loader"
@@ -40,7 +41,7 @@ init:
 	./tools/apply_patches.sh
 
 sim:
-	mkdir -p build/sim
+	mkdir -p build/sim/lfm build/sim/arbiter
 	iverilog -g2012 -s terminal_buffer_tb -o build/sim/terminal_buffer_tb rtl/terminal_buffer.sv sim/terminal_buffer_tb.sv
 	cd $(CURDIR) && vvp build/sim/terminal_buffer_tb
 	iverilog -g2012 -s uart_rx_tb -o build/sim/uart_rx_tb rtl/uart_rx.sv sim/uart_rx_tb.sv
@@ -60,6 +61,11 @@ timing-accelerator:
 
 gateware:
 	UART_BAUD=$(UART_BAUD) ./tools/build_gateware.sh
+
+smp-smoke:
+	mkdir -p build/diagnostics
+	$$(command -v riscv64-elf-gcc || command -v riscv64-unknown-elf-gcc) -march=rv64ima_zicsr -mabi=lp64 -mcmodel=medany -nostdlib -nostartfiles -T diagnostics/smp_smoke.ld -o build/diagnostics/smp_smoke.elf diagnostics/smp_smoke.S
+	$$(command -v riscv64-elf-objcopy || command -v riscv64-unknown-elf-objcopy) -O binary build/diagnostics/smp_smoke.elf build/diagnostics/smp_smoke.bin
 
 monitor:
 	SERIAL=$(SERIAL) UART_BAUD=$(UART_BAUD) ./tools/monitor.sh

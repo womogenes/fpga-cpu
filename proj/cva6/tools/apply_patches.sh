@@ -17,8 +17,38 @@ apply_once() {
     fi
 }
 
-apply_once "$root/hardware" "$root/patches/cva6-bootrom-uart-clock.patch"
-apply_once "$root/hardware" "$root/patches/cva6-soc-video-accelerator.patch"
-apply_once "$root/hardware" "$root/patches/cva6-100mhz.patch"
+apply_stack() {
+    local repository="$1"
+    shift
+    local patches=("$@")
+    local start=0
+
+    # Later patches intentionally edit context introduced by earlier patches,
+    # so an early patch is not necessarily reverse-applicable once the entire
+    # stack is present. Find the newest applied layer, then apply only the
+    # remaining suffix.
+    for ((index=${#patches[@]} - 1; index >= 0; --index)); do
+        if git -C "$repository" apply --reverse --check "${patches[index]}" 2>/dev/null; then
+            start=$((index + 1))
+            echo "Patch stack already contains $(basename "${patches[index]}")"
+            break
+        fi
+    done
+
+    for ((index=start; index < ${#patches[@]}; ++index)); do
+        if ! git -C "$repository" apply --check "${patches[index]}" 2>/dev/null; then
+            echo "Cannot apply ${patches[index]} in $repository" >&2
+            exit 1
+        fi
+        git -C "$repository" apply "${patches[index]}"
+        echo "Applied $(basename "${patches[index]}")"
+    done
+}
+
+apply_stack "$root/hardware" \
+    "$root/patches/cva6-bootrom-uart-clock.patch" \
+    "$root/patches/cva6-soc-video-accelerator.patch" \
+    "$root/patches/cva6-100mhz.patch" \
+    "$root/patches/cva6-smp.patch"
 apply_once "$root/hardware/core/cvfpu" "$root/patches/cvfpu-fpga-fma-pipeline.patch"
 apply_once "$root/hardware/corev_apu/fpga/src/apb_uart" "$root/patches/apb-uart-3mbaud.patch"

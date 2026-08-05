@@ -18,3 +18,31 @@
  
  static void embedding_row(float *out, const struct tensor *embedding, uint32_t token) {
    if (embedding->type != LFM_Q6_K || token >= embedding->ne1 || embedding->ne0 != LFM_DIM)
+@@ -929,12 +933,27 @@
+ #ifdef LFM_HOST
+ static const uint8_t *map_model(const char *path, size_t *size_out) {
++#ifdef LFM_DIRECT_MODEL_PHYS
++  (void)path;
++  int fd = open("/dev/mem", O_RDONLY | O_SYNC);
++  if (fd < 0) fail("cannot open reserved model memory");
++  void *data = mmap(NULL, (size_t)LFM_MODEL_FILE_SIZE, PROT_READ, MAP_SHARED,
++                    fd, (off_t)LFM_DIRECT_MODEL_PHYS);
++  (void)close(fd);
++  if (data == MAP_FAILED) fail("cannot map reserved model memory");
++  const uint8_t *bytes = (const uint8_t *)data;
++  if (bytes[0] != 'G' || bytes[1] != 'G' || bytes[2] != 'U' || bytes[3] != 'F')
++    fail("no GGUF model is staged in reserved memory");
++  *size_out = (size_t)LFM_MODEL_FILE_SIZE;
++  return bytes;
++#else
+   int fd = open(path, O_RDONLY);
+   if (fd < 0) fail("cannot open model");
+   struct stat st;
+   if (fstat(fd, &st) != 0) fail("cannot stat model");
+   void *data = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+   (void)close(fd);
+   if (data == MAP_FAILED) fail("cannot map model");
+   *size_out = (size_t)st.st_size;
+   return (const uint8_t *)data;
++#endif
+ }

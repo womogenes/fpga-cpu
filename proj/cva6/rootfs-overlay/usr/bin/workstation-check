@@ -18,9 +18,5 @@ cc -O2 -Wall -Wextra /root/examples/hello.c -o /tmp/hello-cva6
 /tmp/hello-cva6
 echo "Native C compilation: OK"
 lfm-chat --self-test
-if test -s /root/models/LFM2.5-350M-Q4_0.gguf; then
-    echo "LFM model: present"
-else
-    echo "LFM model: not uploaded (run make remote-model from the host)"
-fi
+echo "LFM model: reserved DDR (run lfm-chat to validate staged weights)"
 echo "Workstation software check: PASS"

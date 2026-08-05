@@ -1,4 +1,6 @@
 CONFIG_DEFAULT_HOSTNAME="cva6-fpga"
+CONFIG_SMP=y
+CONFIG_NR_CPUS=3
 CONFIG_HZ_100=y
 CONFIG_CMDLINE="earlycon console=ttyS0,3000000n8 root=PARTLABEL=rootfs rootwait rw"
 # CONFIG_GCC_PLUGINS is not set
