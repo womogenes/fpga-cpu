@@ -89,3 +89,12 @@ rm -f "$build/bin/llama-cli" "$build/bin/llama-completion"
 cmake --build "$build" --target llama-completion -j"$(nproc)"
 install -m 0755 "$build/bin/llama-completion" "$target_dir/usr/bin/bonsai-runtime"
 "$host/bin/riscv64-buildroot-linux-gnu-strip" "$target_dir/usr/bin/bonsai-runtime"
+
+# Slim custom decoder: all Q1_0 matvecs through the whole-matrix accelerator
+# interface, everything else in tight scalar C with a small worker pool.
+"$target_gcc" \
+    -O3 -Wall -Wextra -std=gnu11 -pthread \
+    "-march=$target_march" "-mabi=$target_mabi" \
+    -I"$build" "$root/software/bonsai_main.c" "$accelerator_object" \
+    -lm -o "$build/bonsai-lite"
+install -m 0755 "$build/bonsai-lite" "$target_dir/usr/bin/bonsai-lite"

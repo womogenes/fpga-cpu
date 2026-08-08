@@ -474,12 +474,42 @@ int bonsai_accelerate_f32_matvec_submit(const void *weights, uint32_t columns,
   write_register(3u, tensor->ne0);
   write_register(4u, tensor->ne1);
   write_register(5u, 3u);
+  if (debug_enabled > 0) {
+    static int dumped;
+    if (!dumped) {
+      dumped = 1;
+      fprintf(stderr,
+              "[drv] regs: w=%llu in=%u out=%u ne0=%u ne1=%u gpio0=%08x "
+              "scratch_rb=%02x%02x%02x%02x%02x%02x%02x%02x q8d=%04x\n",
+              (unsigned long long)(tensor->offset >> 3),
+              BONSAI_INPUT_OFFSET >> 3, BONSAI_OUTPUT_OFFSET >> 3,
+              tensor->ne0, tensor->ne1, accelerator_gpio[0],
+              accelerator_scratch[0], accelerator_scratch[1],
+              accelerator_scratch[2], accelerator_scratch[3],
+              accelerator_scratch[4], accelerator_scratch[5],
+              accelerator_scratch[6], accelerator_scratch[7],
+              (unsigned)*(const uint16_t *)quantized_input);
+      fflush(stderr);
+    }
+  }
   debug_step("submit: command written, polling");
   uint32_t status;
   do {
     status = accelerator_gpio[2];
   } while ((status & BONSAI_STATUS_DONE) == old_done);
   accelerator_fence();
+  if (debug_enabled > 0) {
+    static int dumped2;
+    if (!dumped2) {
+      dumped2 = 1;
+      const volatile int64_t *raw =
+          (const volatile int64_t *)(accelerator_scratch + BONSAI_OUTPUT_LOCAL);
+      fprintf(stderr, "[drv] status=%08x raw[0..3]=%lld %lld %lld %lld\n",
+              status, (long long)raw[0], (long long)raw[1],
+              (long long)raw[2], (long long)raw[3]);
+      fflush(stderr);
+    }
+  }
   debug_step("submit: done observed");
   if (profile_enabled)
     profile_hardware_ns += profile_now() - hardware_start;
@@ -502,12 +532,22 @@ int bonsai_accelerate_f32_matvec_submit(const void *weights, uint32_t columns,
   return 1;
 }
 
+/* This FPU's 64-bit integer converts (fcvt.s.l) are unreliable, so build
+   the float from 32-bit halves, which convert correctly. */
+static inline float s64_to_float(int64_t value) {
+  int32_t high = (int32_t)(value >> 32);
+  uint32_t low = (uint32_t)value;
+  return (float)high * 4294967296.0f +
+         (float)(int32_t)(low >> 1) * 2.0f + (float)(int32_t)(low & 1u);
+}
+
 void bonsai_accelerate_read_rows(float *output, uint32_t first,
                                  uint32_t count) {
   const volatile int64_t *hardware_output =
       (const volatile int64_t *)(accelerator_scratch + BONSAI_OUTPUT_LOCAL);
   for (uint32_t row = first; row < first + count; ++row)
-    output[row] = (float)hardware_output[row] * (1.0f / 1073741824.0f);
+    output[row] = s64_to_float(hardware_output[row]) *
+                  (1.0f / 1073741824.0f);
 }
 
 void bonsai_accelerate_release(void) {
@@ -580,6 +620,6 @@ void __wrap_ggml_vec_dot_q1_0_q8_0(int n, float *s, size_t bs,
   }
   const volatile int64_t *output =
       (const volatile int64_t *)(accelerator_scratch + BONSAI_OUTPUT_LOCAL);
-  *s = (float)output[row] * (1.0f / 1073741824.0f);
+  *s = s64_to_float(output[row]) * (1.0f / 1073741824.0f);
   unlock_accelerator();
 }
