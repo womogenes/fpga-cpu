@@ -9,7 +9,7 @@
     .equ UART_THR,    0
     .equ UART_LSR,    20
     .equ READY_MAGIC, 0x534d5054
-    .equ HART_COUNT,  3
+    .equ HART_COUNT,  4
 
 _start:
     csrr    s1, mhartid
@@ -115,7 +115,7 @@ uart_puts:
 online_message:
     .asciz  "hart 0 online\n"
 pass_message:
-    .asciz  "SMP PASS: 3 harts and AMOs operational\n"
+    .asciz  "SMP PASS: 4 harts and AMOs operational\n"
 
     .section .bss, "aw", @nobits
     .balign 4

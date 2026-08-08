@@ -49,6 +49,7 @@ apply_stack "$root/hardware" \
     "$root/patches/cva6-bootrom-uart-clock.patch" \
     "$root/patches/cva6-soc-video-accelerator.patch" \
     "$root/patches/cva6-100mhz.patch" \
-    "$root/patches/cva6-smp.patch"
+    "$root/patches/cva6-smp.patch" \
+    "$root/patches/cva6-four-hart.patch"
 apply_once "$root/hardware/core/cvfpu" "$root/patches/cvfpu-fpga-fma-pipeline.patch"
 apply_once "$root/hardware/corev_apu/fpga/src/apb_uart" "$root/patches/apb-uart-3mbaud.patch"

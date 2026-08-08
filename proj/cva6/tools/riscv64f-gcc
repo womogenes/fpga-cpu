@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+compiler="${CVA6_RISCV_GCC:?CVA6_RISCV_GCC is not set}"
+march="${CVA6_RISCV_MARCH:-rv64imafc_zicsr_zifencei_zbc_zicntr_zcb_zihpm}"
+mabi="${CVA6_RISCV_MABI:-lp64}"
+arguments=()
+
+# llama.cpp currently appends rv64gc/lp64d in its RISC-V CMake path. Remove
+# every architecture/ABI selection it supplied and place the board's exact
+# contract last so compiler probes, compilation, and links all agree.
+for argument in "$@"; do
+    case "$argument" in
+        -march=*|-mabi=*) ;;
+        *) arguments+=("$argument") ;;
+    esac
+done
+
+exec "$compiler" "${arguments[@]}" "-march=$march" "-mabi=$mabi"

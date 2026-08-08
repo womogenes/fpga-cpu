@@ -13,11 +13,11 @@
     .equ UART_LSR,        20
     .equ RELOC_BASE,      0xbf000000
     .equ IMAGE_DEST,      0x80000000
-    .equ MODEL_DEST,      0xb0000000
+    .equ MODEL_DEST,      0xaf000000
     .equ SMP_MAILBOX,     0xbffffe00
     .equ SMP_RELEASE,     0x534d504c
-    .equ MAX_IMAGE_SIZE,  0x30000000
-    .equ MAX_MODEL_SIZE,  0x0e000000
+    .equ MAX_IMAGE_SIZE,  0x2f000000
+    .equ MAX_MODEL_SIZE,  0x0f000000
     .equ BLOCK_SIZE,      4096
 
 _start:

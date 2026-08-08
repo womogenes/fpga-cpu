@@ -2,7 +2,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-host="$root/sdk/buildroot/output/host"
+host="$root/build/buildroot/host"
 cross="$host/bin/riscv64-buildroot-linux-gnu-"
 output="$root/build/sdk"
 

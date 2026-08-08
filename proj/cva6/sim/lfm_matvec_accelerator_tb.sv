@@ -2,7 +2,7 @@
 
 module lfm_matvec_accelerator_tb;
 
-    localparam logic [29:0] MODEL_BASE = 30'h3000_0000;
+    localparam logic [29:0] MODEL_BASE = 30'h2f00_0000;
     localparam integer MEMORY_BYTES = 4 * 1024 * 1024;
     localparam integer INPUT_OFFSET = 32'h0000_0000;
     // Match the 0xae0 page offset of blk.1.ffn_down.weight, the first
@@ -193,7 +193,10 @@ module lfm_matvec_accelerator_tb;
                 timeout = timeout + 1;
             end
             if (timeout == 20000000)
-                $fatal(1, "accelerator timeout state=%0d status=%08x", dut.state, status);
+                $fatal(1, "accelerator timeout state=%0d status=%08x row=%0d block=%0d position=%0d bytes=%0d reader_busy=%0d reader_done=%0d",
+                       dut.state, status, dut.row_index, dut.row_block,
+                       dut.weight_position, dut.weight_byte_index,
+                       dut.reader_busy, dut.reader_done);
             if (request || grant)
                 $fatal(1, "DONE became visible before DDR was released");
             if (status[29])
@@ -354,6 +357,85 @@ module lfm_matvec_accelerator_tb;
         end
     endtask
 
+    task automatic run_q1_test;
+        integer block;
+        integer input_block_index;
+        integer row;
+        integer group;
+        integer j;
+        integer address;
+        integer bit_index;
+        integer bit_value;
+        integer input_value;
+        integer dot;
+        longint signed expected;
+        longint signed actual;
+        logic [15:0] input_d;
+        logic [15:0] weight_d;
+        logic old_done;
+        begin
+            for (input_block_index = 0; input_block_index < 8;
+                 input_block_index = input_block_index + 1) begin
+                address = INPUT_OFFSET + input_block_index * 34;
+                input_d = 16'h2a00 + input_block_index * 16'h0030;
+                write_u16(address, input_d);
+                for (j = 0; j < 32; j = j + 1)
+                    memory[address + 2 + j] =
+                        byte'(((input_block_index * 43 + j * 17) % 255) - 127);
+            end
+            for (row = 0; row < 3; row = row + 1) begin
+                for (block = 0; block < 2; block = block + 1) begin
+                    address = WEIGHT_OFFSET + (row * 2 + block) * 18;
+                    weight_d = 16'h2800 + row * 16'h0080 + block * 16'h0020;
+                    write_u16(address, weight_d);
+                    for (j = 0; j < 16; j = j + 1)
+                        memory[address + 2 + j] =
+                            (row * 71 + block * 29 + j * 53) & 8'hff;
+                end
+            end
+
+            old_done = status[28];
+            send_register(0, WEIGHT_OFFSET >> 3);
+            send_register(1, INPUT_OFFSET >> 3);
+            send_register(2, OUTPUT_OFFSET >> 3);
+            send_register(3, 256);
+            send_register(4, 3);
+            send_register(5, 3);
+            wait_done(old_done);
+
+            for (row = 0; row < 3; row = row + 1) begin
+                expected = 0;
+                for (block = 0; block < 2; block = block + 1) begin
+                    address = WEIGHT_OFFSET + (row * 2 + block) * 18;
+                    weight_d = {memory[address + 1], memory[address]};
+                    for (group = 0; group < 4; group = group + 1) begin
+                        dot = 0;
+                        input_block_index = block * 4 + group;
+                        for (j = 0; j < 32; j = j + 1) begin
+                            bit_index = group * 32 + j;
+                            bit_value = (memory[address + 2 + bit_index / 8] >>
+                                         (bit_index % 8)) & 1;
+                            input_value = $signed(memory[INPUT_OFFSET +
+                                input_block_index * 34 + 2 + j]);
+                            dot = dot + (bit_value ? input_value : -input_value);
+                        end
+                        input_d = {memory[INPUT_OFFSET + input_block_index * 34 + 1],
+                                   memory[INPUT_OFFSET + input_block_index * 34]};
+                        expected = expected +
+                            dot * fp16_product_q30(weight_d, input_d);
+                    end
+                end
+                actual = 0;
+                for (j = 0; j < 8; j = j + 1)
+                    actual[j*8 +: 8] = memory[OUTPUT_OFFSET + row * 8 + j];
+                if (actual !== expected)
+                    $fatal(1, "Q1 row %0d mismatch: got %0d expected %0d",
+                           row, actual, expected);
+            end
+            $display("PASS: Q1_0 exact Q30 matrix-vector output");
+        end
+    endtask
+
     task automatic run_q6_test;
         integer block;
         integer row;
@@ -461,6 +543,95 @@ module lfm_matvec_accelerator_tb;
         end
     endtask
 
+    // Larger Q1 runs covering multi-block rows, negative and zero scales,
+    // and the single-block-per-row case that stresses the row-result FIFO
+    // backpressure of the streaming Q1 pipeline.
+    task automatic run_q1_stress(input integer ne0, input integer ne1);
+        integer block;
+        integer input_block_index;
+        integer row;
+        integer group;
+        integer j;
+        integer address;
+        integer bit_index;
+        integer bit_value;
+        integer input_value;
+        integer dot;
+        longint signed expected;
+        longint signed actual;
+        logic [15:0] input_d;
+        logic [15:0] weight_d;
+        logic old_done;
+        begin
+            for (input_block_index = 0; input_block_index < ne0 / 32;
+                 input_block_index = input_block_index + 1) begin
+                address = INPUT_OFFSET + input_block_index * 34;
+                input_d = 16'h2c00 + ((input_block_index * 37) % 512);
+                if (input_block_index % 5 == 3)
+                    input_d = input_d | 16'h8000;
+                write_u16(address, input_d);
+                for (j = 0; j < 32; j = j + 1)
+                    memory[address + 2 + j] =
+                        byte'(((input_block_index * 61 + j * 13) % 255) - 127);
+            end
+            for (row = 0; row < ne1; row = row + 1) begin
+                for (block = 0; block < ne0 / 128; block = block + 1) begin
+                    address = WEIGHT_OFFSET + (row * (ne0 / 128) + block) * 18;
+                    weight_d = 16'h2600 + ((row * 97 + block * 41) % 1024);
+                    if ((row + block) % 3 == 1)
+                        weight_d = weight_d | 16'h8000;
+                    if (row == 0 && block == 0)
+                        weight_d = 16'h0000;
+                    write_u16(address, weight_d);
+                    for (j = 0; j < 16; j = j + 1)
+                        memory[address + 2 + j] =
+                            (row * 19 + block * 7 + j * 111) & 8'hff;
+                end
+            end
+
+            old_done = status[28];
+            send_register(0, WEIGHT_OFFSET >> 3);
+            send_register(1, INPUT_OFFSET >> 3);
+            send_register(2, OUTPUT_OFFSET >> 3);
+            send_register(3, ne0[24:0]);
+            send_register(4, ne1[24:0]);
+            send_register(5, 3);
+            wait_done(old_done);
+
+            for (row = 0; row < ne1; row = row + 1) begin
+                expected = 0;
+                for (block = 0; block < ne0 / 128; block = block + 1) begin
+                    address = WEIGHT_OFFSET + (row * (ne0 / 128) + block) * 18;
+                    weight_d = {memory[address + 1], memory[address]};
+                    for (group = 0; group < 4; group = group + 1) begin
+                        dot = 0;
+                        input_block_index = block * 4 + group;
+                        for (j = 0; j < 32; j = j + 1) begin
+                            bit_index = group * 32 + j;
+                            bit_value = (memory[address + 2 + bit_index / 8] >>
+                                         (bit_index % 8)) & 1;
+                            input_value = $signed(memory[INPUT_OFFSET +
+                                input_block_index * 34 + 2 + j]);
+                            dot = dot + (bit_value ? input_value : -input_value);
+                        end
+                        input_d = {memory[INPUT_OFFSET + input_block_index * 34 + 1],
+                                   memory[INPUT_OFFSET + input_block_index * 34]};
+                        expected = expected +
+                            dot * fp16_product_q30(weight_d, input_d);
+                    end
+                end
+                actual = 0;
+                for (j = 0; j < 8; j = j + 1)
+                    actual[j*8 +: 8] = memory[OUTPUT_OFFSET + row * 8 + j];
+                if (actual !== expected)
+                    $fatal(1, "Q1 stress %0dx%0d row %0d mismatch: got %0d expected %0d",
+                           ne0, ne1, row, actual, expected);
+            end
+            $display("PASS: Q1_0 exact %0dx%0d stress output (%0d cycles, %0d weights)",
+                     ne0, ne1, dut.cycle_count, ne0 * ne1);
+        end
+    endtask
+
     initial begin
         for (i = 0; i < MEMORY_BYTES; i = i + 1)
             memory[i] = 0;
@@ -475,10 +646,17 @@ module lfm_matvec_accelerator_tb;
         run_q4_large_input_test();
         run_q4_test();
         run_q4_large_input_test();
+        run_q1_test();
         run_q6_test();
         run_q4_test();
+        run_q1_test();
         run_q6_test();
-        $display("PASS: LFM accelerator regression complete");
+        run_q1_stress(1024, 37);
+        run_q1_stress(128, 64);
+        run_q1_stress(2048, 96);
+        run_q4_test();
+        run_q6_test();
+        $display("PASS: LFM and Bonsai accelerator regression complete");
         $finish;
     end
 

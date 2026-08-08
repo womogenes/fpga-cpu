@@ -2,9 +2,12 @@
 
 / {
   memory@80000000 {
-    reg = <0x0 0x80000000 0x0 0x30000000>;
+    reg = <0x0 0x80000000 0x0 0x2f000000>;
   };
   chosen {
-    bootargs = "earlycon console=ttyS0,3000000n8 rdinit=/sbin/init rw fpga_model_size=219309792";
+    /* Linux otherwise chooses tmpfs for rootfs and caps extraction at half of
+       managed RAM. The development image is intentionally larger than that;
+       ramfs has no artificial size ceiling and remains writable. */
+    bootargs = "earlycon console=ttyS0,3000000n8 rootfstype=ramfs rdinit=/sbin/init rw";
   };
 };

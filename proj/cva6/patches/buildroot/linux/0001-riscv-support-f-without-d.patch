@@ -1,0 +1,269 @@
+From 8bfc5fe3f9ec2d11bcce81783bf693866ac6b81f Mon Sep 17 00:00:00 2001
+From: fpga-cpu <fpga-cpu@localhost>
+Date: Wed, 5 Aug 2026 20:00:00 -0700
+Subject: [PATCH] riscv: support F without D
+
+The RISC-V ISA permits single-precision floating point without the
+double-precision extension, but the kernel currently rejects that topology
+because its task switch code unconditionally uses fld/fsd and its signal code
+unconditionally exposes D-format state.
+
+Keep the existing D path and add an F-only path using flw/fsw. The internal
+task structure remains the larger D-shaped superset, while F signal frames are
+packed and unpacked according to the existing UAPI F state definition.
+Advertise F in the ISA bitmap and ELF HWCAP so LP64 programs compiled with
+single-precision instructions can use the hardware safely.
+---
+ arch/riscv/include/asm/switch_to.h | 21 +++++++++++++++++++--
+ arch/riscv/kernel/cpufeature.c     | 18 ------------------
+ arch/riscv/kernel/fpu.S            | 86 +++++++++++++++++++++++++++++++++++++++
+ arch/riscv/kernel/signal.c         | 32 ++++++++++++++++++++++++++++----
+ 4 files changed, 133 insertions(+), 24 deletions(-)
+
+diff --git a/arch/riscv/include/asm/switch_to.h b/arch/riscv/include/asm/switch_to.h
+index 8d4e9e7c7f71..38a16e4b3b13 100644
+--- a/arch/riscv/include/asm/switch_to.h
++++ b/arch/riscv/include/asm/switch_to.h
+@@ -18,7 +18,24 @@
+ #ifdef CONFIG_FPU
+ extern void __fstate_save(struct task_struct *save_to);
+ extern void __fstate_restore(struct task_struct *restore_from);
++extern void __fstate_save_f(struct task_struct *save_to);
++extern void __fstate_restore_f(struct task_struct *restore_from);
++
++static inline void __fstate_save_isa(struct task_struct *task)
++{
++	if (riscv_has_extension_likely(RISCV_ISA_EXT_d))
++		__fstate_save(task);
++	else
++		__fstate_save_f(task);
++}
+ 
++static inline void __fstate_restore_isa(struct task_struct *task)
++{
++	if (riscv_has_extension_likely(RISCV_ISA_EXT_d))
++		__fstate_restore(task);
++	else
++		__fstate_restore_f(task);
++}
+ static inline void __fstate_clean(struct pt_regs *regs)
+ {
+ 	regs->status = (regs->status & ~SR_FS) | SR_FS_CLEAN;
+@@ -34,7 +51,7 @@ static inline void fstate_save(struct task_struct *task,
+ 			       struct pt_regs *regs)
+ {
+ 	if ((regs->status & SR_FS) == SR_FS_DIRTY) {
+-		__fstate_save(task);
++		__fstate_save_isa(task);
+ 		__fstate_clean(regs);
+ 	}
+ }
+@@ -43,7 +60,7 @@ static inline void fstate_restore(struct task_struct *task,
+ 				  struct pt_regs *regs)
+ {
+ 	if ((regs->status & SR_FS) != SR_FS_OFF) {
+-		__fstate_restore(task);
++		__fstate_restore_isa(task);
+ 		__fstate_clean(regs);
+ 	}
+ }
+diff --git a/arch/riscv/kernel/cpufeature.c b/arch/riscv/kernel/cpufeature.c
+index 6cbcacd8cce8..4256f1059f62 100644
+--- a/arch/riscv/kernel/cpufeature.c
++++ b/arch/riscv/kernel/cpufeature.c
+@@ -141,15 +141,6 @@ static int riscv_ext_f_validate(const struct riscv_isa_ext_data *data,
+ 	if (!IS_ENABLED(CONFIG_FPU))
+ 		return -EINVAL;
+ 
+-	/*
+-	 * Due to extension ordering, d is checked before f, so no deferral
+-	 * is required.
+-	 */
+-	if (!__riscv_isa_extension_available(isa_bitmap, RISCV_ISA_EXT_d)) {
+-		pr_warn_once("This kernel does not support systems with F but not D\n");
+-		return -EINVAL;
+-	}
+-
+ 	return 0;
+ }
+ 
+@@ -1101,15 +1092,6 @@ void __init riscv_fill_hwcap(void)
+ 		}
+ 	}
+ 
+-	/*
+-	 * We don't support systems with F but without D, so mask those out
+-	 * here.
+-	 */
+-	if ((elf_hwcap & COMPAT_HWCAP_ISA_F) && !(elf_hwcap & COMPAT_HWCAP_ISA_D)) {
+-		pr_info("This kernel does not support systems with F but not D\n");
+-		elf_hwcap &= ~COMPAT_HWCAP_ISA_F;
+-	}
+-
+ 	if (__riscv_isa_extension_available(NULL, RISCV_ISA_EXT_ZVE32X) ||
+ 	    has_xtheadvector_no_alternatives()) {
+ 		/*
+diff --git a/arch/riscv/kernel/fpu.S b/arch/riscv/kernel/fpu.S
+index 09c0a9d426de..4f7bc2f07d66 100644
+--- a/arch/riscv/kernel/fpu.S
++++ b/arch/riscv/kernel/fpu.S
+@@ -105,6 +105,92 @@ SYM_FUNC_START(__fstate_restore)
+ 	ret
+ SYM_FUNC_END(__fstate_restore)
+ 
++SYM_FUNC_START(__fstate_save_f)
++	li  a2,  TASK_THREAD_F0
++	add a0, a0, a2
++	li t1, SR_FS
++	csrs CSR_STATUS, t1
++	frcsr t0
++	fsw f0,  TASK_THREAD_F0_F0(a0)
++	fsw f1,  TASK_THREAD_F1_F0(a0)
++	fsw f2,  TASK_THREAD_F2_F0(a0)
++	fsw f3,  TASK_THREAD_F3_F0(a0)
++	fsw f4,  TASK_THREAD_F4_F0(a0)
++	fsw f5,  TASK_THREAD_F5_F0(a0)
++	fsw f6,  TASK_THREAD_F6_F0(a0)
++	fsw f7,  TASK_THREAD_F7_F0(a0)
++	fsw f8,  TASK_THREAD_F8_F0(a0)
++	fsw f9,  TASK_THREAD_F9_F0(a0)
++	fsw f10, TASK_THREAD_F10_F0(a0)
++	fsw f11, TASK_THREAD_F11_F0(a0)
++	fsw f12, TASK_THREAD_F12_F0(a0)
++	fsw f13, TASK_THREAD_F13_F0(a0)
++	fsw f14, TASK_THREAD_F14_F0(a0)
++	fsw f15, TASK_THREAD_F15_F0(a0)
++	fsw f16, TASK_THREAD_F16_F0(a0)
++	fsw f17, TASK_THREAD_F17_F0(a0)
++	fsw f18, TASK_THREAD_F18_F0(a0)
++	fsw f19, TASK_THREAD_F19_F0(a0)
++	fsw f20, TASK_THREAD_F20_F0(a0)
++	fsw f21, TASK_THREAD_F21_F0(a0)
++	fsw f22, TASK_THREAD_F22_F0(a0)
++	fsw f23, TASK_THREAD_F23_F0(a0)
++	fsw f24, TASK_THREAD_F24_F0(a0)
++	fsw f25, TASK_THREAD_F25_F0(a0)
++	fsw f26, TASK_THREAD_F26_F0(a0)
++	fsw f27, TASK_THREAD_F27_F0(a0)
++	fsw f28, TASK_THREAD_F28_F0(a0)
++	fsw f29, TASK_THREAD_F29_F0(a0)
++	fsw f30, TASK_THREAD_F30_F0(a0)
++	fsw f31, TASK_THREAD_F31_F0(a0)
++	sw t0, TASK_THREAD_FCSR_F0(a0)
++	csrc CSR_STATUS, t1
++	ret
++SYM_FUNC_END(__fstate_save_f)
++
++SYM_FUNC_START(__fstate_restore_f)
++	li  a2,  TASK_THREAD_F0
++	add a0, a0, a2
++	li t1, SR_FS
++	lw t0, TASK_THREAD_FCSR_F0(a0)
++	csrs CSR_STATUS, t1
++	flw f0,  TASK_THREAD_F0_F0(a0)
++	flw f1,  TASK_THREAD_F1_F0(a0)
++	flw f2,  TASK_THREAD_F2_F0(a0)
++	flw f3,  TASK_THREAD_F3_F0(a0)
++	flw f4,  TASK_THREAD_F4_F0(a0)
++	flw f5,  TASK_THREAD_F5_F0(a0)
++	flw f6,  TASK_THREAD_F6_F0(a0)
++	flw f7,  TASK_THREAD_F7_F0(a0)
++	flw f8,  TASK_THREAD_F8_F0(a0)
++	flw f9,  TASK_THREAD_F9_F0(a0)
++	flw f10, TASK_THREAD_F10_F0(a0)
++	flw f11, TASK_THREAD_F11_F0(a0)
++	flw f12, TASK_THREAD_F12_F0(a0)
++	flw f13, TASK_THREAD_F13_F0(a0)
++	flw f14, TASK_THREAD_F14_F0(a0)
++	flw f15, TASK_THREAD_F15_F0(a0)
++	flw f16, TASK_THREAD_F16_F0(a0)
++	flw f17, TASK_THREAD_F17_F0(a0)
++	flw f18, TASK_THREAD_F18_F0(a0)
++	flw f19, TASK_THREAD_F19_F0(a0)
++	flw f20, TASK_THREAD_F20_F0(a0)
++	flw f21, TASK_THREAD_F21_F0(a0)
++	flw f22, TASK_THREAD_F22_F0(a0)
++	flw f23, TASK_THREAD_F23_F0(a0)
++	flw f24, TASK_THREAD_F24_F0(a0)
++	flw f25, TASK_THREAD_F25_F0(a0)
++	flw f26, TASK_THREAD_F26_F0(a0)
++	flw f27, TASK_THREAD_F27_F0(a0)
++	flw f28, TASK_THREAD_F28_F0(a0)
++	flw f29, TASK_THREAD_F29_F0(a0)
++	flw f30, TASK_THREAD_F30_F0(a0)
++	flw f31, TASK_THREAD_F31_F0(a0)
++	fscsr t0
++	csrc CSR_STATUS, t1
++	ret
++SYM_FUNC_END(__fstate_restore_f)
++
+ #define get_f32(which) fmv.x.s a0, which; j 2f
+ #define put_f32(which) fmv.s.x which, a1; j 2f
+ #if __riscv_xlen == 64
+diff --git a/arch/riscv/kernel/signal.c b/arch/riscv/kernel/signal.c
+index b87fbe967fba..413ba0383fce 100644
+--- a/arch/riscv/kernel/signal.c
++++ b/arch/riscv/kernel/signal.c
+@@ -38,34 +38,58 @@ struct rt_sigframe {
+ #endif
+ };
+ 
+ #ifdef CONFIG_FPU
+ static long restore_fp_state(struct pt_regs *regs,
+ 			     union __riscv_fp_state __user *sc_fpregs)
+ {
+ 	long err;
+-	struct __riscv_d_ext_state __user *state = &sc_fpregs->d;
+ 
+-	err = __copy_from_user(&current->thread.fstate, state, sizeof(*state));
++	if (riscv_has_extension_likely(RISCV_ISA_EXT_d)) {
++		struct __riscv_d_ext_state __user *state = &sc_fpregs->d;
++
++		err = __copy_from_user(&current->thread.fstate, state, sizeof(*state));
++	} else {
++		struct __riscv_f_ext_state state;
++		int i;
++
++		err = __copy_from_user(&state, &sc_fpregs->f, sizeof(state));
++		if (unlikely(err))
++			return err;
++		for (i = 0; i < ARRAY_SIZE(state.f); i++)
++			current->thread.fstate.f[i] = state.f[i];
++		current->thread.fstate.fcsr = state.fcsr;
++	}
+ 	if (unlikely(err))
+ 		return err;
+ 
+ 	fstate_restore(current, regs);
+ 	return 0;
+ }
+ 
+ static long save_fp_state(struct pt_regs *regs,
+ 			  union __riscv_fp_state __user *sc_fpregs)
+ {
+ 	long err;
+-	struct __riscv_d_ext_state __user *state = &sc_fpregs->d;
+ 
+ 	fstate_save(current, regs);
+-	err = __copy_to_user(state, &current->thread.fstate, sizeof(*state));
++	if (riscv_has_extension_likely(RISCV_ISA_EXT_d)) {
++		struct __riscv_d_ext_state __user *state = &sc_fpregs->d;
++
++		err = __copy_to_user(state, &current->thread.fstate, sizeof(*state));
++	} else {
++		struct __riscv_f_ext_state state;
++		int i;
++
++		for (i = 0; i < ARRAY_SIZE(state.f); i++)
++			state.f[i] = current->thread.fstate.f[i];
++		state.fcsr = current->thread.fstate.fcsr;
++		err = __copy_to_user(&sc_fpregs->f, &state, sizeof(state));
++	}
+ 	return err;
+ }
+ #else
+ #define save_fp_state(task, regs) (0)
+ #define restore_fp_state(task, regs) (0)
+ #endif
+ 
+ static long save_v_state(struct pt_regs *regs, void __user *sc_vec)

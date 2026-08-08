@@ -13,8 +13,8 @@ module lfm_matvec_accelerator #(
     AXI_BUS.Master      axi
 );
 
-    localparam logic [29:0] MODEL_BASE = 30'h3000_0000;
-    localparam integer MAX_INPUT = 4608;
+    localparam logic [29:0] MODEL_BASE = 30'h2f00_0000;
+    localparam integer MAX_INPUT = 6144;
     localparam integer MAX_BLOCKS = MAX_INPUT / 32;
 
     typedef enum logic [5:0] {
@@ -50,6 +50,8 @@ module lfm_matvec_accelerator #(
         Q6_SCALE_MULTIPLY,
         Q6_ACCUMULATE,
         Q6_COMPARE,
+        Q1_STREAM,
+        Q1_FLUSH,
         FINISH,
         RELEASE_BUS,
         SIGNAL_DONE
@@ -59,34 +61,58 @@ module lfm_matvec_accelerator #(
     logic [31:0] command_meta;
     logic [31:0] command_sync;
     logic        command_toggle_seen;
+    logic        command_pending;
 
     logic [24:0] weight_offset_words;
     logic [24:0] input_offset_words;
     logic [24:0] output_offset_words;
     logic [15:0] ne0;
-    logic [16:0] ne1;
+    logic [17:0] ne1;
     logic        q6_mode;
+    logic        q1_mode;
 
     logic [15:0] input_scale [0:MAX_BLOCKS-1];
-    // Two replicated true-dual-port banks provide the four synchronous reads
-    // needed by Q6_K without expanding the activation vector into registers.
+    // Eight replicated true-dual-port banks provide sixteen synchronous reads
+    // without expanding the activation vector into registers. Q4_0 uses all
+    // sixteen ports; Q6_K uses eight of them.
     // Loading and matrix evaluation are mutually exclusive, so port A becomes
     // the write port only while the compact input vector is being received.
     (* ram_style = "block" *) logic signed [7:0] input_q0 [0:MAX_INPUT-1];
     (* ram_style = "block" *) logic signed [7:0] input_q1 [0:MAX_INPUT-1];
+    (* ram_style = "block" *) logic signed [7:0] input_q2 [0:MAX_INPUT-1];
+    (* ram_style = "block" *) logic signed [7:0] input_q3 [0:MAX_INPUT-1];
+    (* ram_style = "block" *) logic signed [7:0] input_q4 [0:MAX_INPUT-1];
+    (* ram_style = "block" *) logic signed [7:0] input_q5 [0:MAX_INPUT-1];
+    (* ram_style = "block" *) logic signed [7:0] input_q6 [0:MAX_INPUT-1];
+    (* ram_style = "block" *) logic signed [7:0] input_q7 [0:MAX_INPUT-1];
     logic [12:0] input_write_address;
-    logic [12:0] input_read0a_address;
-    logic [12:0] input_read0b_address;
-    logic [12:0] input_read1a_address;
-    logic [12:0] input_read1b_address;
-    logic signed [7:0] input_read0a;
-    logic signed [7:0] input_read0b;
-    logic signed [7:0] input_read1a;
-    logic signed [7:0] input_read1b;
+    logic [12:0] input_read_a_address [0:7];
+    logic [12:0] input_read_b_address [0:7];
+    logic signed [7:0] input_read_a [0:7];
+    logic signed [7:0] input_read_b [0:7];
     logic input_write_enable;
     logic [7:0] q6_ql [0:127];
     logic [7:0] q6_qh [0:63];
     logic signed [7:0] q6_scales [0:15];
+
+    // Q1_0 streams one 128-weight block as a 2-byte scale beat plus two
+    // 8-byte sign-bit beats. Four replicated 64-bit-wide banks provide the
+    // 64 activation bytes that pair with each sign-bit beat, so the block
+    // datapath keeps pace with the AXI stream and the arithmetic tail runs
+    // as a free-running pipeline instead of FSM states.
+    (* ram_style = "block" *) logic [63:0] wide_q0 [0:MAX_INPUT/8-1];
+    (* ram_style = "block" *) logic [63:0] wide_q1 [0:MAX_INPUT/8-1];
+    (* ram_style = "block" *) logic [63:0] wide_q2 [0:MAX_INPUT/8-1];
+    (* ram_style = "block" *) logic [63:0] wide_q3 [0:MAX_INPUT/8-1];
+    logic [55:0] wide_assemble;
+    logic        wide_write_enable;
+    logic [9:0]  wide_write_address;
+    logic [63:0] wide_write_data;
+    logic [9:0]  wide_read_a_address [0:3];
+    logic [9:0]  wide_read_b_address [0:3];
+    logic [63:0] wide_read_a [0:3];
+    logic [63:0] wide_read_b [0:3];
+    logic [9:0]  q1_wide_base;
 
     logic [31:0] input_byte_index;
     logic [15:0] input_block;
@@ -95,7 +121,7 @@ module lfm_matvec_accelerator #(
     logic [32:0] weight_block_count;
     logic [8:0]  weight_position;
     logic [15:0] row_block;
-    logic [16:0] row_index;
+    logic [17:0] row_index;
     logic [15:0] row_blocks;
     logic [15:0] weight_scale;
     logic signed [31:0] block_dot;
@@ -104,7 +130,113 @@ module lfm_matvec_accelerator #(
     logic signed [63:0] best_score;
     logic signed [63:0] q6_row_result;
     logic [15:0] best_token;
-    logic [5:0] q6_step;
+    logic [4:0] q6_step;
+
+    // Q1 stream-side capture of the pending block's scales and row bookkeeping.
+    logic [15:0] pend_input_scale [0:3];
+    logic        pend_last;
+    logic [17:0] pend_row;
+
+    // Q1 free-running compute pipeline. V1 sign-selects one 64-weight half
+    // against the wide activation banks and registers eight 4:1 partial sums
+    // per 32-weight group; V2 reduces them to group dots and, on the second
+    // half, injects the completed block into the exact Q30 scale pipeline
+    // (stages s0 through s6 mirror the former Q1_SCALE_* states).
+    logic [63:0] v_bits;
+    logic        v_half;
+    logic        v_valid;
+    // R stage: register the wide BRAM outputs (and the matching sign bits
+    // and block context) before any arithmetic, keeping the BRAM output
+    // routing off the critical path.
+    logic [63:0] r_data [0:7];
+    logic [63:0] r_bits;
+    logic        r_half;
+    logic        r_valid;
+    logic [15:0] r_wscale;
+    logic [15:0] r_iscale [0:3];
+    logic        r_last;
+    logic [17:0] r_row;
+    logic [7:0]  q1w_raw [0:63];
+    logic signed [8:0]  q1w_signed [0:63];
+    logic signed [10:0] q1w_partial_c [0:1][0:7];
+    logic signed [10:0] p_partial [0:1][0:7];
+    logic        p_half;
+    logic        p_valid;
+    logic [15:0] p_wscale;
+    logic [15:0] p_iscale [0:3];
+    logic        p_last;
+    logic [17:0] p_row;
+    logic signed [15:0] q1w_dot [0:1];
+    logic signed [15:0] h_dot0;
+    logic signed [15:0] h_dot1;
+    logic signed [15:0] s0_dot [0:3];
+    logic [15:0] s0_wscale;
+    logic [15:0] s0_iscale [0:3];
+    logic        s0_last;
+    logic [17:0] s0_row;
+    logic        s0_valid;
+    logic [4:0]  s0_wexp;
+    logic [10:0] s0_wmant;
+    logic signed [7:0] s0_wpow;
+    logic [4:0]  s0_iexp [0:3];
+    logic [10:0] s0_imant [0:3];
+    logic signed [7:0] s0_ipow [0:3];
+    logic [10:0] s1_wmant [0:3];
+    logic [10:0] s1_imant [0:3];
+    logic        s1_neg [0:3];
+    logic signed [8:0] s1_shift [0:3];
+    logic        s1_zero [0:3];
+    logic signed [15:0] s1_dot [0:3];
+    logic        s1_last;
+    logic [17:0] s1_row;
+    logic        s1_valid;
+    logic [21:0] s2_mprod [0:3];
+    logic        s2_neg [0:3];
+    logic signed [8:0] s2_shift [0:3];
+    logic        s2_zero [0:3];
+    logic signed [15:0] s2_dot [0:3];
+    logic        s2_last;
+    logic [17:0] s2_row;
+    logic        s2_valid;
+    logic [31:0] s2_aligned [0:3];
+    logic signed [31:0] s3_sprod [0:3];
+    logic signed [15:0] s3_dot [0:3];
+    logic        s3_last;
+    logic [17:0] s3_row;
+    logic        s3_valid;
+    logic signed [63:0] s4_scaled [0:3];
+    logic        s4_last;
+    logic [17:0] s4_row;
+    logic        s4_valid;
+    logic signed [63:0] s5_pair [0:1];
+    logic        s5_last;
+    logic [17:0] s5_row;
+    logic        s5_valid;
+    logic signed [63:0] s6_term;
+    logic        s6_last;
+    logic [17:0] s6_row;
+    logic        s6_valid;
+    logic signed [63:0] q1_row_accum;
+    logic        q1_pipe_busy;
+
+    // Q1 non-blocking row-result writer: results queue in an eight-entry
+    // FIFO; the stream backpressures at four entries so in-flight pipeline
+    // blocks always fit. B responses are tracked out of band.
+    logic [63:0] wfifo_data [0:7];
+    logic [29:0] wfifo_addr [0:7];
+    logic [3:0]  wfifo_count;
+    logic [2:0]  wfifo_rd;
+    logic [2:0]  wfifo_wr;
+    logic        wr_active;
+    logic        wr_aw_done;
+    logic        wr_w_done;
+    logic [3:0]  wr_outstanding;
+    logic [29:0] eng_addr;
+    logic [63:0] eng_data;
+    logic        wfifo_push;
+    logic        wfifo_pop;
+    logic        wr_issue_done;
+
     logic done_toggle;
     logic error_flag;
     logic [63:0] cycle_count;
@@ -115,10 +247,10 @@ module lfm_matvec_accelerator #(
     logic reader_busy;
     logic reader_done;
     logic reader_error;
-    logic [15:0] reader_data;
+    logic [63:0] reader_data;
     logic reader_byte_valid;
     logic reader_byte_ready;
-    logic reader_word_mode;
+    logic [3:0] reader_unit_bytes;
 
     logic [ID_WIDTH-1:0] reader_arid;
     logic [29:0] reader_araddr;
@@ -133,23 +265,18 @@ module lfm_matvec_accelerator #(
     logic [29:0] write_address;
     logic [63:0] write_data;
 
-    logic signed [16:0] q4_product0;
-    logic signed [16:0] q4_product1;
-    logic signed [16:0] q4_product2;
-    logic signed [16:0] q4_product3;
-    logic signed [8:0] q4_value_pipe0;
-    logic signed [8:0] q4_value_pipe1;
-    logic signed [8:0] q4_value_pipe2;
-    logic signed [8:0] q4_value_pipe3;
-    logic signed [7:0] q4_input_pipe0;
-    logic signed [7:0] q4_input_pipe1;
-    logic signed [7:0] q4_input_pipe2;
-    logic signed [7:0] q4_input_pipe3;
-    logic signed [18:0] q4_pair_sum;
+    logic signed [8:0]  q4_value [0:15];
+    logic signed [8:0]  q4_value_pipe [0:15];
+    logic signed [7:0]  q4_input_pipe [0:15];
+    logic signed [16:0] q4_product [0:15];
+    logic signed [21:0] q4_product_sum;
+    logic signed [21:0] q4_product_reduction;
+    logic signed [21:0] q4_sum_group [0:3];
     logic signed [31:0] q6_contribution;
-    logic signed [63:0] scale_mantissa_product;
+    logic [21:0] scale_mantissa_product;
     logic signed [8:0]  scale_shift;
     logic                scale_zero;
+    logic                scale_negative;
     logic signed [31:0] scale_product;
     logic signed [63:0] wide_scaled_product;
 
@@ -157,140 +284,294 @@ module lfm_matvec_accelerator #(
     logic [4:0] scale_eb;
     logic [10:0] scale_ma;
     logic [10:0] scale_mb;
-    logic signed [11:0] scale_signed_ma;
-    logic signed [11:0] scale_signed_mb;
+    logic [10:0] scale_mantissa_a;
+    logic [10:0] scale_mantissa_b;
     logic signed [7:0] scale_pa;
     logic signed [7:0] scale_pb;
-    logic signed [63:0] aligned_scale_product;
-    integer scale_right_shift;
+    logic [31:0] aligned_scale_product;
+    logic [15:0] active_input_scale;
 
-    logic signed [8:0] q4_lo0;
-    logic signed [8:0] q4_hi0;
-    logic signed [8:0] q4_lo1;
-    logic signed [8:0] q4_hi1;
     logic [15:0] active_weight_scale;
     integer q4_prefetch_position;
+    integer q4_prefetch_base;
+    integer q4_prefetch_next_position;
+    integer q4_prefetch_next_base;
+    logic   q4_accept;
 
-    logic [5:0] q6_l;
+    logic [4:0] q6_l0;
+    logic [4:0] q6_l1;
     logic q6_half;
     integer q6_ql_base;
     integer q6_qh_base;
     integer q6_prefetch_step;
-    logic [5:0] q6_prefetch_l;
+    logic [4:0] q6_prefetch_l0;
+    logic [4:0] q6_prefetch_l1;
     logic q6_prefetch_half;
     integer q6_prefetch_base;
     integer q6_scale_base;
-    logic signed [6:0] q6_v0;
-    logic signed [6:0] q6_v1;
-    logic signed [6:0] q6_v2;
-    logic signed [6:0] q6_v3;
-    logic signed [6:0] q6_value_pipe0;
-    logic signed [6:0] q6_value_pipe1;
-    logic signed [6:0] q6_value_pipe2;
-    logic signed [6:0] q6_value_pipe3;
-    logic signed [7:0] q6_input_pipe0;
-    logic signed [7:0] q6_input_pipe1;
-    logic signed [7:0] q6_input_pipe2;
-    logic signed [7:0] q6_input_pipe3;
-    logic signed [7:0] q6_scale_decode0;
-    logic signed [7:0] q6_scale_decode1;
-    logic signed [7:0] q6_scale_decode2;
-    logic signed [7:0] q6_scale_decode3;
-    logic signed [14:0] q6_pair_product0;
-    logic signed [14:0] q6_pair_product1;
-    logic signed [14:0] q6_pair_product2;
-    logic signed [14:0] q6_pair_product3;
-    logic signed [7:0] q6_scale_pipe0;
-    logic signed [7:0] q6_scale_pipe1;
-    logic signed [7:0] q6_scale_pipe2;
-    logic signed [7:0] q6_scale_pipe3;
-    logic signed [22:0] q6_scaled_product0;
-    logic signed [22:0] q6_scaled_product1;
-    logic signed [22:0] q6_scaled_product2;
-    logic signed [22:0] q6_scaled_product3;
+    logic signed [6:0]  q6_value [0:7];
+    logic signed [6:0]  q6_value_pipe [0:7];
+    logic signed [7:0]  q6_input_pipe [0:7];
+    logic signed [7:0]  q6_scale_value [0:7];
+    logic signed [7:0]  q6_scale_decode [0:7];
+    logic signed [14:0] q6_pair_product [0:7];
+    logic signed [7:0]  q6_scale_pipe [0:7];
+    logic signed [22:0] q6_scaled_product [0:7];
+    logic signed [25:0] q6_sum_group0;
+    logic signed [25:0] q6_sum_group1;
+    integer lane;
+    integer state_lane;
+
+    function automatic logic [31:0] align_q30_magnitude(
+        input logic [21:0] mantissa,
+        input logic signed [8:0] shift,
+        input logic zero
+    );
+        logic [31:0] magnitude;
+        logic [31:0] rounding;
+        logic [8:0] right_shift;
+        begin
+            magnitude = {{10{1'b0}}, mantissa};
+            right_shift = $unsigned(-shift);
+            rounding = 32'd1 << (right_shift - 1'b1);
+            if (zero)
+                align_q30_magnitude = 32'd0;
+            else if (shift >= 0)
+                align_q30_magnitude = magnitude << shift;
+            else
+                align_q30_magnitude = (magnitude + rounding) >> right_shift;
+        end
+    endfunction
 
     always_comb begin
-        q4_lo0 = $signed({1'b0, reader_data[3:0]}) - 9'sd8;
-        q4_hi0 = $signed({1'b0, reader_data[7:4]}) - 9'sd8;
-        q4_lo1 = $signed({1'b0, reader_data[11:8]}) - 9'sd8;
-        q4_hi1 = $signed({1'b0, reader_data[15:12]}) - 9'sd8;
-        // Q4 weights are consumed two packed bytes at a time. Request the next
-        // activation pair only when the current word is accepted so the
-        // synchronous BRAM outputs remain aligned across AXI burst gaps.
-        q4_prefetch_position = weight_position == 0 ? 1 :
-                               ((reader_byte_valid && reader_byte_ready &&
-                                 weight_position < 8) ? weight_position + 1 :
-                                weight_position);
+        for (lane = 0; lane < 16; lane = lane + 1)
+            q4_value[lane] = $signed({1'b0, reader_data[lane*4 +: 4]}) - 9'sd8;
+        q4_sum_group[0] =
+            {{5{q4_product[0][16]}}, q4_product[0]} +
+            {{5{q4_product[1][16]}}, q4_product[1]} +
+            {{5{q4_product[2][16]}}, q4_product[2]} +
+            {{5{q4_product[3][16]}}, q4_product[3]};
+        q4_sum_group[1] =
+            {{5{q4_product[4][16]}}, q4_product[4]} +
+            {{5{q4_product[5][16]}}, q4_product[5]} +
+            {{5{q4_product[6][16]}}, q4_product[6]} +
+            {{5{q4_product[7][16]}}, q4_product[7]};
+        q4_sum_group[2] =
+            {{5{q4_product[8][16]}}, q4_product[8]} +
+            {{5{q4_product[9][16]}}, q4_product[9]} +
+            {{5{q4_product[10][16]}}, q4_product[10]} +
+            {{5{q4_product[11][16]}}, q4_product[11]};
+        q4_sum_group[3] =
+            {{5{q4_product[12][16]}}, q4_product[12]} +
+            {{5{q4_product[13][16]}}, q4_product[13]} +
+            {{5{q4_product[14][16]}}, q4_product[14]} +
+            {{5{q4_product[15][16]}}, q4_product[15]};
+        q4_product_reduction = q4_sum_group[0] + q4_sum_group[1] +
+                               q4_sum_group[2] + q4_sum_group[3];
 
-        q6_l = q6_step[4:0];
-        q6_half = q6_step[5];
+        // Each Q4 cycle consumes eight packed bytes (sixteen weights).
+        // Request the following activation slice only when the current unit is
+        // accepted so synchronous BRAM data remains aligned across AXI gaps.
+        // The two candidate bases are pure functions of registers; the
+        // late-arriving reader handshake only picks between them in the final
+        // per-lane mux, keeping the BRAM address arithmetic off that path.
+        q4_prefetch_position = weight_position == 0 ? 1 : weight_position;
+        q4_prefetch_base = row_block * 32 +
+                           (q4_prefetch_position - 1) * 8;
+        q4_prefetch_next_position = weight_position == 0 ? 1 :
+                                    (weight_position < 2 ?
+                                     weight_position + 1 : weight_position);
+        q4_prefetch_next_base = row_block * 32 +
+                                (q4_prefetch_next_position - 1) * 8;
+        q4_accept = reader_byte_valid && reader_byte_ready;
+
+        // Each Q6 cycle decodes two positions from each of four 64-value
+        // quarters, for eight exact products per cycle.
+        q6_l0 = {q6_step[3:0], 1'b0};
+        q6_l1 = q6_l0 + 1'b1;
+        q6_half = q6_step[4];
         q6_ql_base = q6_half ? 64 : 0;
         q6_qh_base = q6_half ? 32 : 0;
-        q6_scale_base = (q6_half ? 8 : 0) + (q6_l[4] ? 1 : 0);
-        q6_v0 = $signed({1'b0, q6_ql[q6_ql_base + q6_l][3:0]}) +
-                $signed({1'b0, q6_qh[q6_qh_base + q6_l][1:0], 4'b0}) - 7'sd32;
-        q6_v1 = $signed({1'b0, q6_ql[q6_ql_base + 32 + q6_l][3:0]}) +
-                $signed({1'b0, q6_qh[q6_qh_base + q6_l][3:2], 4'b0}) - 7'sd32;
-        q6_v2 = $signed({1'b0, q6_ql[q6_ql_base + q6_l][7:4]}) +
-                $signed({1'b0, q6_qh[q6_qh_base + q6_l][5:4], 4'b0}) - 7'sd32;
-        q6_v3 = $signed({1'b0, q6_ql[q6_ql_base + 32 + q6_l][7:4]}) +
-                $signed({1'b0, q6_qh[q6_qh_base + q6_l][7:6], 4'b0}) - 7'sd32;
-        q6_contribution =
-            {{9{q6_scaled_product0[22]}}, q6_scaled_product0} +
-            {{9{q6_scaled_product1[22]}}, q6_scaled_product1} +
-            {{9{q6_scaled_product2[22]}}, q6_scaled_product2} +
-            {{9{q6_scaled_product3[22]}}, q6_scaled_product3};
+        q6_scale_base = (q6_half ? 8 : 0) + (q6_l0[4] ? 1 : 0);
+        q6_value[0] = $signed({1'b0, q6_ql[q6_ql_base + q6_l0][3:0]}) +
+                        $signed({1'b0, q6_qh[q6_qh_base + q6_l0][1:0], 4'b0}) - 7'sd32;
+        q6_value[1] = $signed({1'b0, q6_ql[q6_ql_base + 32 + q6_l0][3:0]}) +
+                        $signed({1'b0, q6_qh[q6_qh_base + q6_l0][3:2], 4'b0}) - 7'sd32;
+        q6_value[2] = $signed({1'b0, q6_ql[q6_ql_base + q6_l0][7:4]}) +
+                        $signed({1'b0, q6_qh[q6_qh_base + q6_l0][5:4], 4'b0}) - 7'sd32;
+        q6_value[3] = $signed({1'b0, q6_ql[q6_ql_base + 32 + q6_l0][7:4]}) +
+                        $signed({1'b0, q6_qh[q6_qh_base + q6_l0][7:6], 4'b0}) - 7'sd32;
+        q6_value[4] = $signed({1'b0, q6_ql[q6_ql_base + q6_l1][3:0]}) +
+                        $signed({1'b0, q6_qh[q6_qh_base + q6_l1][1:0], 4'b0}) - 7'sd32;
+        q6_value[5] = $signed({1'b0, q6_ql[q6_ql_base + 32 + q6_l1][3:0]}) +
+                        $signed({1'b0, q6_qh[q6_qh_base + q6_l1][3:2], 4'b0}) - 7'sd32;
+        q6_value[6] = $signed({1'b0, q6_ql[q6_ql_base + q6_l1][7:4]}) +
+                        $signed({1'b0, q6_qh[q6_qh_base + q6_l1][5:4], 4'b0}) - 7'sd32;
+        q6_value[7] = $signed({1'b0, q6_ql[q6_ql_base + 32 + q6_l1][7:4]}) +
+                        $signed({1'b0, q6_qh[q6_qh_base + q6_l1][7:6], 4'b0}) - 7'sd32;
+        q6_scale_value[0] = q6_scales[q6_scale_base];
+        q6_scale_value[1] = q6_scales[q6_scale_base + 2];
+        q6_scale_value[2] = q6_scales[q6_scale_base + 4];
+        q6_scale_value[3] = q6_scales[q6_scale_base + 6];
+        q6_scale_value[4] = q6_scales[q6_scale_base];
+        q6_scale_value[5] = q6_scales[q6_scale_base + 2];
+        q6_scale_value[6] = q6_scales[q6_scale_base + 4];
+        q6_scale_value[7] = q6_scales[q6_scale_base + 6];
+        q6_sum_group0 =
+            {{3{q6_scaled_product[0][22]}}, q6_scaled_product[0]} +
+            {{3{q6_scaled_product[1][22]}}, q6_scaled_product[1]} +
+            {{3{q6_scaled_product[2][22]}}, q6_scaled_product[2]} +
+            {{3{q6_scaled_product[3][22]}}, q6_scaled_product[3]};
+        q6_sum_group1 =
+            {{3{q6_scaled_product[4][22]}}, q6_scaled_product[4]} +
+            {{3{q6_scaled_product[5][22]}}, q6_scaled_product[5]} +
+            {{3{q6_scaled_product[6][22]}}, q6_scaled_product[6]} +
+            {{3{q6_scaled_product[7][22]}}, q6_scaled_product[7]};
+        q6_contribution = {{6{q6_sum_group0[25]}}, q6_sum_group0} +
+                          {{6{q6_sum_group1[25]}}, q6_sum_group1};
+
+        // Q1 V1: sign-select one 64-weight half from the registered wide-bank
+        // data and form eight 4:1 partial sums for each 32-weight group.
+        for (lane = 0; lane < 64; lane = lane + 1)
+            q1w_raw[lane] = r_data[lane >> 3][(lane & 7)*8 +: 8];
+        for (lane = 0; lane < 64; lane = lane + 1)
+            q1w_signed[lane] = r_bits[lane] ?
+                 $signed({q1w_raw[lane][7], q1w_raw[lane]}) :
+                -$signed({q1w_raw[lane][7], q1w_raw[lane]});
+        for (lane = 0; lane < 8; lane = lane + 1) begin
+            q1w_partial_c[0][lane] =
+                {{2{q1w_signed[lane*4][8]}},     q1w_signed[lane*4]} +
+                {{2{q1w_signed[lane*4 + 1][8]}}, q1w_signed[lane*4 + 1]} +
+                {{2{q1w_signed[lane*4 + 2][8]}}, q1w_signed[lane*4 + 2]} +
+                {{2{q1w_signed[lane*4 + 3][8]}}, q1w_signed[lane*4 + 3]};
+            q1w_partial_c[1][lane] =
+                {{2{q1w_signed[32 + lane*4][8]}},     q1w_signed[32 + lane*4]} +
+                {{2{q1w_signed[32 + lane*4 + 1][8]}}, q1w_signed[32 + lane*4 + 1]} +
+                {{2{q1w_signed[32 + lane*4 + 2][8]}}, q1w_signed[32 + lane*4 + 2]} +
+                {{2{q1w_signed[32 + lane*4 + 3][8]}}, q1w_signed[32 + lane*4 + 3]};
+        end
+
+        // Q1 V2: reduce the registered partial sums into two group dots.
+        q1w_dot[0] =
+            {{5{p_partial[0][0][10]}}, p_partial[0][0]} +
+            {{5{p_partial[0][1][10]}}, p_partial[0][1]} +
+            {{5{p_partial[0][2][10]}}, p_partial[0][2]} +
+            {{5{p_partial[0][3][10]}}, p_partial[0][3]} +
+            {{5{p_partial[0][4][10]}}, p_partial[0][4]} +
+            {{5{p_partial[0][5][10]}}, p_partial[0][5]} +
+            {{5{p_partial[0][6][10]}}, p_partial[0][6]} +
+            {{5{p_partial[0][7][10]}}, p_partial[0][7]};
+        q1w_dot[1] =
+            {{5{p_partial[1][0][10]}}, p_partial[1][0]} +
+            {{5{p_partial[1][1][10]}}, p_partial[1][1]} +
+            {{5{p_partial[1][2][10]}}, p_partial[1][2]} +
+            {{5{p_partial[1][3][10]}}, p_partial[1][3]} +
+            {{5{p_partial[1][4][10]}}, p_partial[1][4]} +
+            {{5{p_partial[1][5][10]}}, p_partial[1][5]} +
+            {{5{p_partial[1][6][10]}}, p_partial[1][6]} +
+            {{5{p_partial[1][7][10]}}, p_partial[1][7]};
+
+        // Q1 T0: decompose the captured fp16 scales exactly as the former
+        // Q1_SCALE_PREP state did.
+        s0_wexp = s0_wscale[14:10];
+        s0_wmant = s0_wexp == 0 ? {1'b0, s0_wscale[9:0]} :
+                                  {1'b1, s0_wscale[9:0]};
+        s0_wpow = s0_wexp == 0 ? -8'sd24 :
+                  $signed({3'b000, s0_wexp}) - 8'sd25;
+        for (lane = 0; lane < 4; lane = lane + 1) begin
+            s0_iexp[lane] = s0_iscale[lane][14:10];
+            s0_imant[lane] = s0_iexp[lane] == 0 ?
+                             {1'b0, s0_iscale[lane][9:0]} :
+                             {1'b1, s0_iscale[lane][9:0]};
+            s0_ipow[lane] = s0_iexp[lane] == 0 ? -8'sd24 :
+                            $signed({3'b000, s0_iexp[lane]}) - 8'sd25;
+            s2_aligned[lane] = align_q30_magnitude(
+                s2_mprod[lane], s2_shift[lane], s2_zero[lane]);
+        end
+        q1_pipe_busy = v_valid || r_valid || p_valid || s0_valid ||
+                       s1_valid || s2_valid || s3_valid || s4_valid ||
+                       s5_valid || s6_valid;
+        wfifo_push = s6_valid && s6_last;
+        wfifo_pop = !wr_active && wfifo_count != 4'd0;
+        wr_issue_done = wr_active &&
+            (wr_aw_done || (axi.aw_valid && axi.aw_ready)) &&
+            (wr_w_done || (axi.w_valid && axi.w_ready));
 
         input_write_enable = state == LOAD_INPUT && reader_byte_valid &&
                              reader_byte_ready && input_position >= 2;
         input_write_address = (q6_mode ? input_block * 256 : input_block * 32) +
                               (input_position >= 2 ? input_position - 2 : 0);
 
-        q6_prefetch_step = state == Q6_COMPUTE && q6_step < 63 ? q6_step + 1 : 0;
-        q6_prefetch_l = q6_prefetch_step[4:0];
-        q6_prefetch_half = q6_prefetch_step[5];
+        // Activation bytes arrive at strictly sequential addresses, so the
+        // wide banks are filled by assembling eight bytes into one word.
+        wide_write_enable = input_write_enable &&
+                            input_write_address[2:0] == 3'd7;
+        wide_write_address = input_write_address[12:3];
+        wide_write_data = {reader_data[7:0], wide_assemble};
+
+        q6_prefetch_step = state == Q6_COMPUTE && q6_step < 31 ? q6_step + 1 : 0;
+        q6_prefetch_l0 = {q6_prefetch_step[3:0], 1'b0};
+        q6_prefetch_l1 = q6_prefetch_l0 + 1'b1;
+        q6_prefetch_half = q6_prefetch_step[4];
         q6_prefetch_base = row_block * 256 + (q6_prefetch_half ? 128 : 0);
+        // Wide-bank addresses track the stream: the eight words of the half
+        // that the next accepted bits beat will pair with. The BRAM output
+        // registers refresh every cycle from a held address, so data is
+        // stable across AXI stalls.
+        q1_wide_base = {row_block[5:0], 4'b0000} +
+                       ((state == Q1_STREAM && weight_position == 10) ?
+                        10'd8 : 10'd0);
+        for (lane = 0; lane < 4; lane = lane + 1) begin
+            wide_read_a_address[lane] = q1_wide_base + lane[9:0];
+            wide_read_b_address[lane] = q1_wide_base + 10'd4 + lane[9:0];
+        end
         if (q6_mode) begin
-            input_read0a_address = q6_prefetch_base + q6_prefetch_l;
-            input_read0b_address = q6_prefetch_base + q6_prefetch_l + 32;
-            input_read1a_address = q6_prefetch_base + q6_prefetch_l + 64;
-            input_read1b_address = q6_prefetch_base + q6_prefetch_l + 96;
+            input_read_a_address[0] = q6_prefetch_base + q6_prefetch_l0;
+            input_read_b_address[0] = q6_prefetch_base + q6_prefetch_l0 + 32;
+            input_read_a_address[1] = q6_prefetch_base + q6_prefetch_l0 + 64;
+            input_read_b_address[1] = q6_prefetch_base + q6_prefetch_l0 + 96;
+            input_read_a_address[2] = q6_prefetch_base + q6_prefetch_l1;
+            input_read_b_address[2] = q6_prefetch_base + q6_prefetch_l1 + 32;
+            input_read_a_address[3] = q6_prefetch_base + q6_prefetch_l1 + 64;
+            input_read_b_address[3] = q6_prefetch_base + q6_prefetch_l1 + 96;
+            for (lane = 4; lane < 8; lane = lane + 1) begin
+                input_read_a_address[lane] = q6_prefetch_base;
+                input_read_b_address[lane] = q6_prefetch_base;
+            end
         end else begin
-            input_read0a_address = row_block * 32 +
-                                   ((q4_prefetch_position - 1) << 1);
-            input_read0b_address = row_block * 32 +
-                                   ((q4_prefetch_position - 1) << 1) + 16;
-            input_read1a_address = row_block * 32 +
-                                   ((q4_prefetch_position - 1) << 1) + 1;
-            input_read1b_address = row_block * 32 +
-                                   ((q4_prefetch_position - 1) << 1) + 17;
+            for (lane = 0; lane < 8; lane = lane + 1) begin
+                input_read_a_address[lane] = q4_accept ?
+                    q4_prefetch_next_base + lane :
+                    q4_prefetch_base + lane;
+                input_read_b_address[lane] = q4_accept ?
+                    q4_prefetch_next_base + lane + 16 :
+                    q4_prefetch_base + lane + 16;
+            end
         end
 
+        reader_unit_bytes = 4'd1;
+        if (state == Q4_STREAM)
+            reader_unit_bytes = weight_position == 0 ? 4'd2 : 4'd8;
+        else if (state == Q6_STREAM)
+            reader_unit_bytes = weight_position == 208 ? 4'd2 : 4'd8;
+        else if (state == Q1_STREAM)
+            reader_unit_bytes = weight_position == 0 ? 4'd2 : 4'd8;
+
         active_weight_scale =
-            state == Q4_STREAM && weight_position == 0 && reader_byte_valid ?
-            reader_data : weight_scale;
+            state == Q4_STREAM &&
+            weight_position == 0 && reader_byte_valid ?
+            reader_data[15:0] : weight_scale;
+        active_input_scale = input_scale[row_block];
         scale_ea = active_weight_scale[14:10];
-        scale_eb = input_scale[row_block][14:10];
+        scale_eb = active_input_scale[14:10];
         scale_ma = scale_ea == 0 ? {1'b0, active_weight_scale[9:0]} :
                                   {1'b1, active_weight_scale[9:0]};
-        scale_mb = scale_eb == 0 ? {1'b0, input_scale[row_block][9:0]} :
-                                  {1'b1, input_scale[row_block][9:0]};
+        scale_mb = scale_eb == 0 ? {1'b0, active_input_scale[9:0]} :
+                                  {1'b1, active_input_scale[9:0]};
         scale_pa = scale_ea == 0 ? -8'sd24 : $signed({3'b000, scale_ea}) - 8'sd25;
         scale_pb = scale_eb == 0 ? -8'sd24 : $signed({3'b000, scale_eb}) - 8'sd25;
-        scale_right_shift = -scale_shift;
-        if (scale_zero) begin
-            aligned_scale_product = 64'sd0;
-        end else if (scale_shift >= 0) begin
-            aligned_scale_product = scale_mantissa_product <<< scale_shift;
-        end else if (scale_mantissa_product >= 0) begin
-            aligned_scale_product =
-                (scale_mantissa_product + (64'sd1 <<< (scale_right_shift - 1))) >>>
-                scale_right_shift;
-        end else begin
-            aligned_scale_product =
-                -((-scale_mantissa_product + (64'sd1 <<< (scale_right_shift - 1))) >>>
-                  scale_right_shift);
-        end
+        aligned_scale_product = align_q30_magnitude(
+            scale_mantissa_product, scale_shift, scale_zero);
         wide_scaled_product = block_dot * scale_product;
     end
 
@@ -298,19 +579,61 @@ module lfm_matvec_accelerator #(
         if (input_write_enable) begin
             input_q0[input_write_address] <= reader_data[7:0];
             input_q1[input_write_address] <= reader_data[7:0];
+            input_q2[input_write_address] <= reader_data[7:0];
+            input_q3[input_write_address] <= reader_data[7:0];
+            input_q4[input_write_address] <= reader_data[7:0];
+            input_q5[input_write_address] <= reader_data[7:0];
+            input_q6[input_write_address] <= reader_data[7:0];
+            input_q7[input_write_address] <= reader_data[7:0];
         end else begin
-            input_read0a <= input_q0[input_read0a_address];
-            input_read1a <= input_q1[input_read1a_address];
+            input_read_a[0] <= input_q0[input_read_a_address[0]];
+            input_read_a[1] <= input_q1[input_read_a_address[1]];
+            input_read_a[2] <= input_q2[input_read_a_address[2]];
+            input_read_a[3] <= input_q3[input_read_a_address[3]];
+            input_read_a[4] <= input_q4[input_read_a_address[4]];
+            input_read_a[5] <= input_q5[input_read_a_address[5]];
+            input_read_a[6] <= input_q6[input_read_a_address[6]];
+            input_read_a[7] <= input_q7[input_read_a_address[7]];
         end
-        input_read0b <= input_q0[input_read0b_address];
-        input_read1b <= input_q1[input_read1b_address];
+        input_read_b[0] <= input_q0[input_read_b_address[0]];
+        input_read_b[1] <= input_q1[input_read_b_address[1]];
+        input_read_b[2] <= input_q2[input_read_b_address[2]];
+        input_read_b[3] <= input_q3[input_read_b_address[3]];
+        input_read_b[4] <= input_q4[input_read_b_address[4]];
+        input_read_b[5] <= input_q5[input_read_b_address[5]];
+        input_read_b[6] <= input_q6[input_read_b_address[6]];
+        input_read_b[7] <= input_q7[input_read_b_address[7]];
     end
 
+    always_ff @(posedge clk_i) begin
+        if (input_write_enable && input_write_address[2:0] != 3'd7)
+            wide_assemble[input_write_address[2:0]*8 +: 8] <= reader_data[7:0];
+        if (wide_write_enable) begin
+            wide_q0[wide_write_address] <= wide_write_data;
+            wide_q1[wide_write_address] <= wide_write_data;
+            wide_q2[wide_write_address] <= wide_write_data;
+            wide_q3[wide_write_address] <= wide_write_data;
+        end else begin
+            wide_read_a[0] <= wide_q0[wide_read_a_address[0]];
+            wide_read_a[1] <= wide_q1[wide_read_a_address[1]];
+            wide_read_a[2] <= wide_q2[wide_read_a_address[2]];
+            wide_read_a[3] <= wide_q3[wide_read_a_address[3]];
+        end
+        wide_read_b[0] <= wide_q0[wide_read_b_address[0]];
+        wide_read_b[1] <= wide_q1[wide_read_b_address[1]];
+        wide_read_b[2] <= wide_q2[wide_read_b_address[2]];
+        wide_read_b[3] <= wide_q3[wide_read_b_address[3]];
+    end
+
+    // Q6 argmax reports its winning token; the other modes repurpose the
+    // field to expose the live FSM state for host-side diagnostics.
     assign status_o = {1'b1, bus_request_o, error_flag, done_toggle,
-                       4'b0, best_token, 8'b0};
+                       4'b0,
+                       q6_mode ? best_token : {10'b0, state},
+                       8'b0};
 
     assign axi.aw_id     = {ID_WIDTH{1'b1}};
-    assign axi.aw_addr   = {{34{1'b0}}, write_address};
+    assign axi.aw_addr   = {{34{1'b0}}, q1_mode ? eng_addr : write_address};
     assign axi.aw_len    = 8'd0;
     assign axi.aw_size   = 3'd3;
     assign axi.aw_burst  = 2'b01;
@@ -321,13 +644,16 @@ module lfm_matvec_accelerator #(
     assign axi.aw_region = 4'b0000;
     assign axi.aw_atop   = 6'b000000;
     assign axi.aw_user   = '0;
-    assign axi.aw_valid  = state == Q4_WRITE && !write_aw_sent;
-    assign axi.w_data    = write_data;
+    assign axi.aw_valid  = q1_mode ? (wr_active && !wr_aw_done) :
+                           (state == Q4_WRITE && !write_aw_sent);
+    assign axi.w_data    = q1_mode ? eng_data : write_data;
     assign axi.w_strb    = 8'hff;
     assign axi.w_last    = 1'b1;
     assign axi.w_user    = '0;
-    assign axi.w_valid   = state == Q4_WRITE && !write_w_sent;
-    assign axi.b_ready   = state == Q4_WRITE_RESPONSE;
+    assign axi.w_valid   = q1_mode ? (wr_active && !wr_w_done) :
+                           (state == Q4_WRITE && !write_w_sent);
+    assign axi.b_ready   = q1_mode ? 1'b1 :
+                           (state == Q4_WRITE_RESPONSE);
 
     assign axi.ar_id     = reader_arid;
     assign axi.ar_addr   = {{34{1'b0}}, reader_araddr};
@@ -343,9 +669,13 @@ module lfm_matvec_accelerator #(
     assign axi.ar_valid  = reader_arvalid;
     assign axi.r_ready   = reader_rready;
 
+    // Q1_FLUSH also consumes (and discards) any residual stream so an
+    // error/trap drain can always retire the reader before the bus releases.
     assign reader_byte_ready = (state == LOAD_INPUT) ||
                                (state == Q4_STREAM) ||
-                               (state == Q6_STREAM);
+                               (state == Q6_STREAM) ||
+                               (state == Q1_STREAM && wfifo_count < 4'd4) ||
+                               (state == Q1_FLUSH);
 
     lfm_axi_byte_reader #(
         .ID_WIDTH(ID_WIDTH)
@@ -355,7 +685,7 @@ module lfm_matvec_accelerator #(
         .start_i(reader_start),
         .address_i(reader_address),
         .byte_count_i(reader_byte_count),
-        .word_mode_i(reader_word_mode),
+        .unit_bytes_i(reader_unit_bytes),
         .busy_o(reader_busy),
         .done_o(reader_done),
         .error_o(reader_error),
@@ -382,9 +712,11 @@ module lfm_matvec_accelerator #(
             command_meta        <= '0;
             command_sync        <= '0;
             command_toggle_seen <= 1'b0;
+            command_pending     <= 1'b0;
         end else begin
             command_meta <= command_i;
             command_sync <= command_meta;
+            command_pending <= 1'b0;
             if (command_sync[31] != command_toggle_seen)
                 command_toggle_seen <= command_sync[31];
         end
@@ -395,7 +727,6 @@ module lfm_matvec_accelerator #(
             state               <= IDLE;
             bus_request_o       <= 1'b0;
             reader_start        <= 1'b0;
-            reader_word_mode    <= 1'b0;
             reader_address      <= '0;
             reader_byte_count   <= '0;
             weight_offset_words <= '0;
@@ -404,6 +735,7 @@ module lfm_matvec_accelerator #(
             ne0                 <= '0;
             ne1                 <= '0;
             q6_mode             <= 1'b0;
+            q1_mode             <= 1'b0;
             input_byte_index    <= '0;
             input_block         <= '0;
             input_position      <= '0;
@@ -415,55 +747,62 @@ module lfm_matvec_accelerator #(
             row_blocks          <= '0;
             weight_scale        <= '0;
             block_dot           <= '0;
-            q4_product0         <= '0;
-            q4_product1         <= '0;
-            q4_product2         <= '0;
-            q4_product3         <= '0;
-            q4_value_pipe0      <= '0;
-            q4_value_pipe1      <= '0;
-            q4_value_pipe2      <= '0;
-            q4_value_pipe3      <= '0;
-            q4_input_pipe0      <= '0;
-            q4_input_pipe1      <= '0;
-            q4_input_pipe2      <= '0;
-            q4_input_pipe3      <= '0;
-            q4_pair_sum         <= '0;
+            for (state_lane = 0; state_lane < 16; state_lane = state_lane + 1) begin
+                q4_product[state_lane]    <= '0;
+                q4_value_pipe[state_lane] <= '0;
+                q4_input_pipe[state_lane] <= '0;
+            end
+            q4_product_sum      <= '0;
             row_sum             <= '0;
             scaled_term         <= '0;
             scale_mantissa_product <= '0;
-            scale_signed_ma     <= '0;
-            scale_signed_mb     <= '0;
+            scale_mantissa_a    <= '0;
+            scale_mantissa_b    <= '0;
             scale_shift         <= '0;
             scale_zero          <= 1'b0;
+            scale_negative      <= 1'b0;
             scale_product       <= '0;
             best_score          <= 64'sh8000_0000_0000_0000;
             q6_row_result       <= '0;
             best_token          <= '0;
             q6_step             <= '0;
-            q6_value_pipe0      <= '0;
-            q6_value_pipe1      <= '0;
-            q6_value_pipe2      <= '0;
-            q6_value_pipe3      <= '0;
-            q6_input_pipe0      <= '0;
-            q6_input_pipe1      <= '0;
-            q6_input_pipe2      <= '0;
-            q6_input_pipe3      <= '0;
-            q6_scale_decode0    <= '0;
-            q6_scale_decode1    <= '0;
-            q6_scale_decode2    <= '0;
-            q6_scale_decode3    <= '0;
-            q6_pair_product0    <= '0;
-            q6_pair_product1    <= '0;
-            q6_pair_product2    <= '0;
-            q6_pair_product3    <= '0;
-            q6_scale_pipe0      <= '0;
-            q6_scale_pipe1      <= '0;
-            q6_scale_pipe2      <= '0;
-            q6_scale_pipe3      <= '0;
-            q6_scaled_product0  <= '0;
-            q6_scaled_product1  <= '0;
-            q6_scaled_product2  <= '0;
-            q6_scaled_product3  <= '0;
+            v_bits              <= '0;
+            v_half              <= 1'b0;
+            v_valid             <= 1'b0;
+            r_bits              <= '0;
+            r_half              <= 1'b0;
+            r_valid             <= 1'b0;
+            p_half              <= 1'b0;
+            p_valid             <= 1'b0;
+            s0_valid            <= 1'b0;
+            s1_valid            <= 1'b0;
+            s2_valid            <= 1'b0;
+            s3_valid            <= 1'b0;
+            s4_valid            <= 1'b0;
+            s5_valid            <= 1'b0;
+            s6_valid            <= 1'b0;
+            h_dot0              <= '0;
+            h_dot1              <= '0;
+            q1_row_accum        <= '0;
+            pend_last           <= 1'b0;
+            pend_row            <= '0;
+            wfifo_count         <= '0;
+            wfifo_rd            <= '0;
+            wfifo_wr            <= '0;
+            wr_active           <= 1'b0;
+            wr_aw_done          <= 1'b0;
+            wr_w_done           <= 1'b0;
+            wr_outstanding      <= '0;
+            eng_addr            <= '0;
+            eng_data            <= '0;
+            for (state_lane = 0; state_lane < 8; state_lane = state_lane + 1) begin
+                q6_value_pipe[state_lane]     <= '0;
+                q6_input_pipe[state_lane]     <= '0;
+                q6_scale_decode[state_lane]   <= '0;
+                q6_pair_product[state_lane]   <= '0;
+                q6_scale_pipe[state_lane]     <= '0;
+                q6_scaled_product[state_lane] <= '0;
+            end
             done_toggle         <= 1'b0;
             error_flag          <= 1'b0;
             cycle_count         <= '0;
@@ -484,12 +823,13 @@ module lfm_matvec_accelerator #(
                     3'd1: input_offset_words  <= command_sync[24:0];
                     3'd2: output_offset_words <= command_sync[24:0];
                     3'd3: ne0                 <= command_sync[15:0];
-                    3'd4: ne1                 <= command_sync[15:0] == 0 ? 17'd65536 : {1'b0, command_sync[15:0]};
+                    3'd4: ne1                 <= command_sync[17:0] == 0 ? 18'd65536 : command_sync[17:0];
                     3'd5: begin
                         if (state != IDLE) begin
                             error_flag <= 1'b1;
-                        end else if (command_sync[1:0] == 2'd1 || command_sync[1:0] == 2'd2) begin
-                            q6_mode       <= command_sync[1];
+                        end else if (command_sync[1:0] != 2'd0) begin
+                            q6_mode       <= command_sync[1:0] == 2'd2;
+                            q1_mode       <= command_sync[1:0] == 2'd3;
                             error_flag    <= 1'b0;
                             best_score    <= 64'sh8000_0000_0000_0000;
                             best_token    <= '0;
@@ -502,6 +842,149 @@ module lfm_matvec_accelerator #(
                 endcase
             end
 
+            // Q1 free-running compute pipeline. Runs regardless of FSM state;
+            // Q1_STREAM injects one 64-weight half per accepted bits beat and
+            // LAUNCH_WEIGHTS resets the valid chain (textually later, so its
+            // assignments win over these defaults).
+            v_valid <= 1'b0;
+            for (state_lane = 0; state_lane < 4; state_lane = state_lane + 1) begin
+                r_data[state_lane]     <= wide_read_a[state_lane];
+                r_data[state_lane + 4] <= wide_read_b[state_lane];
+            end
+            r_bits   <= v_bits;
+            r_half   <= v_half;
+            r_valid  <= v_valid;
+            r_wscale <= weight_scale;
+            for (state_lane = 0; state_lane < 4; state_lane = state_lane + 1)
+                r_iscale[state_lane] <= pend_input_scale[state_lane];
+            r_last <= pend_last;
+            r_row  <= pend_row;
+
+            for (state_lane = 0; state_lane < 8; state_lane = state_lane + 1) begin
+                p_partial[0][state_lane] <= q1w_partial_c[0][state_lane];
+                p_partial[1][state_lane] <= q1w_partial_c[1][state_lane];
+            end
+            p_half   <= r_half;
+            p_valid  <= r_valid;
+            p_wscale <= r_wscale;
+            for (state_lane = 0; state_lane < 4; state_lane = state_lane + 1)
+                p_iscale[state_lane] <= r_iscale[state_lane];
+            p_last <= r_last;
+            p_row  <= r_row;
+
+            if (p_valid) begin
+                if (!p_half) begin
+                    h_dot0 <= q1w_dot[0];
+                    h_dot1 <= q1w_dot[1];
+                end else begin
+                    s0_dot[0]  <= h_dot0;
+                    s0_dot[1]  <= h_dot1;
+                    s0_dot[2]  <= q1w_dot[0];
+                    s0_dot[3]  <= q1w_dot[1];
+                    s0_wscale  <= p_wscale;
+                    for (state_lane = 0; state_lane < 4; state_lane = state_lane + 1)
+                        s0_iscale[state_lane] <= p_iscale[state_lane];
+                    s0_last <= p_last;
+                    s0_row  <= p_row;
+                end
+            end
+            s0_valid <= p_valid && p_half;
+
+            for (state_lane = 0; state_lane < 4; state_lane = state_lane + 1) begin
+                s1_wmant[state_lane] <= s0_wmant;
+                s1_imant[state_lane] <= s0_imant[state_lane];
+                s1_neg[state_lane]   <= s0_wscale[15] ^ s0_iscale[state_lane][15];
+                s1_shift[state_lane] <= s0_wpow + s0_ipow[state_lane] + 9'sd30;
+                s1_zero[state_lane]  <=
+                    (s0_wexp == 0 && s0_wscale[9:0] == 0) ||
+                    (s0_iexp[state_lane] == 0 && s0_iscale[state_lane][9:0] == 0);
+                s1_dot[state_lane]   <= s0_dot[state_lane];
+            end
+            s1_last  <= s0_last;
+            s1_row   <= s0_row;
+            s1_valid <= s0_valid;
+
+            for (state_lane = 0; state_lane < 4; state_lane = state_lane + 1) begin
+                s2_mprod[state_lane] <= s1_wmant[state_lane] * s1_imant[state_lane];
+                s2_neg[state_lane]   <= s1_neg[state_lane];
+                s2_shift[state_lane] <= s1_shift[state_lane];
+                s2_zero[state_lane]  <= s1_zero[state_lane];
+                s2_dot[state_lane]   <= s1_dot[state_lane];
+            end
+            s2_last  <= s1_last;
+            s2_row   <= s1_row;
+            s2_valid <= s1_valid;
+
+            // Apply the product sign to the 16-bit dot instead of the 32-bit
+            // aligned magnitude: (-d)*a == d*(-a) exactly, and the short
+            // carry chain keeps the barrel shifter off the critical path.
+            for (state_lane = 0; state_lane < 4; state_lane = state_lane + 1) begin
+                s3_sprod[state_lane] <= $signed(s2_aligned[state_lane]);
+                s3_dot[state_lane]   <= s2_neg[state_lane] ?
+                    -s2_dot[state_lane] : s2_dot[state_lane];
+            end
+            s3_last  <= s2_last;
+            s3_row   <= s2_row;
+            s3_valid <= s2_valid;
+
+            for (state_lane = 0; state_lane < 4; state_lane = state_lane + 1)
+                s4_scaled[state_lane] <= s3_dot[state_lane] * s3_sprod[state_lane];
+            s4_last  <= s3_last;
+            s4_row   <= s3_row;
+            s4_valid <= s3_valid;
+
+            s5_pair[0] <= s4_scaled[0] + s4_scaled[1];
+            s5_pair[1] <= s4_scaled[2] + s4_scaled[3];
+            s5_last  <= s4_last;
+            s5_row   <= s4_row;
+            s5_valid <= s4_valid;
+
+            s6_term  <= s5_pair[0] + s5_pair[1];
+            s6_last  <= s5_last;
+            s6_row   <= s5_row;
+            s6_valid <= s5_valid;
+
+            if (s6_valid) begin
+                if (s6_last) begin
+                    wfifo_addr[wfifo_wr] <= MODEL_BASE +
+                        {output_offset_words, 3'b000} +
+                        ({12'b0, s6_row} << 3);
+                    wfifo_data[wfifo_wr] <= q1_row_accum + s6_term;
+                    wfifo_wr <= wfifo_wr + 1'b1;
+                    q1_row_accum <= '0;
+                end else begin
+                    q1_row_accum <= q1_row_accum + s6_term;
+                end
+            end
+
+            if (wfifo_push && !wfifo_pop)
+                wfifo_count <= wfifo_count + 1'b1;
+            else if (!wfifo_push && wfifo_pop)
+                wfifo_count <= wfifo_count - 1'b1;
+
+            if (wfifo_pop) begin
+                wr_active  <= 1'b1;
+                wr_aw_done <= 1'b0;
+                wr_w_done  <= 1'b0;
+                eng_addr   <= wfifo_addr[wfifo_rd];
+                eng_data   <= wfifo_data[wfifo_rd];
+                wfifo_rd   <= wfifo_rd + 1'b1;
+            end
+            if (wr_active) begin
+                if (axi.aw_valid && axi.aw_ready)
+                    wr_aw_done <= 1'b1;
+                if (axi.w_valid && axi.w_ready)
+                    wr_w_done <= 1'b1;
+                if (wr_issue_done)
+                    wr_active <= 1'b0;
+            end
+            wr_outstanding <= wr_outstanding +
+                (wr_issue_done ? 4'd1 : 4'd0) -
+                ((q1_mode && axi.b_valid) ? 4'd1 : 4'd0);
+            if (q1_mode && axi.b_valid &&
+                (axi.b_resp != 2'b00 || axi.b_id != {ID_WIDTH{1'b1}}))
+                error_flag <= 1'b1;
+
             case (state)
                 IDLE: begin
                 end
@@ -509,19 +992,23 @@ module lfm_matvec_accelerator #(
                 WAIT_GRANT: begin
                     if (bus_grant_i) begin
                         if (ne0 == 0 || ne1 == 0 || ne0 > MAX_INPUT ||
-                            (!q6_mode && (ne0[4:0] != 0 || ((ne0 >> 5) & 3) != 0)) ||
-                            (q6_mode && (ne0[7:0] != 0 || ((ne0 >> 8) & 3) != 0))) begin
+                            (!q6_mode && !q1_mode &&
+                             (ne0[4:0] != 0 || ((ne0 >> 5) & 3) != 0)) ||
+                            (q6_mode &&
+                             (ne0[7:0] != 0 || ((ne0 >> 8) & 3) != 0)) ||
+                            (q1_mode && ne0[6:0] != 0)) begin
                             error_flag <= 1'b1;
                             state <= FINISH;
                         end else begin
-                            row_blocks <= q6_mode ? (ne0 >> 8) : (ne0 >> 5);
+                            row_blocks <= q6_mode ? (ne0 >> 8) :
+                                          q1_mode ? (ne0 >> 7) :
+                                                    (ne0 >> 5);
                             state <= START_INPUT;
                         end
                     end
                 end
 
                 START_INPUT: begin
-                    reader_word_mode <= 1'b0;
                     reader_address <= MODEL_BASE + {input_offset_words, 3'b000};
                     // Compact Q6_K blocks contain 256 values plus a 2-byte
                     // scale; compact Q4_0 blocks contain 32 values plus a
@@ -583,7 +1070,6 @@ module lfm_matvec_accelerator #(
                 end
 
                 LAUNCH_WEIGHTS: begin
-                    reader_word_mode <= !q6_mode;
                     reader_start      <= 1'b1;
                     weight_byte_index <= '0;
                     weight_position   <= '0;
@@ -591,68 +1077,66 @@ module lfm_matvec_accelerator #(
                     row_index         <= '0;
                     row_sum           <= '0;
                     block_dot         <= '0;
-                    state             <= q6_mode ? Q6_STREAM : Q4_STREAM;
+                    v_valid           <= 1'b0;
+                    r_valid           <= 1'b0;
+                    p_valid           <= 1'b0;
+                    s0_valid          <= 1'b0;
+                    s1_valid          <= 1'b0;
+                    s2_valid          <= 1'b0;
+                    s3_valid          <= 1'b0;
+                    s4_valid          <= 1'b0;
+                    s5_valid          <= 1'b0;
+                    s6_valid          <= 1'b0;
+                    q1_row_accum      <= '0;
+                    wfifo_count       <= '0;
+                    wfifo_rd          <= '0;
+                    wfifo_wr          <= '0;
+                    wr_active         <= 1'b0;
+                    wr_outstanding    <= '0;
+                    state             <= q6_mode ? Q6_STREAM :
+                                         q1_mode ? Q1_STREAM : Q4_STREAM;
                 end
 
                 Q4_STREAM: begin
                     if (reader_byte_valid && reader_byte_ready) begin
-                        weight_byte_index <= weight_byte_index + 2'd2;
                         if (weight_position == 0) begin
-                            weight_scale <= reader_data;
-                            block_dot   <= '0;
-                            q4_value_pipe0 <= '0;
-                            q4_value_pipe1 <= '0;
-                            q4_value_pipe2 <= '0;
-                            q4_value_pipe3 <= '0;
-                            q4_input_pipe0 <= '0;
-                            q4_input_pipe1 <= '0;
-                            q4_input_pipe2 <= '0;
-                            q4_input_pipe3 <= '0;
-                            q4_product0 <= '0;
-                            q4_product1 <= '0;
-                            q4_product2 <= '0;
-                            q4_product3 <= '0;
-                            q4_pair_sum <= '0;
-                            scale_signed_ma <=
-                                active_weight_scale[15] ^ input_scale[row_block][15] ?
-                                -$signed({1'b0, scale_ma}) :
-                                 $signed({1'b0, scale_ma});
-                            scale_signed_mb <= $signed({1'b0, scale_mb});
+                            weight_byte_index <= weight_byte_index + 2;
+                            weight_scale <= reader_data[15:0];
+                            block_dot <= '0;
+                            for (state_lane = 0; state_lane < 16; state_lane = state_lane + 1) begin
+                                q4_value_pipe[state_lane] <= '0;
+                                q4_input_pipe[state_lane] <= '0;
+                                q4_product[state_lane] <= '0;
+                            end
+                            q4_product_sum <= '0;
+                            scale_mantissa_a <= scale_ma;
+                            scale_mantissa_b <= scale_mb;
+                            scale_negative <=
+                                active_weight_scale[15] ^ active_input_scale[15];
                             scale_shift <= scale_pa + scale_pb + 9'sd30;
                             scale_zero <=
                                 (scale_ea == 0 && active_weight_scale[9:0] == 0) ||
-                                (scale_eb == 0 && input_scale[row_block][9:0] == 0);
+                                (scale_eb == 0 && active_input_scale[9:0] == 0);
                             weight_position <= 1;
                         end else begin
-                            // Register both multiplier operands so the 200 MHz
-                            // path starts at local flip-flops instead of the
-                            // synchronous activation BRAM outputs.
-                            q4_value_pipe0 <= q4_lo0;
-                            q4_value_pipe1 <= q4_hi0;
-                            q4_value_pipe2 <= q4_lo1;
-                            q4_value_pipe3 <= q4_hi1;
-                            q4_input_pipe0 <= input_read0a;
-                            q4_input_pipe1 <= input_read0b;
-                            q4_input_pipe2 <= input_read1a;
-                            q4_input_pipe3 <= input_read1b;
-                            q4_product0 <= q4_value_pipe0 * q4_input_pipe0;
-                            q4_product1 <= q4_value_pipe1 * q4_input_pipe1;
-                            q4_product2 <= q4_value_pipe2 * q4_input_pipe2;
-                            q4_product3 <= q4_value_pipe3 * q4_input_pipe3;
-                            q4_pair_sum <=
-                                {{2{q4_product0[16]}}, q4_product0} +
-                                {{2{q4_product1[16]}}, q4_product1} +
-                                {{2{q4_product2[16]}}, q4_product2} +
-                                {{2{q4_product3[16]}}, q4_product3};
-                            if (weight_position > 3)
-                                block_dot <= block_dot +
-                                    {{13{q4_pair_sum[18]}}, q4_pair_sum};
+                            weight_byte_index <= weight_byte_index + 8;
+                            for (state_lane = 0; state_lane < 16; state_lane = state_lane + 1) begin
+                                q4_value_pipe[state_lane] <= q4_value[state_lane];
+                                q4_product[state_lane] <= q4_value_pipe[state_lane] *
+                                                          q4_input_pipe[state_lane];
+                            end
+                            for (state_lane = 0; state_lane < 8; state_lane = state_lane + 1) begin
+                                q4_input_pipe[state_lane*2] <= input_read_a[state_lane];
+                                q4_input_pipe[state_lane*2 + 1] <= input_read_b[state_lane];
+                            end
                             if (weight_position == 1)
                                 scale_mantissa_product <=
-                                    scale_signed_ma * scale_signed_mb;
-                            if (weight_position == 3)
-                                scale_product <= aligned_scale_product[31:0];
-                            if (weight_position == 8) begin
+                                    scale_mantissa_a * scale_mantissa_b;
+                            if (weight_position == 2)
+                                scale_product <= scale_negative ?
+                                    -$signed(aligned_scale_product) :
+                                     $signed(aligned_scale_product);
+                            if (weight_position == 2) begin
                                 weight_position <= '0;
                                 state <= Q4_DRAIN_PRODUCT;
                             end else begin
@@ -663,34 +1147,23 @@ module lfm_matvec_accelerator #(
                 end
 
                 Q4_DRAIN_PRODUCT: begin
-                    q4_product0 <= q4_value_pipe0 * q4_input_pipe0;
-                    q4_product1 <= q4_value_pipe1 * q4_input_pipe1;
-                    q4_product2 <= q4_value_pipe2 * q4_input_pipe2;
-                    q4_product3 <= q4_value_pipe3 * q4_input_pipe3;
-                    q4_pair_sum <=
-                        {{2{q4_product0[16]}}, q4_product0} +
-                        {{2{q4_product1[16]}}, q4_product1} +
-                        {{2{q4_product2[16]}}, q4_product2} +
-                        {{2{q4_product3[16]}}, q4_product3};
-                    block_dot <= block_dot +
-                        {{13{q4_pair_sum[18]}}, q4_pair_sum};
+                    for (state_lane = 0; state_lane < 16; state_lane = state_lane + 1)
+                        q4_product[state_lane] <= q4_value_pipe[state_lane] *
+                                                  q4_input_pipe[state_lane];
+                    q4_product_sum <= q4_product_reduction;
                     state <= Q4_DRAIN;
                 end
 
                 Q4_DRAIN: begin
-                    q4_pair_sum <=
-                        {{2{q4_product0[16]}}, q4_product0} +
-                        {{2{q4_product1[16]}}, q4_product1} +
-                        {{2{q4_product2[16]}}, q4_product2} +
-                        {{2{q4_product3[16]}}, q4_product3};
+                    q4_product_sum <= q4_product_reduction;
                     block_dot <= block_dot +
-                        {{13{q4_pair_sum[18]}}, q4_pair_sum};
+                        {{10{q4_product_sum[21]}}, q4_product_sum};
                     state <= Q4_SCALE;
                 end
 
                 Q4_SCALE: begin
                     block_dot <= block_dot +
-                        {{13{q4_pair_sum[18]}}, q4_pair_sum};
+                        {{10{q4_product_sum[21]}}, q4_product_sum};
                     state <= Q4_SCALE_WAIT;
                 end
 
@@ -744,45 +1217,38 @@ module lfm_matvec_accelerator #(
 
                 Q6_STREAM: begin
                     if (reader_byte_valid && reader_byte_ready) begin
-                        weight_byte_index <= weight_byte_index + 1'b1;
-                        if (weight_position < 128)
-                            q6_ql[weight_position] <= reader_data[7:0];
-                        else if (weight_position < 192)
-                            q6_qh[weight_position - 128] <= reader_data[7:0];
-                        else if (weight_position < 208)
-                            q6_scales[weight_position - 192] <= reader_data[7:0];
-                        else if (weight_position == 208)
-                            weight_scale[7:0] <= reader_data[7:0];
-                        else
-                            weight_scale[15:8] <= reader_data[7:0];
+                        weight_byte_index <= weight_byte_index + reader_unit_bytes;
+                        if (weight_position < 128) begin
+                            for (state_lane = 0; state_lane < 8; state_lane = state_lane + 1)
+                                q6_ql[weight_position + state_lane] <=
+                                    reader_data[state_lane*8 +: 8];
+                        end else if (weight_position < 192) begin
+                            for (state_lane = 0; state_lane < 8; state_lane = state_lane + 1)
+                                q6_qh[weight_position - 128 + state_lane] <=
+                                    reader_data[state_lane*8 +: 8];
+                        end else if (weight_position < 208) begin
+                            for (state_lane = 0; state_lane < 8; state_lane = state_lane + 1)
+                                q6_scales[weight_position - 192 + state_lane] <=
+                                    reader_data[state_lane*8 +: 8];
+                        end else begin
+                            weight_scale <= reader_data[15:0];
+                        end
 
-                        if (weight_position == 209) begin
+                        if (weight_position == 208) begin
                             weight_position <= '0;
                             block_dot <= '0;
                             q6_step <= '0;
-                            q6_value_pipe0 <= '0;
-                            q6_value_pipe1 <= '0;
-                            q6_value_pipe2 <= '0;
-                            q6_value_pipe3 <= '0;
-                            q6_input_pipe0 <= '0;
-                            q6_input_pipe1 <= '0;
-                            q6_input_pipe2 <= '0;
-                            q6_input_pipe3 <= '0;
-                            q6_scale_decode0 <= '0;
-                            q6_scale_decode1 <= '0;
-                            q6_scale_decode2 <= '0;
-                            q6_scale_decode3 <= '0;
-                            q6_pair_product0 <= '0;
-                            q6_pair_product1 <= '0;
-                            q6_pair_product2 <= '0;
-                            q6_pair_product3 <= '0;
-                            q6_scaled_product0 <= '0;
-                            q6_scaled_product1 <= '0;
-                            q6_scaled_product2 <= '0;
-                            q6_scaled_product3 <= '0;
+                            for (state_lane = 0; state_lane < 8; state_lane = state_lane + 1) begin
+                                q6_value_pipe[state_lane] <= '0;
+                                q6_input_pipe[state_lane] <= '0;
+                                q6_scale_decode[state_lane] <= '0;
+                                q6_pair_product[state_lane] <= '0;
+                                q6_scale_pipe[state_lane] <= '0;
+                                q6_scaled_product[state_lane] <= '0;
+                            end
                             state <= Q6_COMPUTE;
                         end else begin
-                            weight_position <= weight_position + 1'b1;
+                            weight_position <= weight_position + 8;
                         end
                     end
                 end
@@ -791,35 +1257,27 @@ module lfm_matvec_accelerator #(
                     // Register the variable Q6_K unpacking and BRAM outputs
                     // before multiplication. This removes the unpack muxes
                     // and offset arithmetic from the 200 MHz product path.
-                    q6_value_pipe0 <= q6_v0;
-                    q6_value_pipe1 <= q6_v1;
-                    q6_value_pipe2 <= q6_v2;
-                    q6_value_pipe3 <= q6_v3;
-                    q6_input_pipe0 <= input_read0a;
-                    q6_input_pipe1 <= input_read0b;
-                    q6_input_pipe2 <= input_read1a;
-                    q6_input_pipe3 <= input_read1b;
-                    q6_scale_decode0 <= q6_scales[q6_scale_base];
-                    q6_scale_decode1 <= q6_scales[q6_scale_base + 2];
-                    q6_scale_decode2 <= q6_scales[q6_scale_base + 4];
-                    q6_scale_decode3 <= q6_scales[q6_scale_base + 6];
-                    q6_pair_product0 <= q6_value_pipe0 * q6_input_pipe0;
-                    q6_pair_product1 <= q6_value_pipe1 * q6_input_pipe1;
-                    q6_pair_product2 <= q6_value_pipe2 * q6_input_pipe2;
-                    q6_pair_product3 <= q6_value_pipe3 * q6_input_pipe3;
-                    q6_scale_pipe0 <= q6_scale_decode0;
-                    q6_scale_pipe1 <= q6_scale_decode1;
-                    q6_scale_pipe2 <= q6_scale_decode2;
-                    q6_scale_pipe3 <= q6_scale_decode3;
-                    if (q6_step >= 2) begin
-                        q6_scaled_product0 <= q6_pair_product0 * q6_scale_pipe0;
-                        q6_scaled_product1 <= q6_pair_product1 * q6_scale_pipe1;
-                        q6_scaled_product2 <= q6_pair_product2 * q6_scale_pipe2;
-                        q6_scaled_product3 <= q6_pair_product3 * q6_scale_pipe3;
+                    for (state_lane = 0; state_lane < 8; state_lane = state_lane + 1) begin
+                        q6_value_pipe[state_lane] <= q6_value[state_lane];
+                        q6_scale_decode[state_lane] <= q6_scale_value[state_lane];
+                        q6_pair_product[state_lane] <= q6_value_pipe[state_lane] *
+                                                       q6_input_pipe[state_lane];
+                        q6_scale_pipe[state_lane] <= q6_scale_decode[state_lane];
+                        if (q6_step >= 2)
+                            q6_scaled_product[state_lane] <=
+                                q6_pair_product[state_lane] * q6_scale_pipe[state_lane];
                     end
+                    q6_input_pipe[0] <= input_read_a[0];
+                    q6_input_pipe[1] <= input_read_b[0];
+                    q6_input_pipe[2] <= input_read_a[1];
+                    q6_input_pipe[3] <= input_read_b[1];
+                    q6_input_pipe[4] <= input_read_a[2];
+                    q6_input_pipe[5] <= input_read_b[2];
+                    q6_input_pipe[6] <= input_read_a[3];
+                    q6_input_pipe[7] <= input_read_b[3];
                     if (q6_step >= 3)
                         block_dot <= block_dot + q6_contribution;
-                    if (q6_step == 63) begin
+                    if (q6_step == 31) begin
                         state <= Q6_DRAIN_PAIR;
                     end else begin
                         q6_step <= q6_step + 1'b1;
@@ -827,27 +1285,21 @@ module lfm_matvec_accelerator #(
                 end
 
                 Q6_DRAIN_PAIR: begin
-                    q6_pair_product0 <= q6_value_pipe0 * q6_input_pipe0;
-                    q6_pair_product1 <= q6_value_pipe1 * q6_input_pipe1;
-                    q6_pair_product2 <= q6_value_pipe2 * q6_input_pipe2;
-                    q6_pair_product3 <= q6_value_pipe3 * q6_input_pipe3;
-                    q6_scale_pipe0 <= q6_scale_decode0;
-                    q6_scale_pipe1 <= q6_scale_decode1;
-                    q6_scale_pipe2 <= q6_scale_decode2;
-                    q6_scale_pipe3 <= q6_scale_decode3;
-                    q6_scaled_product0 <= q6_pair_product0 * q6_scale_pipe0;
-                    q6_scaled_product1 <= q6_pair_product1 * q6_scale_pipe1;
-                    q6_scaled_product2 <= q6_pair_product2 * q6_scale_pipe2;
-                    q6_scaled_product3 <= q6_pair_product3 * q6_scale_pipe3;
+                    for (state_lane = 0; state_lane < 8; state_lane = state_lane + 1) begin
+                        q6_pair_product[state_lane] <= q6_value_pipe[state_lane] *
+                                                       q6_input_pipe[state_lane];
+                        q6_scale_pipe[state_lane] <= q6_scale_decode[state_lane];
+                        q6_scaled_product[state_lane] <=
+                            q6_pair_product[state_lane] * q6_scale_pipe[state_lane];
+                    end
                     block_dot <= block_dot + q6_contribution;
                     state <= Q6_DRAIN_SCALE;
                 end
 
                 Q6_DRAIN_SCALE: begin
-                    q6_scaled_product0 <= q6_pair_product0 * q6_scale_pipe0;
-                    q6_scaled_product1 <= q6_pair_product1 * q6_scale_pipe1;
-                    q6_scaled_product2 <= q6_pair_product2 * q6_scale_pipe2;
-                    q6_scaled_product3 <= q6_pair_product3 * q6_scale_pipe3;
+                    for (state_lane = 0; state_lane < 8; state_lane = state_lane + 1)
+                        q6_scaled_product[state_lane] <=
+                            q6_pair_product[state_lane] * q6_scale_pipe[state_lane];
                     block_dot <= block_dot + q6_contribution;
                     state <= Q6_DRAIN_ACCUMULATE;
                 end
@@ -858,19 +1310,18 @@ module lfm_matvec_accelerator #(
                 end
 
                 Q6_SCALE: begin
-                    scale_signed_ma <=
-                        weight_scale[15] ^ input_scale[row_block][15] ?
-                        -$signed({1'b0, scale_ma}) :
-                         $signed({1'b0, scale_ma});
-                    scale_signed_mb <= $signed({1'b0, scale_mb});
+                    scale_mantissa_a <= scale_ma;
+                    scale_mantissa_b <= scale_mb;
+                    scale_negative <=
+                        weight_scale[15] ^ active_input_scale[15];
                     scale_shift <= scale_pa + scale_pb + 9'sd30;
                     scale_zero <= (scale_ea == 0 && weight_scale[9:0] == 0) ||
-                                  (scale_eb == 0 && input_scale[row_block][9:0] == 0);
+                                  (scale_eb == 0 && active_input_scale[9:0] == 0);
                     state <= Q6_SCALE_MANTISSA;
                 end
 
                 Q6_SCALE_MANTISSA: begin
-                    scale_mantissa_product <= scale_signed_ma * scale_signed_mb;
+                    scale_mantissa_product <= scale_mantissa_a * scale_mantissa_b;
                     state <= Q6_SCALE_ALIGN_WAIT;
                 end
 
@@ -879,7 +1330,9 @@ module lfm_matvec_accelerator #(
                 end
 
                 Q6_SCALE_ALIGN: begin
-                    scale_product <= aligned_scale_product[31:0];
+                    scale_product <= scale_negative ?
+                        -$signed(aligned_scale_product) :
+                         $signed(aligned_scale_product);
                     state <= Q6_SCALE_WAIT;
                 end
 
@@ -920,6 +1373,48 @@ module lfm_matvec_accelerator #(
                     end
                 end
 
+                Q1_STREAM: begin
+                    if (reader_byte_valid && reader_byte_ready) begin
+                        weight_byte_index <= weight_byte_index + reader_unit_bytes;
+                        if (weight_position == 0) begin
+                            weight_scale <= reader_data[15:0];
+                            for (state_lane = 0; state_lane < 4; state_lane = state_lane + 1)
+                                pend_input_scale[state_lane] <=
+                                    input_scale[row_block * 4 + state_lane];
+                            weight_position <= 2;
+                        end else if (weight_position == 2) begin
+                            v_bits <= reader_data;
+                            v_half <= 1'b0;
+                            v_valid <= 1'b1;
+                            weight_position <= 10;
+                        end else begin
+                            v_bits <= reader_data;
+                            v_half <= 1'b1;
+                            v_valid <= 1'b1;
+                            pend_last <= row_block + 1 == row_blocks;
+                            pend_row <= row_index;
+                            weight_position <= '0;
+                            if (row_block + 1 == row_blocks) begin
+                                row_block <= '0;
+                                if (row_index + 1 == ne1)
+                                    state <= Q1_FLUSH;
+                                else
+                                    row_index <= row_index + 1'b1;
+                            end else begin
+                                row_block <= row_block + 1'b1;
+                            end
+                        end
+                    end
+                end
+
+                Q1_FLUSH: begin
+                    // Wait for the compute pipeline, the row-result FIFO, and
+                    // every outstanding AXI write before signaling completion.
+                    if (!q1_pipe_busy && wfifo_count == 4'd0 && !wr_active &&
+                        wr_outstanding == 4'd0)
+                        state <= FINISH;
+                end
+
                 FINISH: begin
                     // Do not expose completion until the streaming reader has
                     // retired its final AXI beat. This is normally already
@@ -945,9 +1440,11 @@ module lfm_matvec_accelerator #(
                 end
 
                 default: begin
-                    error_flag    <= 1'b1;
-                    bus_request_o <= 1'b0;
-                    state         <= IDLE;
+                    // Trap undefined states through the ordinary completion
+                    // path so the bus is never released while the reader or
+                    // writer still owns outstanding AXI transactions.
+                    error_flag <= 1'b1;
+                    state      <= Q1_FLUSH;
                 end
             endcase
         end

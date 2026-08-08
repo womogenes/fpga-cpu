@@ -26,6 +26,18 @@ set_clock_groups -asynchronous \
     -group [get_clocks clk_pll_i] \
     -group [get_clocks -include_generated_clocks prog_clko_pin]
 
+# The accelerator command word crosses from the 100 MHz GPIO clock into the
+# DDR UI clock through command_meta_reg. The toggle-plus-settle protocol
+# tolerates one ambiguous capture, but the data bits must settle well inside
+# the driver's settle window; cap their delay explicitly so placement cannot
+# stretch this crossing.
+set_max_delay -datapath_only 5.0 -to [get_pins {i_soc/i_lfm_matvec_accelerator/command_meta_reg[*]/D}]
+
+# The accelerator and its AXI register slice deassert their asynchronous reset
+# through the main reset synchronizer while the DDR domain is quiescent, so
+# recovery/removal timing on the released edge is not functional.
+set_false_path -from [get_pins {i_soc/i_rstgen_main/i_rstgen_bypass/synch_regs_q_reg[*]/C}] -to [get_cells -hier -filter {NAME =~ *i_lfm_matvec_accelerator* || NAME =~ *i_lfm_axi_cut*}]
+
 # The Q30 block scale and 32-bit dot product are held for two clocks before the
 # matrix-block product is captured. Target sequential cells only so synthesized
 # helper LUT names cannot accidentally become timing endpoints.

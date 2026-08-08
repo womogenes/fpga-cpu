@@ -1,9 +1,10 @@
-.PHONY: help init sim lint timing-accelerator gateware smp-smoke image ram-image stage2-loader upload-ram upload-ram-model upload-model monitor deploy-remote remote-boot remote-boot-model deploy-model-remote remote-model status
+.PHONY: help init sim lint timing-accelerator gateware smp-smoke image ram-image stage2-loader upload-ram upload-ram-model upload-sd-model upload-model monitor deploy-remote remote-boot remote-boot-model remote-boot-sd-model deploy-model-remote remote-model status
 
 ROOT := $(abspath ../..)
 OUTPUT := $(CURDIR)/build/sdk
 HOST_TOOLS := $(CURDIR)/build/host-tools
 BUILDROOT := $(CURDIR)/sdk/buildroot
+BUILDROOT_OUTPUT := $(CURDIR)/build/buildroot
 BUILDROOT_EXTERNAL := $(CURDIR)/sdk/br2-ext-tree
 BUILDROOT_DEFCONFIG := $(CURDIR)/config/buildroot64_defconfig
 BC_VERSION := 1.08.2
@@ -15,6 +16,7 @@ REMOTE_HOST ?= thinkmax
 REMOTE_CVA6_DIR ?= ~/fpga/fpga-cpu/build/cva6
 REMOTE_SERIAL ?= /dev/ttyUSB0
 MODEL ?= $(abspath $(ROOT)/../inference/models/LFM2.5-350M-Q4_0.gguf)
+REMOTE_MODEL_FILE = $(notdir $(MODEL))
 
 help:
 	@echo "make init      Initialize all pinned CVA6 dependencies"
@@ -22,17 +24,19 @@ help:
 	@echo "make lint      Elaborate the HDMI terminal RTL with Vivado"
 	@echo "make timing-accelerator Route only the LFM accelerator at its 200 MHz clock"
 	@echo "make gateware Build the CVA6 Genesys 2 HDMI bitstream"
-	@echo "make smp-smoke Build the three-hart bare-metal smoke test"
+	@echo "make smp-smoke Build the four-hart bare-metal smoke test"
 	@echo "make image    Build the 64-bit Linux userspace and SD-card image"
 	@echo "make ram-image Build Linux with the root filesystem embedded in DRAM firmware"
 	@echo "make stage2-loader Build the flow-controlled fast RAM loader"
 	@echo "make upload-ram Upload the existing DRAM Linux firmware over UART"
 	@echo "make upload-ram-model Upload Linux and LFM weights through the fast stage-2 loader"
+	@echo "make upload-sd-model Boot existing SD Linux while staging one model"
 	@echo "make upload-model Upload LFM weights into the running RAM filesystem"
 	@echo "make monitor  Open the board's serial console"
 	@echo "make deploy-remote Copy board-ready artifacts to thinkmax"
 	@echo "make remote-boot Deploy, program the remote FPGA, upload Linux, and attach"
 	@echo "make remote-boot-model Boot remote Linux with LFM weights staged in reserved DDR"
+	@echo "make remote-boot-sd-model Boot remote SD Linux with one model staged in DDR"
 	@echo "make remote-model Upload the LFM weights into a running remote RAM filesystem"
 	@echo "make status   Show upstream revisions and submodule state"
 
@@ -83,8 +87,10 @@ $(HOST_TOOLS)/bin/bc: $(BC_ARCHIVE)
 
 image: $(HOST_TOOLS)/bin/bc
 	mkdir -p $(OUTPUT)
-	PATH="$(HOST_TOOLS)/bin:$(PATH)" $(MAKE) -C $(BUILDROOT) BR2_EXTERNAL="$(BUILDROOT_EXTERNAL)" BR2_DEFCONFIG="$(BUILDROOT_DEFCONFIG)" HOSTCXX=$(CURDIR)/tools/host-gxx defconfig
-	PATH="$(HOST_TOOLS)/bin:$(PATH)" $(MAKE) -j$$(nproc) -C $(BUILDROOT) BR2_EXTERNAL="$(BUILDROOT_EXTERNAL)" BINARIES_DIR=$(OUTPUT) HOSTCXX=$(CURDIR)/tools/host-gxx
+	PATH="$(HOST_TOOLS)/bin:$(PATH)" $(MAKE) -C $(BUILDROOT) O="$(BUILDROOT_OUTPUT)" BR2_EXTERNAL="$(BUILDROOT_EXTERNAL)" BR2_DEFCONFIG="$(BUILDROOT_DEFCONFIG)" HOSTCXX=$(CURDIR)/tools/host-gxx defconfig
+	PATH="$(HOST_TOOLS)/bin:$(PATH)" $(MAKE) -C $(BUILDROOT) O="$(BUILDROOT_OUTPUT)" BR2_EXTERNAL="$(BUILDROOT_EXTERNAL)" BINARIES_DIR=$(OUTPUT) HOSTCXX=$(CURDIR)/tools/host-gxx uboot-rebuild
+	PATH="$(HOST_TOOLS)/bin:$(PATH)" $(MAKE) -C $(BUILDROOT) O="$(BUILDROOT_OUTPUT)" BR2_EXTERNAL="$(BUILDROOT_EXTERNAL)" BINARIES_DIR=$(OUTPUT) HOSTCXX=$(CURDIR)/tools/host-gxx opensbi-rebuild
+	PATH="$(HOST_TOOLS)/bin:$(PATH)" $(MAKE) -j$$(nproc) -C $(BUILDROOT) O="$(BUILDROOT_OUTPUT)" BR2_EXTERNAL="$(BUILDROOT_EXTERNAL)" BINARIES_DIR=$(OUTPUT) HOSTCXX=$(CURDIR)/tools/host-gxx
 
 ram-image: image
 	./tools/build_ram_image.sh
@@ -101,6 +107,11 @@ upload-ram-model: stage2-loader
 	test -f $(MODEL) || { echo "Model not found: $(MODEL)" >&2; exit 1; }
 	SERIAL=$(SERIAL) UART_BAUD=$(UART_BAUD) ./tools/ram_upload.py --stage2 $(OUTPUT)/stage2-loader.bin --model $(MODEL) $(OUTPUT)/ram-linux.bin
 
+upload-sd-model: stage2-loader
+	test -f $(OUTPUT)/fw_payload.bin || { echo "Run 'make image' first." >&2; exit 1; }
+	test -f $(MODEL) || { echo "Model not found: $(MODEL)" >&2; exit 1; }
+	SERIAL=$(SERIAL) UART_BAUD=$(UART_BAUD) ./tools/ram_upload.py --stage2 $(OUTPUT)/stage2-loader.bin --model $(MODEL) $(OUTPUT)/fw_payload.bin
+
 upload-model:
 	test -f $(MODEL) || { echo "Model not found: $(MODEL)" >&2; exit 1; }
 	./tools/model_upload.py --serial $(SERIAL) --baud $(UART_BAUD) --rate-kib $(MODEL_UPLOAD_RATE_KIB) $(MODEL)
@@ -109,22 +120,25 @@ deploy-remote: stage2-loader
 	test -f build/gateware/cva6_genesys2_hdmi.bit || { echo "Run 'make gateware' first." >&2; exit 1; }
 	test -f $(OUTPUT)/ram-linux.bin || { echo "Run 'make ram-image' first." >&2; exit 1; }
 	ssh $(REMOTE_HOST) 'mkdir -p $(REMOTE_CVA6_DIR)'
-	rsync -az build/gateware/cva6_genesys2_hdmi.bit $(OUTPUT)/ram-linux.bin $(OUTPUT)/stage2-loader.bin tools/ram_upload.py $(REMOTE_HOST):$(REMOTE_CVA6_DIR)/
+	rsync -az build/gateware/cva6_genesys2_hdmi.bit $(OUTPUT)/fw_payload.bin $(OUTPUT)/ram-linux.bin $(OUTPUT)/stage2-loader.bin tools/ram_upload.py tools/program_and_upload.py $(REMOTE_HOST):$(REMOTE_CVA6_DIR)/
 
 remote-boot: deploy-remote
-	ssh -tt $(REMOTE_HOST) 'cd $(REMOTE_CVA6_DIR) && openFPGALoader -b genesys2 --freq 1000000 cva6_genesys2_hdmi.bit && python3 ram_upload.py --serial $(REMOTE_SERIAL) --baud $(UART_BAUD) --stage2 stage2-loader.bin ram-linux.bin'
+	ssh -tt $(REMOTE_HOST) 'cd $(REMOTE_CVA6_DIR) && python3 program_and_upload.py --bitstream cva6_genesys2_hdmi.bit --serial $(REMOTE_SERIAL) --baud $(UART_BAUD) --stage2 stage2-loader.bin ram-linux.bin'
 
 remote-boot-model: deploy-remote deploy-model-remote
-	ssh -tt $(REMOTE_HOST) 'cd $(REMOTE_CVA6_DIR) && openFPGALoader -b genesys2 --freq 1000000 cva6_genesys2_hdmi.bit && python3 ram_upload.py --serial $(REMOTE_SERIAL) --baud $(UART_BAUD) --stage2 stage2-loader.bin --model LFM2.5-350M-Q4_0.gguf ram-linux.bin'
+	ssh -tt $(REMOTE_HOST) 'cd $(REMOTE_CVA6_DIR) && python3 program_and_upload.py --bitstream cva6_genesys2_hdmi.bit --serial $(REMOTE_SERIAL) --baud $(UART_BAUD) --stage2 stage2-loader.bin --model $(REMOTE_MODEL_FILE) ram-linux.bin'
+
+remote-boot-sd-model: deploy-remote deploy-model-remote
+	ssh -tt $(REMOTE_HOST) 'cd $(REMOTE_CVA6_DIR) && python3 program_and_upload.py --bitstream cva6_genesys2_hdmi.bit --serial $(REMOTE_SERIAL) --baud $(UART_BAUD) --stage2 stage2-loader.bin --model $(REMOTE_MODEL_FILE) fw_payload.bin'
 
 deploy-model-remote:
 	test -f $(MODEL) || { echo "Model not found: $(MODEL)" >&2; exit 1; }
 	ssh $(REMOTE_HOST) 'mkdir -p $(REMOTE_CVA6_DIR)'
-	rsync -az $(MODEL) $(REMOTE_HOST):$(REMOTE_CVA6_DIR)/LFM2.5-350M-Q4_0.gguf
+	rsync -az $(MODEL) $(REMOTE_HOST):$(REMOTE_CVA6_DIR)/$(REMOTE_MODEL_FILE)
 	rsync -az tools/model_upload.py $(REMOTE_HOST):$(REMOTE_CVA6_DIR)/
 
 remote-model: deploy-model-remote
-	ssh -tt $(REMOTE_HOST) 'cd $(REMOTE_CVA6_DIR) && python3 model_upload.py --serial $(REMOTE_SERIAL) --baud $(UART_BAUD) --rate-kib $(MODEL_UPLOAD_RATE_KIB) LFM2.5-350M-Q4_0.gguf'
+	ssh -tt $(REMOTE_HOST) 'cd $(REMOTE_CVA6_DIR) && python3 model_upload.py --serial $(REMOTE_SERIAL) --baud $(UART_BAUD) --rate-kib $(MODEL_UPLOAD_RATE_KIB) $(REMOTE_MODEL_FILE)'
 
 status:
 	git -C hardware status --short --branch

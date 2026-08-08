@@ -37,7 +37,7 @@ cd "$build"
     --sysincludepaths=/usr/include \
     --libpaths=/usr/lib:/lib \
     --crtprefix=/usr/lib \
-    --elfinterp=/lib/ld-linux-riscv64-lp64d.so.1 \
+    --elfinterp=/lib/ld-linux-riscv64-lp64.so.1 \
     --config-pie
 
 cc -DC2STR "$source/conftest.c" -o c2str.exe

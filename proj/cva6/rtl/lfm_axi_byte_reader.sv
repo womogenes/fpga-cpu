@@ -1,5 +1,7 @@
-// AXI4 burst reader with a byte-wide output stream. Addresses and lengths must
-// be eight-byte aligned. Bursts never cross a 4 KiB boundary.
+// AXI4 burst reader with a variable-width little-endian output stream.
+// Addresses must be eight-byte aligned; lengths may end on any byte. Bursts
+// never cross a 4 KiB boundary. A 16-byte elastic buffer permits unaligned
+// 1-, 2-, and 8-byte units while retaining the full 64-bit AXI bandwidth.
 module lfm_axi_byte_reader #(
     parameter integer ID_WIDTH = 5
 ) (
@@ -8,11 +10,11 @@ module lfm_axi_byte_reader #(
     input  logic                start_i,
     input  logic [29:0]         address_i,
     input  logic [31:0]         byte_count_i,
-    input  logic                word_mode_i,
+    input  logic [3:0]          unit_bytes_i,
     output logic                busy_o,
     output logic                done_o,
     output logic                error_o,
-    output logic [15:0]         data_o,
+    output logic [63:0]         data_o,
     output logic                byte_valid_o,
     input  logic                byte_ready_i,
     output logic [ID_WIDTH-1:0] arid_o,
@@ -30,15 +32,18 @@ module lfm_axi_byte_reader #(
     output logic                rready_o
 );
 
-    logic [29:0] next_address;
-    logic [31:0] beats_unissued;
-    logic [8:0]  burst_beats;
-    logic [8:0]  beats_in_flight;
-    logic [63:0] beat_data;
-    logic [2:0]  byte_index;
-    logic        beat_valid;
-    logic        last_unit;
-    logic        consume_last;
+    logic [29:0]  next_address;
+    logic [31:0]  beats_unissued;
+    logic [31:0]  bytes_unreceived;
+    logic [8:0]   burst_beats;
+    logic [8:0]   beats_in_flight;
+    logic [127:0] data_buffer;
+    logic [4:0]   buffered_bytes;
+    logic         consume_unit;
+    logic [4:0]   bytes_after_consume;
+    logic [127:0] buffer_after_consume;
+    logic         accept_beat;
+    logic [4:0]   accepted_bytes;
 
     function automatic [8:0] choose_burst(
         input logic [29:0] address,
@@ -60,14 +65,20 @@ module lfm_axi_byte_reader #(
     assign arid_o       = {ID_WIDTH{1'b1}};
     assign arsize_o     = 3'd3;
     assign arburst_o    = 2'b01;
-    assign data_o       = beat_data[15:0];
-    assign byte_valid_o = beat_valid;
-    assign last_unit    = (!word_mode_i && byte_index == 3'd7) ||
-                          (word_mode_i && byte_index == 3'd6);
-    assign consume_last = beat_valid && byte_ready_i && last_unit;
-    // Replace a consumed beat directly from RDATA when the next AXI beat is
-    // already waiting. This removes the former one-cycle bubble per 64 bits.
-    assign rready_o     = busy_o && (!beat_valid || consume_last);
+    assign data_o       = data_buffer[63:0];
+    assign byte_valid_o = buffered_bytes >= unit_bytes_i && unit_bytes_i != 0;
+    assign consume_unit = byte_valid_o && byte_ready_i;
+    assign bytes_after_consume = buffered_bytes -
+                                 (consume_unit ? unit_bytes_i : 4'd0);
+    assign buffer_after_consume = consume_unit ?
+                                  (data_buffer >> (unit_bytes_i * 8)) :
+                                  data_buffer;
+    // Account for a simultaneous consumer transfer when deciding whether an
+    // arriving AXI beat fits. This sustains one 64-bit beat per cycle.
+    assign rready_o = busy_o && bytes_after_consume <= 8;
+    assign accept_beat = rvalid_i && rready_o;
+    assign accepted_bytes = bytes_unreceived >= 8 ? 5'd8 :
+                            {1'b0, bytes_unreceived[3:0]};
 
     always_ff @(posedge clk_i or negedge rst_ni) begin
         if (!rst_ni) begin
@@ -76,11 +87,11 @@ module lfm_axi_byte_reader #(
             error_o         <= 1'b0;
             next_address    <= '0;
             beats_unissued  <= '0;
+            bytes_unreceived <= '0;
             burst_beats     <= '0;
             beats_in_flight <= '0;
-            beat_data       <= '0;
-            byte_index      <= '0;
-            beat_valid      <= 1'b0;
+            data_buffer     <= '0;
+            buffered_bytes  <= '0;
             araddr_o        <= '0;
             arlen_o         <= '0;
             arvalid_o       <= 1'b0;
@@ -90,13 +101,17 @@ module lfm_axi_byte_reader #(
             if (start_i && !busy_o) begin
                 busy_o          <= 1'b1;
                 error_o         <= (address_i[2:0] != 0) ||
-                                   (byte_count_i[2:0] != 0) ||
-                                   (byte_count_i == 0);
+                                   (byte_count_i == 0) ||
+                                   !((unit_bytes_i == 1) ||
+                                     (unit_bytes_i == 2) ||
+                                     (unit_bytes_i == 8));
                 next_address    <= address_i;
-                beats_unissued  <= byte_count_i >> 3;
+                beats_unissued  <= (byte_count_i + 7) >> 3;
+                bytes_unreceived <= byte_count_i;
                 burst_beats     <= '0;
                 beats_in_flight <= '0;
-                beat_valid      <= 1'b0;
+                data_buffer     <= '0;
+                buffered_bytes  <= '0;
                 arvalid_o       <= 1'b0;
             end
 
@@ -115,10 +130,18 @@ module lfm_axi_byte_reader #(
                 next_address    <= next_address + (burst_beats << 3);
             end
 
-            if (rvalid_i && rready_o) begin
-                beat_data  <= rdata_i;
-                byte_index <= 3'd0;
-                beat_valid <= 1'b1;
+            if (consume_unit || accept_beat) begin
+                if (accept_beat)
+                    data_buffer <= buffer_after_consume |
+                                   ({64'b0, rdata_i} << (bytes_after_consume * 8));
+                else
+                    data_buffer <= buffer_after_consume;
+                buffered_bytes <= bytes_after_consume +
+                                  (accept_beat ? accepted_bytes : 5'd0);
+            end
+
+            if (accept_beat) begin
+                bytes_unreceived <= bytes_unreceived - accepted_bytes;
                 if (rresp_i != 2'b00 || rid_i != {ID_WIDTH{1'b1}})
                     error_o <= 1'b1;
                 if (beats_in_flight == 1) begin
@@ -130,25 +153,10 @@ module lfm_axi_byte_reader #(
                 beats_in_flight <= beats_in_flight - 1'b1;
             end
 
-            if (beat_valid && byte_ready_i) begin
-                if (last_unit) begin
-                    if (!(rvalid_i && rready_o)) begin
-                        beat_valid <= 1'b0;
-                        if (beats_unissued == 0 && beats_in_flight == 0 &&
-                            !arvalid_o) begin
-                            busy_o <= 1'b0;
-                            done_o <= 1'b1;
-                        end
-                    end
-                end else begin
-                    if (word_mode_i) begin
-                        beat_data  <= {16'b0, beat_data[63:16]};
-                        byte_index <= byte_index + 2'd2;
-                    end else begin
-                        beat_data  <= {8'b0, beat_data[63:8]};
-                        byte_index <= byte_index + 1'b1;
-                    end
-                end
+            if (consume_unit && bytes_after_consume == 0 && !accept_beat &&
+                beats_unissued == 0 && beats_in_flight == 0 && !arvalid_o) begin
+                busy_o <= 1'b0;
+                done_o <= 1'b1;
             end
         end
     end
