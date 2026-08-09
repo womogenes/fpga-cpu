@@ -12,6 +12,7 @@ cflags=(-O3 "${target_arch[@]}" -Wall -Wextra -Werror -std=gnu11 -I"$software")
 inference="${LFM_INFERENCE_ROOT:-$root/../../../inference}"
 llama_root="${BONSAI_LLAMA_ROOT:-$root/../../../llama.cpp}"
 lfm_model="$inference/models/LFM2.5-350M-Q4_0.gguf"
+bonsai_model="${BONSAI_MODEL:-$llama_root/../Bonsai-1.7B.gguf}"
 lfm_main="$inference/main"
 lfm_build="$root/build/lfm-runtime"
 
@@ -42,10 +43,12 @@ install -m 0755 "$software/numpy_bench.py" "$programs/numpy-bench"
 install -m 0755 "$software/lfm_chat.py" "$programs/lfm-chat"
 install -m 0755 "$software/sd_install.sh" "$TARGET_DIR/usr/sbin/sd-install"
 "$root/tools/build_bonsai_runtime.sh" "$TARGET_DIR" "$llama_root"
-install -m 0755 "$software/bonsai_chat.sh" "$programs/bonsai-chat"
-mkdir -p "$TARGET_DIR/usr/share/lfm"
+install -m 0755 "$software/bonsai_chat.sh" "$programs/bonsai-runtime-chat"
+install -m 0755 "$software/bonsai_chat.py" "$programs/bonsai-chat"
+mkdir -p "$TARGET_DIR/usr/share/lfm" "$TARGET_DIR/usr/share/bonsai"
 rm -f "$TARGET_DIR/etc/init.d/S99model-export"
 python3 "$root/tools/build_lfm_tokenizer.py" "$lfm_model" "$TARGET_DIR/usr/share/lfm/tokenizer.pickle"
+python3 "$root/tools/build_lfm_tokenizer.py" "$bonsai_model" "$TARGET_DIR/usr/share/bonsai/tokenizer.pickle"
 
 badapple_asset="$root/../sw/bad_apple/build/video.bin"
 if [[ ! -f "$badapple_asset" ]]; then
