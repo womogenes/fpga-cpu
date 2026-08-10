@@ -29,10 +29,15 @@ def drain(port: serial.Serial, duration: float) -> bytes:
 
 
 def send_line(port: serial.Serial, text: str, char_delay: float) -> None:
-    for byte in (text + "\r").encode():
-        port.write(bytes([byte]))
+    payload = (text + "\r").encode()
+    # Python's sub-millisecond sleep is quantized heavily on the remote host.
+    # Pace four-byte bursts instead: they fit comfortably in the UART RX FIFO
+    # while avoiding one scheduler sleep and tcdrain operation per character.
+    for offset in range(0, len(payload), 4):
+        burst = payload[offset:offset + 4]
+        port.write(burst)
         port.flush()
-        time.sleep(char_delay)
+        time.sleep(char_delay * len(burst))
 
 
 SEQUENCE = 0
@@ -77,7 +82,7 @@ def main() -> None:
     delay = args.char_delay_us / 1_000_000
 
     with serial.Serial(args.serial, args.baud, timeout=0.1) as port:
-        run(port, "", delay, 0.5)
+        run(port, ":", delay, 0.5)
         run(port, f"rm -f {args.destination}.part", delay, 0.8)
         offset = 0
         index = 0
@@ -91,7 +96,7 @@ def main() -> None:
                     f"printf %s {chunk_b64} | base64 -d > /tmp/.chunk.bin",
                     delay, 0.8)
                 reply = run(port,
-                            "sha256sum /tmp/.chunk.bin | cut -d' ' -f1",
+                            "sha256sum /tmp/.chunk.bin",
                             delay, 0.8)
                 if chunk_sha not in reply:
                     print(f"chunk {index} attempt {attempt + 1} decode failed",
@@ -118,7 +123,7 @@ def main() -> None:
             if index % 8 == 0:
                 print(f"{offset}/{len(payload)} bytes", file=sys.stderr)
         reply = run(port,
-                    f"sha256sum {args.destination}.part | cut -d' ' -f1",
+                    f"sha256sum {args.destination}.part",
                     delay, 1.5)
         if total_sha not in reply:
             raise SystemExit("final SHA mismatch")

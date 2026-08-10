@@ -37,19 +37,27 @@ def send_line(port: serial.Serial, line: str, delay: float) -> None:
 
 def report_benchmark(transcript: bytes) -> None:
     text = transcript.decode(errors="replace").replace("\r", "")
+    speed_text = text.split("__BONSAI_SPEED_BEGIN__", 1)[-1]
+    speed_text = speed_text.split("__BONSAI_PROFILE_BEGIN__", 1)[0]
+    profile_text = text.split("__BONSAI_PROFILE_BEGIN__", 1)[-1]
     sequence_ok = re.search(
-        r"^25,220,16,24,24,15,11,279,1156$", text, re.MULTILINE
+        r"^25,220,16,24,24,15,11,279,1156$", speed_text, re.MULTILINE
     ) is not None
     decode = re.search(
         r"decode: 8 tokens in ([0-9.]+)s \(([0-9.]+)s/token, "
-        r"([0-9.]+) tok/s\)", text
+        r"([0-9.]+) tok/s\)", speed_text
     )
     profile = re.search(
         r"Bonsai FPGA profile: .* pack=([0-9.]+)ms "
-        r"hardware=([0-9.]+)ms output=([0-9.]+)ms", text
+        r"hardware=([0-9.]+)ms output=([0-9.]+)ms", profile_text
     )
-    prompt = re.search(r"prompt: 1 tokens in ([0-9.]+)s", text)
-    hardware_argmax = "Bonsai FPGA hardware argmax enabled" in text
+    profile_prompt = re.search(
+        r"prompt: 1 tokens in ([0-9.]+)s", profile_text
+    )
+    profile_decode = re.search(
+        r"decode: 8 tokens in ([0-9.]+)s", profile_text
+    )
+    hardware_argmax = "Bonsai FPGA hardware argmax enabled" in speed_text
     if decode is None:
         print("ACCEPTANCE FAIL: decode timing was not reported")
         return
@@ -59,9 +67,11 @@ def report_benchmark(transcript: bytes) -> None:
         f"ACCEPTANCE {'PASS' if passed else 'FAIL'}: exact_tokens={sequence_ok} "
         f"hardware_argmax={hardware_argmax} decode_tok_s={decode_tps:.3f}"
     )
-    if profile is not None and prompt is not None:
+    if profile is not None and profile_prompt is not None and profile_decode is not None:
         hardware_ms = float(profile.group(2))
-        wall_ms = 1000.0 * (float(prompt.group(1)) + float(decode.group(1)))
+        wall_ms = 1000.0 * (
+            float(profile_prompt.group(1)) + float(profile_decode.group(1))
+        )
         share = hardware_ms / wall_ms if wall_ms else 0.0
         limiter = "FPGA compute/memory" if share >= 0.5 else "CPU-side work"
         print(
@@ -94,9 +104,14 @@ def main() -> None:
         wait_for(port, b"# ", 30.0)
         if not args.skip_benchmark:
             benchmark = (
+                "printf '\\n__BONSAI_SPEED_BEGIN__\\n'; "
+                "/usr/bin/bonsai-lite --model "
+                '"$BONSAI_MODEL" --threads 4 -n 9 --prompt-ids 12522 '
+                "2>&1 | tee /root/bonsai-speed.log; "
+                "printf '\\n__BONSAI_PROFILE_BEGIN__\\n'; "
                 "BONSAI_PROFILE=1 /usr/bin/bonsai-lite --model "
                 '"$BONSAI_MODEL" --threads 4 -n 9 --prompt-ids 12522 '
-                "2>&1 | tee /root/bonsai-acceptance.log; "
+                "2>&1 | tee /root/bonsai-profile.log; "
                 "printf '\\n__BONSAI_BENCH_DONE__\\n'"
             )
             send_line(
