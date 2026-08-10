@@ -541,18 +541,6 @@ static void rope_cache_init(void) {
   }
 }
 
-static void rope_head(float *v, uint32_t position) {
-  const float *cs = g_rope_cos[position];
-  const float *sn = g_rope_sin[position];
-  const uint32_t half = BONSAI_HEAD_DIM / 2u;
-  for (uint32_t i = 0; i < half; ++i) {
-    float a = v[i];
-    float b = v[i + half];
-    v[i] = a * cs[i] - b * sn[i];
-    v[i + half] = a * sn[i] + b * cs[i];
-  }
-}
-
 /* ------------------------------------------------------------------ */
 /* Worker pool.                                                        */
 
@@ -607,7 +595,8 @@ static void quantize_q8_group_range(const float *input,
                                     uint32_t begin, uint32_t end);
 static void attention_prep_head_range(uint32_t begin, uint32_t end,
                                       uint32_t position,
-                                      const struct layer *layer);
+                                      const struct layer *layer,
+                                      const volatile int64_t *raw);
 
 static inline float q30_to_float(int64_t value) {
   int32_t high = (int32_t)(value >> 32);
@@ -648,21 +637,8 @@ static void execute_job(uint32_t worker) {
       quantize_q8_group_range(g_job.quantize_input, g_job.quantize_output,
                               begin, end);
   } else if (g_job.kind == JOB_ATTN_READ_PREP) {
-    for (uint32_t h = begin; h < end; ++h) {
-      for (uint32_t i = 0; i < BONSAI_HEAD_DIM; ++i)
-        g_state.q[h * BONSAI_HEAD_DIM + i] =
-            q30_to_float(g_job.raw[h * BONSAI_HEAD_DIM + i]);
-      if (h < BONSAI_KV_HEADS) {
-        for (uint32_t i = 0; i < BONSAI_HEAD_DIM; ++i) {
-          uint32_t index = h * BONSAI_HEAD_DIM + i;
-          g_state.k[index] =
-              q30_to_float(g_job.raw[BONSAI_DIM + index]);
-          g_state.v[index] =
-              q30_to_float(g_job.raw[BONSAI_DIM + BONSAI_KV_DIM + index]);
-        }
-      }
-    }
-    attention_prep_head_range(begin, end, g_job.position, g_job.layer);
+    attention_prep_head_range(begin, end, g_job.position, g_job.layer,
+                              g_job.raw);
   } else if (g_job.kind == JOB_FFN_READ_ACTIVATE) {
     for (uint32_t i = begin; i < end; ++i) {
       float up = q30_to_float(g_job.raw[i]);
@@ -838,29 +814,50 @@ static void rms_norm(float *out, float *x, const struct tensor *weight,
   rms_norm_add(out, x, NULL, weight, n);
 }
 
-static void head_rms_norm_one(float *v, const struct tensor *weight) {
+static void head_norm_rope(float *v, const struct tensor *weight, float scale,
+                           uint32_t position) {
   const float *w = (const float *)weight->data;
-  float sum = 0.0f;
-  for (uint32_t i = 0; i < BONSAI_HEAD_DIM; ++i) sum += v[i] * v[i];
-  float scale = rsqrt_f(sum * (1.0f / (float)BONSAI_HEAD_DIM) + BONSAI_EPS);
-  for (uint32_t i = 0; i < BONSAI_HEAD_DIM; ++i) v[i] *= scale * w[i];
+  const float *cs = g_rope_cos[position];
+  const float *sn = g_rope_sin[position];
+  const uint32_t half = BONSAI_HEAD_DIM / 2u;
+  for (uint32_t i = 0; i < half; ++i) {
+    float a = v[i] * scale * w[i];
+    float b = v[i + half] * scale * w[i + half];
+    v[i] = a * cs[i] - b * sn[i];
+    v[i + half] = a * sn[i] + b * cs[i];
+  }
 }
 
 static void attention_prep_head_range(uint32_t begin, uint32_t end,
                                       uint32_t position,
-                                      const struct layer *layer) {
+                                      const struct layer *layer,
+                                      const volatile int64_t *raw) {
   uint32_t layer_index = (uint32_t)(layer - g_model.layers);
   float *kc = g_state.kv_k[layer_index][position];
   float *vc = g_state.kv_v[layer_index][position];
   for (uint32_t h = begin; h < end; ++h) {
     float *q = g_state.q + h * BONSAI_HEAD_DIM;
-    head_rms_norm_one(q, &layer->q_norm);
-    rope_head(q, position);
+    float q_sum = 0.0f;
+    for (uint32_t i = 0; i < BONSAI_HEAD_DIM; ++i) {
+      q[i] = q30_to_float(raw[h * BONSAI_HEAD_DIM + i]);
+      q_sum += q[i] * q[i];
+    }
+    float q_scale = rsqrt_f(
+        q_sum * (1.0f / (float)BONSAI_HEAD_DIM) + BONSAI_EPS);
+    head_norm_rope(q, &layer->q_norm, q_scale, position);
     if (h < BONSAI_KV_HEADS) {
       float *k = g_state.k + h * BONSAI_HEAD_DIM;
       float *v = g_state.v + h * BONSAI_HEAD_DIM;
-      head_rms_norm_one(k, &layer->k_norm);
-      rope_head(k, position);
+      float k_sum = 0.0f;
+      for (uint32_t i = 0; i < BONSAI_HEAD_DIM; ++i) {
+        uint32_t index = h * BONSAI_HEAD_DIM + i;
+        k[i] = q30_to_float(raw[BONSAI_DIM + index]);
+        v[i] = q30_to_float(raw[BONSAI_DIM + BONSAI_KV_DIM + index]);
+        k_sum += k[i] * k[i];
+      }
+      float k_scale = rsqrt_f(
+          k_sum * (1.0f / (float)BONSAI_HEAD_DIM) + BONSAI_EPS);
+      head_norm_rope(k, &layer->k_norm, k_scale, position);
       for (uint32_t i = 0; i < BONSAI_HEAD_DIM; ++i) {
         kc[h * BONSAI_HEAD_DIM + i] = half_to_float(float_to_half(k[i]));
         vc[h * BONSAI_HEAD_DIM + i] = half_to_float(float_to_half(v[i]));
