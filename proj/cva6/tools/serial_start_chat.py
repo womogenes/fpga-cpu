@@ -57,6 +57,20 @@ def report_benchmark(transcript: bytes) -> None:
     profile_decode = re.search(
         r"decode: 8 tokens in ([0-9.]+)s", profile_text
     )
+    worker_times = {
+        name: float(match.group(1))
+        for name in (
+            "attn_heads",
+            "accel_argmax",
+            "read_rows",
+            "quantize",
+            "attn_prep",
+            "ffn_activate",
+            "norm_sum",
+            "norm_apply",
+        )
+        if (match := re.search(rf"{name}=([0-9.]+)ms/", profile_text))
+    }
     hardware_argmax = "Bonsai FPGA hardware argmax enabled" in speed_text
     if decode is None:
         print("ACCEPTANCE FAIL: decode timing was not reported")
@@ -72,12 +86,22 @@ def report_benchmark(transcript: bytes) -> None:
         wall_ms = 1000.0 * (
             float(profile_prompt.group(1)) + float(profile_decode.group(1))
         )
-        share = hardware_ms / wall_ms if wall_ms else 0.0
-        limiter = "FPGA compute/memory" if share >= 0.5 else "CPU-side work"
-        print(
-            f"BOTTLENECK: {limiter}; accelerator wait is "
-            f"{share * 100.0:.1f}% of measured forward wall time"
-        )
+        if len(worker_times) == 8:
+            kernel_ms = hardware_ms + sum(worker_times.values())
+            share = min(kernel_ms / wall_ms, 1.0) if wall_ms else 0.0
+            overhead_ms = max(wall_ms - kernel_ms, 0.0)
+            limiter = "compute/memory kernels" if share >= 0.75 else "CPU overhead"
+            print(
+                f"BOTTLENECK: {limiter}; named FPGA and model kernels account "
+                f"for {share * 100.0:.1f}% of forward wall time "
+                f"({overhead_ms:.1f}ms unclassified)"
+            )
+        else:
+            share = hardware_ms / wall_ms if wall_ms else 0.0
+            print(
+                "BOTTLENECK: incomplete worker profile; accelerator wait is "
+                f"{share * 100.0:.1f}% of measured forward wall time"
+            )
 
 
 def main() -> None:

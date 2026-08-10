@@ -198,6 +198,7 @@ static float g_rope_cos[BONSAI_MAX_CONTEXT][BONSAI_HEAD_DIM / 2];
 static float g_rope_sin[BONSAI_MAX_CONTEXT][BONSAI_HEAD_DIM / 2];
 static uint64_t g_t_attn, g_t_ffn, g_t_norm, g_t_head;
 static uint64_t g_forward_count;
+static uint64_t g_job_ns[12], g_job_count[12];
 static int g_profile;
 static int g_trace;
 static uint32_t g_parallel_rows = 16384u;
@@ -221,6 +222,20 @@ static void report_main_profile(void) {
           (unsigned long long)g_forward_count, (double)g_t_attn / 1e6,
           (double)g_t_ffn / 1e6, (double)g_t_norm / 1e6,
           (double)g_t_head / 1e6);
+  fprintf(stderr,
+          "Bonsai worker profile: attn_heads=%.3fms/%llu "
+          "accel_argmax=%.3fms/%llu read_rows=%.3fms/%llu "
+          "quantize=%.3fms/%llu attn_prep=%.3fms/%llu "
+          "ffn_activate=%.3fms/%llu norm_sum=%.3fms/%llu "
+          "norm_apply=%.3fms/%llu\n",
+          (double)g_job_ns[1] / 1e6, (unsigned long long)g_job_count[1],
+          (double)g_job_ns[3] / 1e6, (unsigned long long)g_job_count[3],
+          (double)g_job_ns[4] / 1e6, (unsigned long long)g_job_count[4],
+          (double)g_job_ns[6] / 1e6, (unsigned long long)g_job_count[6],
+          (double)g_job_ns[7] / 1e6, (unsigned long long)g_job_count[7],
+          (double)g_job_ns[8] / 1e6, (unsigned long long)g_job_count[8],
+          (double)g_job_ns[10] / 1e6, (unsigned long long)g_job_count[10],
+          (double)g_job_ns[11] / 1e6, (unsigned long long)g_job_count[11]);
 }
 
 static float half_to_float(fp16_t h) {
@@ -704,6 +719,7 @@ static void parallel_init(uint32_t workers) {
 }
 
 static void run_job(uint32_t kind, uint32_t rows, uint32_t position) {
+  uint64_t profile_start = g_profile ? now_ns() : 0u;
   g_job.kind = kind;
   g_job.rows = rows;
   g_job.position = position;
@@ -719,6 +735,10 @@ static void run_job(uint32_t kind, uint32_t rows, uint32_t position) {
     while (__atomic_load_n(&g_job.slots[worker].done, __ATOMIC_ACQUIRE) !=
            epoch)
       ;
+  if (g_profile && kind < 12u) {
+    g_job_ns[kind] += now_ns() - profile_start;
+    ++g_job_count[kind];
+  }
 }
 
 /* ------------------------------------------------------------------ */
