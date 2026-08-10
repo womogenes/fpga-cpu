@@ -552,6 +552,7 @@ module lfm_matvec_accelerator_tb;
         integer row;
         integer group;
         integer j;
+        integer k;
         integer address;
         integer bit_index;
         integer bit_value;
@@ -559,6 +560,8 @@ module lfm_matvec_accelerator_tb;
         integer dot;
         longint signed expected;
         longint signed actual;
+        longint signed expected_best;
+        integer expected_token;
         logic [15:0] input_d;
         logic [15:0] weight_d;
         logic old_done;
@@ -574,6 +577,8 @@ module lfm_matvec_accelerator_tb;
                     memory[address + 2 + j] =
                         byte'(((input_block_index * 61 + j * 13) % 255) - 127);
             end
+            expected_best = 64'sh8000_0000_0000_0000;
+            expected_token = 0;
             for (row = 0; row < ne1; row = row + 1) begin
                 for (block = 0; block < ne0 / 128; block = block + 1) begin
                     address = WEIGHT_OFFSET + (row * (ne0 / 128) + block) * 18;
@@ -582,10 +587,26 @@ module lfm_matvec_accelerator_tb;
                         weight_d = weight_d | 16'h8000;
                     if (row == 0 && block == 0)
                         weight_d = 16'h0000;
+                    if (ne1 > 65536 && row + 1 == ne1)
+                        weight_d = 16'h3800;
                     write_u16(address, weight_d);
-                    for (j = 0; j < 16; j = j + 1)
-                        memory[address + 2 + j] =
-                            (row * 19 + block * 7 + j * 111) & 8'hff;
+                    for (j = 0; j < 16; j = j + 1) begin
+                        if (ne1 > 65536 && row + 1 == ne1) begin
+                            memory[address + 2 + j] = 0;
+                            for (k = 0; k < 8; k = k + 1) begin
+                                bit_index = j * 8 + k;
+                                input_block_index = block * 4 + bit_index / 32;
+                                input_value = $signed(memory[INPUT_OFFSET +
+                                    input_block_index * 34 + 2 + bit_index % 32]);
+                                if (input_value >= 0)
+                                    memory[address + 2 + j] =
+                                        memory[address + 2 + j] | (1 << k);
+                            end
+                        end else begin
+                            memory[address + 2 + j] =
+                                (row * 19 + block * 7 + j * 111) & 8'hff;
+                        end
+                    end
                 end
             end
 
@@ -626,9 +647,30 @@ module lfm_matvec_accelerator_tb;
                 if (actual !== expected)
                     $fatal(1, "Q1 stress %0dx%0d row %0d mismatch: got %0d expected %0d",
                            ne0, ne1, row, actual, expected);
+                if (expected > expected_best) begin
+                    expected_best = expected;
+                    expected_token = row;
+                end
             end
             $display("PASS: Q1_0 exact %0dx%0d stress output (%0d cycles, %0d weights)",
                      ne0, ne1, dut.cycle_count, ne0 * ne1);
+
+            old_done = status[28];
+            send_register(0, WEIGHT_OFFSET >> 3);
+            send_register(1, INPUT_OFFSET >> 3);
+            send_register(2, OUTPUT_OFFSET >> 3);
+            send_register(3, ne0[24:0]);
+            send_register(4, ne1[24:0]);
+            send_register(5, 4);
+            wait_done(old_done);
+            if (status[25:8] !== expected_token[17:0])
+                $fatal(1, "Q1 argmax %0dx%0d mismatch: got %0d expected %0d",
+                       ne0, ne1, status[25:8], expected_token);
+            if (dut.best_score !== expected_best)
+                $fatal(1, "Q1 argmax score mismatch: got %0d expected %0d",
+                       dut.best_score, expected_best);
+            $display("PASS: Q1_0 exact %0dx%0d hardware argmax token %0d",
+                     ne0, ne1, expected_token);
         end
     endtask
 
@@ -654,6 +696,7 @@ module lfm_matvec_accelerator_tb;
         run_q1_stress(1024, 37);
         run_q1_stress(128, 64);
         run_q1_stress(2048, 96);
+        run_q1_stress(128, 65538);
         run_q4_test();
         run_q6_test();
         $display("PASS: LFM and Bonsai accelerator regression complete");

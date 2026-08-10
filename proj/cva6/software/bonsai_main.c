@@ -3,7 +3,7 @@
  * All 197 Q1_0 matrices run on the FPGA matrix-vector accelerator through
  * the whole-matrix submit/read interface in bonsai_accelerator.c; the small
  * f32 norm vectors are read from the memory-mapped GGUF. The scalar side
- * follows the LFM2.5 decoder: a spin-free pthread worker pool covers
+ * follows the LFM2.5 decoder: a persistent pthread worker pool covers
  * attention heads, logit argmax, and accelerator result conversion, and a
  * TOKEN/EVAL line protocol serves an interactive chat client. */
 
@@ -53,18 +53,27 @@ void bonsai_accelerate_release(void);
 int bonsai_accelerate_f32_matvec_store(const void *weights, uint32_t columns,
                                        uint32_t rows, const float *input,
                                        uint32_t output_first);
+int bonsai_accelerate_f32_matvec_argmax(const void *weights,
+                                        uint32_t columns, uint32_t rows,
+                                        const float *input,
+                                        uint32_t *best_token);
 void bonsai_accelerate_read_stored_rows(float *output, uint32_t source_first,
                                         uint32_t count);
+const volatile int64_t *bonsai_accelerate_stored_output(void);
 void bonsai_accelerate_argmax_rows(uint32_t first, uint32_t count,
-                                   float *best_score, uint32_t *best_token);
+                                   int64_t *best_raw, uint32_t *best_token);
 #else
 int bonsai_accelerate_f32_matvec_submit(const void *weights, uint32_t columns,
                                         uint32_t rows, const float *input);
+int bonsai_accelerate_f32_matvec_argmax(const void *weights,
+                                        uint32_t columns, uint32_t rows,
+                                        const float *input,
+                                        uint32_t *best_token);
 void bonsai_accelerate_read_rows(float *output, uint32_t first,
                                  uint32_t count);
 void bonsai_accelerate_release(void);
 void bonsai_accelerate_argmax_rows(uint32_t first, uint32_t count,
-                                   float *best_score, uint32_t *best_token);
+                                   int64_t *best_raw, uint32_t *best_token);
 #endif
 
 typedef uint16_t fp16_t;
@@ -276,7 +285,11 @@ static float stub_reference_row(const uint8_t *base, uint32_t columns,
 static const void *stub_weights;
 static uint32_t stub_columns;
 static const float *stub_input;
-static float stub_stored[BONSAI_VOCAB];
+static int64_t stub_stored[BONSAI_VOCAB];
+
+static int64_t stub_float_to_q30(float value) {
+  return (int64_t)llroundf(value * 1073741824.0f);
+}
 
 int bonsai_accelerate_f32_matvec_submit(const void *weights, uint32_t columns,
                                         uint32_t rows, const float *input) {
@@ -300,30 +313,53 @@ int bonsai_accelerate_f32_matvec_store(const void *weights, uint32_t columns,
                                        uint32_t rows, const float *input,
                                        uint32_t output_first) {
   for (uint32_t row = 0; row < rows; ++row)
-    stub_stored[output_first + row] = stub_reference_row(
-        (const uint8_t *)weights, columns, input, row);
+    stub_stored[output_first + row] = stub_float_to_q30(stub_reference_row(
+        (const uint8_t *)weights, columns, input, row));
   return 1;
 }
 
 void bonsai_accelerate_read_stored_rows(float *output, uint32_t source_first,
                                         uint32_t count) {
-  memcpy(output, stub_stored + source_first, count * sizeof(*output));
+  for (uint32_t i = 0; i < count; ++i)
+    output[i] = (float)stub_stored[source_first + i] *
+                (1.0f / 1073741824.0f);
+}
+
+const volatile int64_t *bonsai_accelerate_stored_output(void) {
+  return stub_stored;
 }
 
 void bonsai_accelerate_argmax_rows(uint32_t first, uint32_t count,
-                                   float *best_score, uint32_t *best_token) {
-  float score = -3.402823466e38f;
+                                   int64_t *best_raw, uint32_t *best_token) {
+  int64_t score = INT64_MIN;
   uint32_t token = first;
   for (uint32_t row = first; row < first + count; ++row) {
-    float value = stub_reference_row((const uint8_t *)stub_weights,
-                                     stub_columns, stub_input, row);
+    int64_t value = stub_float_to_q30(stub_reference_row(
+        (const uint8_t *)stub_weights, stub_columns, stub_input, row));
     if (value > score) {
       score = value;
       token = row;
     }
   }
-  *best_score = score;
+  *best_raw = score;
   *best_token = token;
+}
+
+int bonsai_accelerate_f32_matvec_argmax(const void *weights,
+                                        uint32_t columns, uint32_t rows,
+                                        const float *input,
+                                        uint32_t *best_token) {
+  int64_t best_raw = INT64_MIN;
+  *best_token = 0u;
+  for (uint32_t row = 0; row < rows; ++row) {
+    int64_t value = stub_float_to_q30(stub_reference_row(
+        (const uint8_t *)weights, columns, input, row));
+    if (value > best_raw) {
+      best_raw = value;
+      *best_token = row;
+    }
+  }
+  return 1;
 }
 
 void quantize_row_q8_0_unused_host(void);
@@ -513,8 +549,8 @@ enum job_kind {
   JOB_READ_ROWS,
   JOB_READ_STORED_ROWS,
   JOB_QUANTIZE_Q8,
-  JOB_ATTN_PREP,
-  JOB_FFN_ACTIVATE,
+  JOB_ATTN_READ_PREP,
+  JOB_FFN_READ_ACTIVATE,
   JOB_VECTOR_ADD,
   JOB_NORM_SUM,
   JOB_NORM_APPLY,
@@ -524,7 +560,8 @@ struct worker_slot {
   volatile uint32_t done;
   float score;
   uint32_t token;
-  uint8_t padding[52];
+  int64_t raw;
+  uint8_t padding[44];
 } __attribute__((aligned(64)));
 
 struct parallel_job {
@@ -536,6 +573,7 @@ struct parallel_job {
   float *out;
   const float *input;
   const float *norm_weight;
+  const volatile int64_t *raw;
   float norm_scale;
   const float *quantize_input;
   volatile uint64_t *quantize_output;
@@ -556,6 +594,12 @@ static void attention_prep_head_range(uint32_t begin, uint32_t end,
                                       uint32_t position,
                                       const struct layer *layer);
 
+static inline float q30_to_float(int64_t value) {
+  int32_t high = (int32_t)(value >> 32);
+  uint32_t low = (uint32_t)value;
+  return (float)high * 4.0f + (float)low * (1.0f / 1073741824.0f);
+}
+
 static void execute_job(uint32_t worker) {
   uint32_t begin = (uint32_t)(((uint64_t)g_job.rows * worker) / g_worker_count);
   uint32_t end =
@@ -575,7 +619,7 @@ static void execute_job(uint32_t worker) {
     g_job.slots[worker].token = best;
   } else if (g_job.kind == JOB_ACCEL_ARGMAX) {
     bonsai_accelerate_argmax_rows(begin, end - begin,
-                                  &g_job.slots[worker].score,
+                                  &g_job.slots[worker].raw,
                                   &g_job.slots[worker].token);
   } else if (g_job.kind == JOB_READ_ROWS) {
     if (begin < end)
@@ -588,12 +632,27 @@ static void execute_job(uint32_t worker) {
     if (begin < end)
       quantize_q8_group_range(g_job.quantize_input, g_job.quantize_output,
                               begin, end);
-  } else if (g_job.kind == JOB_ATTN_PREP) {
+  } else if (g_job.kind == JOB_ATTN_READ_PREP) {
+    for (uint32_t h = begin; h < end; ++h) {
+      for (uint32_t i = 0; i < BONSAI_HEAD_DIM; ++i)
+        g_state.q[h * BONSAI_HEAD_DIM + i] =
+            q30_to_float(g_job.raw[h * BONSAI_HEAD_DIM + i]);
+      if (h < BONSAI_KV_HEADS) {
+        for (uint32_t i = 0; i < BONSAI_HEAD_DIM; ++i) {
+          uint32_t index = h * BONSAI_HEAD_DIM + i;
+          g_state.k[index] =
+              q30_to_float(g_job.raw[BONSAI_DIM + index]);
+          g_state.v[index] =
+              q30_to_float(g_job.raw[BONSAI_DIM + BONSAI_KV_DIM + index]);
+        }
+      }
+    }
     attention_prep_head_range(begin, end, g_job.position, g_job.layer);
-  } else if (g_job.kind == JOB_FFN_ACTIVATE) {
+  } else if (g_job.kind == JOB_FFN_READ_ACTIVATE) {
     for (uint32_t i = begin; i < end; ++i) {
-      float gate = g_job.input[i];
-      g_job.out[i] *= gate * rcp_f(1.0f + exp_f(-gate));
+      float up = q30_to_float(g_job.raw[i]);
+      float gate = q30_to_float(g_job.raw[BONSAI_FF_DIM + i]);
+      g_job.out[i] = up * (gate * rcp_f(1.0f + exp_f(-gate)));
     }
   } else if (g_job.kind == JOB_VECTOR_ADD) {
     for (uint32_t i = begin; i < end; ++i) g_job.out[i] += g_job.input[i];
@@ -840,10 +899,9 @@ static void attention(struct run_state *state, const struct layer *layer,
           layer->v.data, layer->v.ne0, layer->v.ne1, state->norm,
           BONSAI_DIM + BONSAI_KV_DIM))
     fail("accelerator declined batched QKV matvec");
-  g_job.out = state->q;
-  run_job(JOB_READ_STORED_ROWS, BONSAI_DIM + 2u * BONSAI_KV_DIM, 0u);
+  g_job.raw = bonsai_accelerate_stored_output();
   g_job.layer = layer;
-  run_job(JOB_ATTN_PREP, BONSAI_HEADS, position);
+  run_job(JOB_ATTN_READ_PREP, BONSAI_HEADS, position);
   g_attn_layer = layer;
   if (g_profile) {
     uint64_t th = now_ns();
@@ -864,10 +922,8 @@ static void feed_forward(struct run_state *state, const struct layer *layer) {
           state->norm, BONSAI_FF_DIM))
     fail("accelerator declined batched FFN matvec");
   g_job.out = state->ffn_up;
-  run_job(JOB_READ_STORED_ROWS, 2u * BONSAI_FF_DIM, 0u);
-  g_job.out = state->ffn_up;
-  g_job.input = state->ffn_gate;
-  run_job(JOB_FFN_ACTIVATE, BONSAI_FF_DIM, 0u);
+  g_job.raw = bonsai_accelerate_stored_output();
+  run_job(JOB_FFN_READ_ACTIVATE, BONSAI_FF_DIM, 0u);
   matvec_accel(state->op, &layer->ffn_down, state->ffn_up);
 }
 
@@ -949,8 +1005,14 @@ static uint32_t forward(struct model *model, struct run_state *state,
   }
   rms_norm_add(state->norm, state->x, state->op, &model->output_norm,
                BONSAI_DIM);
+  uint32_t best = 0u;
+  int hardware_argmax = 0;
   if (g_trace) {
     matvec_accel(g_logits, &model->embedding, state->norm);
+  } else if (bonsai_accelerate_f32_matvec_argmax(
+                 model->embedding.data, model->embedding.ne0,
+                 model->embedding.ne1, state->norm, &best)) {
+    hardware_argmax = 1;
   } else {
     if (!bonsai_accelerate_f32_matvec_submit(
             model->embedding.data, model->embedding.ne0,
@@ -977,12 +1039,21 @@ static uint32_t forward(struct model *model, struct run_state *state,
             (double)g_t_head / 1e9);
   }
   if (g_trace) run_job(JOB_ARGMAX, BONSAI_VOCAB, 0);
-  uint32_t best = 0;
-  float best_score = -3.402823466e38f;
-  for (uint32_t worker = 0; worker < g_worker_count; ++worker) {
-    if (g_job.slots[worker].score > best_score) {
-      best_score = g_job.slots[worker].score;
-      best = g_job.slots[worker].token;
+  if (!g_trace && !hardware_argmax) {
+    int64_t best_raw = INT64_MIN;
+    for (uint32_t worker = 0; worker < g_worker_count; ++worker) {
+      if (g_job.slots[worker].raw > best_raw) {
+        best_raw = g_job.slots[worker].raw;
+        best = g_job.slots[worker].token;
+      }
+    }
+  } else if (g_trace) {
+    float best_score = -3.402823466e38f;
+    for (uint32_t worker = 0; worker < g_worker_count; ++worker) {
+      if (g_job.slots[worker].score > best_score) {
+        best_score = g_job.slots[worker].score;
+        best = g_job.slots[worker].token;
+      }
     }
   }
   ++g_forward_count;

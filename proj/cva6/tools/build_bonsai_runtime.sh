@@ -10,7 +10,11 @@ target_dir="$1"
 llama_root="$2"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 build="${BASE_DIR:-$root/build}/bonsai-runtime"
-host="${HOST_DIR:-$root/sdk/buildroot/output/host}"
+host="${HOST_DIR:-$root/build/buildroot/host}"
+if [[ ! -x "$host/bin/riscv64-buildroot-linux-gnu-gcc" &&
+      -x "$root/sdk/buildroot/output/host/bin/riscv64-buildroot-linux-gnu-gcc" ]]; then
+    host="$root/sdk/buildroot/output/host"
+fi
 model="${BONSAI_MODEL_SOURCE:-$root/../../../Bonsai-1.7B.gguf}"
 manifest="$build/bonsai_model_manifest.h"
 accelerator_object="$build/bonsai_accelerator.o"
@@ -22,7 +26,7 @@ compiler_gcc="$root/tools/riscv64f-gcc"
 compiler_gxx="$root/tools/riscv64f-g++"
 target_march="${BONSAI_MARCH:-rv64imafc_zicsr_zifencei_zba_zbb_zbc_zbs_zicntr_zcb_zihpm}"
 target_mabi="${BONSAI_MABI:-lp64}"
-target_mtune="${BONSAI_MTUNE:-sifive-7-series}"
+target_mtune="${BONSAI_MTUNE:-generic-ooo}"
 
 if [[ ! -f "$llama_root/CMakeLists.txt" ]]; then
     echo "llama.cpp source is missing at $llama_root" >&2
@@ -41,12 +45,12 @@ mkdir -p "$build"
 PYTHONPATH="$llama_root/gguf-py" "$host_python" "$root/tools/build_bonsai_manifest.py" \
     "$model" "$manifest"
 "$target_gcc" \
-    -O3 -Wall -Wextra -Werror -std=gnu11 -fPIC -pthread \
+    -O3 -flto -Wall -Wextra -Werror -std=gnu11 -fPIC -pthread \
     "-march=$target_march" "-mabi=$target_mabi" "-mtune=$target_mtune" \
     -I"$build" -c "$root/software/bonsai_accelerator.c" \
     -o "$accelerator_object"
 "$target_gcc" \
-    -O3 -Wall -Wextra -Werror -Wno-unused-function -std=gnu11 -fPIC \
+    -O3 -flto -Wall -Wextra -Werror -Wno-unused-function -std=gnu11 -fPIC \
     "-march=$target_march" "-mabi=$target_mabi" "-mtune=$target_mtune" \
     -I"$llama_root/ggml/include" -I"$llama_root/ggml/src" \
     -I"$llama_root/ggml/src/ggml-cpu" \
@@ -94,7 +98,7 @@ install -m 0755 "$build/bin/llama-completion" "$target_dir/usr/bin/bonsai-runtim
 # Slim custom decoder: all Q1_0 matvecs through the whole-matrix accelerator
 # interface, everything else in tight scalar C with a small worker pool.
 "$target_gcc" \
-    -O3 -Wall -Wextra -std=gnu11 -pthread \
+    -O3 -flto -Wall -Wextra -std=gnu11 -pthread \
     "-march=$target_march" "-mabi=$target_mabi" "-mtune=$target_mtune" \
     -I"$build" "$root/software/bonsai_main.c" "$accelerator_object" \
     -lm -o "$build/bonsai-lite"

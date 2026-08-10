@@ -70,6 +70,7 @@ module lfm_matvec_accelerator #(
     logic [17:0] ne1;
     logic        q6_mode;
     logic        q1_mode;
+    logic        q1_argmax_mode;
 
     logic [15:0] input_scale [0:MAX_BLOCKS-1];
     // Eight replicated true-dual-port banks provide sixteen synchronous reads
@@ -129,7 +130,7 @@ module lfm_matvec_accelerator #(
     logic signed [63:0] scaled_term;
     logic signed [63:0] best_score;
     logic signed [63:0] q6_row_result;
-    logic [15:0] best_token;
+    logic [17:0] best_token;
     logic [4:0] q6_step;
 
     // Q1 stream-side capture of the pending block's scales and row bookkeeping.
@@ -491,7 +492,7 @@ module lfm_matvec_accelerator #(
         q1_pipe_busy = v_valid || r_valid || p_valid || s0_valid ||
                        s1_valid || s2_valid || s3_valid || s4_valid ||
                        s5_valid || s6_valid;
-        wfifo_push = s6_valid && s6_last;
+        wfifo_push = s6_valid && s6_last && !q1_argmax_mode;
         wfifo_pop = !wr_active && wfifo_count != 4'd0;
         wr_issue_done = wr_active &&
             (wr_aw_done || (axi.aw_valid && axi.aw_ready)) &&
@@ -625,11 +626,12 @@ module lfm_matvec_accelerator #(
         wide_read_b[3] <= wide_q3[wide_read_b_address[3]];
     end
 
-    // Q6 argmax reports its winning token; the other modes repurpose the
+    // Argmax modes report their winning token; the other modes repurpose the
     // field to expose the live FSM state for host-side diagnostics.
     assign status_o = {1'b1, bus_request_o, error_flag, done_toggle,
-                       4'b0,
-                       q6_mode ? best_token : {10'b0, state},
+                       2'b10,
+                       (q6_mode || q1_argmax_mode) ? best_token :
+                                                    {12'b0, state},
                        8'b0};
 
     assign axi.aw_id     = {ID_WIDTH{1'b1}};
@@ -736,6 +738,7 @@ module lfm_matvec_accelerator #(
             ne1                 <= '0;
             q6_mode             <= 1'b0;
             q1_mode             <= 1'b0;
+            q1_argmax_mode      <= 1'b0;
             input_byte_index    <= '0;
             input_block         <= '0;
             input_position      <= '0;
@@ -827,9 +830,11 @@ module lfm_matvec_accelerator #(
                     3'd5: begin
                         if (state != IDLE) begin
                             error_flag <= 1'b1;
-                        end else if (command_sync[1:0] != 2'd0) begin
-                            q6_mode       <= command_sync[1:0] == 2'd2;
-                            q1_mode       <= command_sync[1:0] == 2'd3;
+                        end else if (command_sync[2:0] != 3'd0) begin
+                            q6_mode       <= command_sync[2:0] == 3'd2;
+                            q1_mode       <= command_sync[2:0] == 3'd3 ||
+                                             command_sync[2:0] == 3'd4;
+                            q1_argmax_mode <= command_sync[2:0] == 3'd4;
                             error_flag    <= 1'b0;
                             best_score    <= 64'sh8000_0000_0000_0000;
                             best_token    <= '0;
@@ -946,11 +951,19 @@ module lfm_matvec_accelerator #(
 
             if (s6_valid) begin
                 if (s6_last) begin
-                    wfifo_addr[wfifo_wr] <= MODEL_BASE +
-                        {output_offset_words, 3'b000} +
-                        ({12'b0, s6_row} << 3);
-                    wfifo_data[wfifo_wr] <= q1_row_accum + s6_term;
-                    wfifo_wr <= wfifo_wr + 1'b1;
+                    if (q1_argmax_mode) begin
+                        if ($signed(q1_row_accum + s6_term) >
+                            $signed(best_score)) begin
+                            best_score <= q1_row_accum + s6_term;
+                            best_token <= s6_row;
+                        end
+                    end else begin
+                        wfifo_addr[wfifo_wr] <= MODEL_BASE +
+                            {output_offset_words, 3'b000} +
+                            ({12'b0, s6_row} << 3);
+                        wfifo_data[wfifo_wr] <= q1_row_accum + s6_term;
+                        wfifo_wr <= wfifo_wr + 1'b1;
+                    end
                     q1_row_accum <= '0;
                 end else begin
                     q1_row_accum <= q1_row_accum + s6_term;
@@ -1359,7 +1372,7 @@ module lfm_matvec_accelerator #(
                 Q6_COMPARE: begin
                     if ($signed(q6_row_result) > $signed(best_score)) begin
                         best_score <= q6_row_result;
-                        best_token <= row_index[15:0];
+                        best_token <= {2'b0, row_index[15:0]};
                     end
                     begin
                         if (row_index + 1 == ne1) begin

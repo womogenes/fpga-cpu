@@ -420,6 +420,7 @@ static uint64_t submit_columns;
 static uint64_t submit_rows;
 static uint64_t submit_done_ns;
 static uint32_t submit_output_first;
+static uint32_t submit_status;
 void bonsai_accelerate_release(void);
 
 /* Runs a whole-matrix matvec and leaves the raw Q30 results in the scratch
@@ -440,7 +441,7 @@ static void debug_step(const char *step) {
 
 static int bonsai_accelerate_f32_matvec_submit_at(
     const void *weights, uint32_t columns, uint32_t rows, const float *input,
-    uint32_t output_first) {
+    uint32_t output_first, uint32_t mode) {
   if (columns == 0u || columns > 6144u || (columns % 128u) != 0u)
     return 0;
   if ((uint64_t)BONSAI_OUTPUT_LOCAL +
@@ -455,7 +456,7 @@ static int bonsai_accelerate_f32_matvec_submit_at(
     return 0;
   }
 
-  uint32_t first_row;
+  uint32_t first_row = 0u;
   uintptr_t tensor_address;
   const struct bonsai_tensor_spec *tensor =
       find_pointer_tensor(weights, columns, &first_row, &tensor_address);
@@ -511,7 +512,7 @@ static int bonsai_accelerate_f32_matvec_submit_at(
   write_register(2u, (BONSAI_OUTPUT_OFFSET >> 3) + output_first);
   write_register(3u, tensor->ne0);
   write_register(4u, tensor->ne1);
-  write_register(5u, 3u);
+  write_register(5u, mode);
   if (debug_enabled > 0) {
     static int dumped;
     if (!dumped) {
@@ -567,6 +568,7 @@ static int bonsai_accelerate_f32_matvec_submit_at(
   submit_columns = columns;
   submit_rows = rows;
   submit_output_first = output_first;
+  submit_status = status;
   submit_done_ns = profile_enabled ? profile_now() : 0u;
   return 1;
 }
@@ -574,15 +576,32 @@ static int bonsai_accelerate_f32_matvec_submit_at(
 int bonsai_accelerate_f32_matvec_submit(const void *weights, uint32_t columns,
                                         uint32_t rows, const float *input) {
   return bonsai_accelerate_f32_matvec_submit_at(weights, columns, rows, input,
-                                                0u);
+                                                0u, 3u);
 }
 
 int bonsai_accelerate_f32_matvec_store(const void *weights, uint32_t columns,
                                        uint32_t rows, const float *input,
                                        uint32_t output_first) {
   if (!bonsai_accelerate_f32_matvec_submit_at(
-          weights, columns, rows, input, output_first))
+          weights, columns, rows, input, output_first, 3u))
     return 0;
+  bonsai_accelerate_release();
+  return 1;
+}
+
+int bonsai_accelerate_f32_matvec_argmax(const void *weights,
+                                        uint32_t columns, uint32_t rows,
+                                        const float *input,
+                                        uint32_t *best_token) {
+  lock_accelerator();
+  if (!accelerator_initialized) initialize_accelerator();
+  int supported = accelerator_available &&
+                  (accelerator_gpio[2] & UINT32_C(0x08000000)) != 0u;
+  unlock_accelerator();
+  if (!supported || !bonsai_accelerate_f32_matvec_submit_at(
+          weights, columns, rows, input, 0u, 4u))
+    return 0;
+  *best_token = (submit_status >> 8) & UINT32_C(0x0003ffff);
   bonsai_accelerate_release();
   return 1;
 }
@@ -613,21 +632,25 @@ void bonsai_accelerate_read_stored_rows(float *output, uint32_t source_first,
     output[row] = s64_q30_to_float(hardware_output[row]);
 }
 
+const volatile int64_t *bonsai_accelerate_stored_output(void) {
+  return (const volatile int64_t *)(accelerator_scratch + BONSAI_OUTPUT_LOCAL);
+}
+
 void bonsai_accelerate_argmax_rows(uint32_t first, uint32_t count,
-                                   float *best_score, uint32_t *best_token) {
+                                   int64_t *best_raw, uint32_t *best_token) {
   const volatile int64_t *hardware_output =
       (const volatile int64_t *)(accelerator_scratch + BONSAI_OUTPUT_LOCAL) +
       submit_output_first;
-  float score = -3.402823466e38f;
+  int64_t score = INT64_MIN;
   uint32_t token = first;
   for (uint32_t row = first; row < first + count; ++row) {
-    float value = s64_q30_to_float(hardware_output[row]);
+    int64_t value = hardware_output[row];
     if (value > score) {
       score = value;
       token = row;
     }
   }
-  *best_score = score;
+  *best_raw = score;
   *best_token = token;
 }
 
