@@ -33,7 +33,7 @@ module ariane_peripherals #(
     AXI_BUS.Slave      gpio            ,
     AXI_BUS.Slave      ethernet        ,
     AXI_BUS.Slave      timer           ,
-    output logic [1:0] irq_o           ,
+    output logic [ariane_soc::NumTargets-1:0] irq_o,
     // UART
     input  logic       rx_i            ,
     output logic       tx_o            ,
@@ -57,8 +57,8 @@ module ariane_peripherals #(
     output logic       spi_ss          ,
     // SD Card
     input  logic       sd_clk_i        ,
-    output logic [7:0] leds_o          ,
-    input  logic [7:0] dip_switches_i
+    output logic [31:0] leds_o         ,
+    input  logic [31:0] dip_switches_i
 );
 
     // ---------------

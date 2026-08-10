@@ -18,21 +18,24 @@ HAS_ETHERNET ?= 1
 else
 DRAM_SIZE_64 ?= 0x40000000 #1GB
 DRAM_SIZE_32 ?= 0x08000000 #128MB
-CLOCK_FREQUENCY ?= 50000000 #50MHz
-HALF_CLOCK_FREQUENCY ?= 25000000 #25MHz
+CLOCK_FREQUENCY ?= 100000000 #100MHz
+HALF_CLOCK_FREQUENCY ?= 50000000 #50MHz
 UART_BITRATE ?= 115200
 HAS_ETHERNET ?= 1
 endif
+
+UART_CLOCK_FREQUENCY ?= $(CLOCK_FREQUENCY)
+NUM_CORES ?= 4
 
 ifeq ($(CC),cc)
   CC = $(RISCV)/bin/${CROSSCOMPILE}gcc
   OBJCOPY = $(RISCV)/bin/$(CROSSCOMPILE)objcopy
 endif
 SED = sed
-PLATFORM_DEFINES = -DCLOCK_FREQUENCY=$(CLOCK_FREQUENCY) -DUART_BITRATE=$(UART_BITRATE) -D$(PLATFORM)  -DXLEN=$(XLEN)
+PLATFORM_DEFINES = -DCLOCK_FREQUENCY=$(CLOCK_FREQUENCY) -DUART_CLOCK_FREQUENCY=$(UART_CLOCK_FREQUENCY) -DUART_BITRATE=$(UART_BITRATE) -DNUM_CORES=$(NUM_CORES) -D$(PLATFORM)  -DXLEN=$(XLEN)
 
 ifeq ($(XLEN), 64)
-CFLAGS = $(PLATFORM_DEFINES) -Os -ggdb -march=rv64im_zicsr -mabi=lp64 -Wall -mcmodel=medany -mexplicit-relocs -ffreestanding
+CFLAGS = $(PLATFORM_DEFINES) -Os -ggdb -march=rv64im_zicsr_zifencei -mabi=lp64 -Wall -mcmodel=medany -mexplicit-relocs -ffreestanding
 else
 CFLAGS = $(PLATFORM_DEFINES) -O2 -ggdb  -march=rv32im_zicsr -mabi=ilp32 -W -Wall -mcmodel=medany -mexplicit-relocs -fno-builtin -ffreestanding
 endif
@@ -89,6 +92,7 @@ $(MAIN): $(DTB) $(OBJS_C) $(OBJS_S) linker.lds
 	$(SED) -e "s/DRAM_SIZE_64/$(DRAM_SIZE_64)/g" \
 	       -e "s/DRAM_SIZE_32/$(DRAM_SIZE_32)/g" \
 	       -e "s/HALF_CLOCK_FREQUENCY/$(HALF_CLOCK_FREQUENCY)/g" \
+	       -e "s/UART_CLOCK_FREQUENCY/$(UART_CLOCK_FREQUENCY)/g" \
 	       -e "s/CLOCK_FREQUENCY/$(CLOCK_FREQUENCY)/g" \
 	       -e "s/UART_BITRATE/$(UART_BITRATE)/g" \
 	       $(SED_DELETE_OPT) $< > $@

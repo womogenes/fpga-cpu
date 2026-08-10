@@ -200,7 +200,11 @@ module wt_axi_adapter
         unique case (dcache_data.rtype)
           //////////////////////////////////////
           wt_cache_pkg::DCACHE_LOAD_REQ: begin
-            axi_rd_req = 1'b1;
+            // Once a peer invalidation is pending, stop admitting new data
+            // reads so the outstanding-read FIFO can drain. Reads accepted
+            // before the writer's B response must complete before the stale
+            // line is invalidated; reads issued afterwards may safely resume.
+            axi_rd_req = ~inval_valid_i;
           end
           //////////////////////////////////////
           wt_cache_pkg::DCACHE_STORE_REQ: begin
@@ -608,24 +612,8 @@ module wt_axi_adapter
     b_pop              = 1'b0;
     dcache_sc_rtrn     = 1'b0;
 
-    // External invalidation requests (from coprocessor). This is safe as
-    // there are no other transactions when a coprocessor has pending stores.
     inval_ready_o      = 1'b0;
-    if (inval_valid_i) begin
-      inval_ready_o         = 1'b1;
-      dcache_rtrn_type_d    = wt_cache_pkg::DCACHE_INV_REQ;
-      dcache_rtrn_vld_d     = 1'b1;
-      dcache_rtrn_inv_d.all = 1'b1;
-      dcache_rtrn_inv_d.idx = inval_addr_i[CVA6Cfg.DCACHE_INDEX_WIDTH-1:0];
-      //////////////////////////////////////
-      // dcache needs some special treatment
-      // for arbitration and decoding of atomics
-      //////////////////////////////////////
-      // this is safe, there is no other read tx in flight than this atomic.
-      // note that this self invalidation is handled in this way due to the
-      // write-through cache architecture, which is aligned with the openpiton
-      // cache subsystem.
-    end else if (CVA6Cfg.RVA && invalidate) begin
+    if (CVA6Cfg.RVA && invalidate) begin
       dcache_rtrn_type_d = wt_cache_pkg::DCACHE_INV_REQ;
       dcache_rtrn_vld_d = 1'b1;
 
@@ -675,6 +663,17 @@ module wt_axi_adapter
         dcache_rtrn_vld_d  = 1'b1;
         dcache_wr_pop      = 1'b1;
       end
+    end else if (inval_valid_i && dcache_rd_empty) begin
+      // External invalidations share the single cache return port. Accept one
+      // only when all older reads have completed and older read/write responses
+      // have been delivered. Otherwise a pre-write miss response could refill
+      // stale data after the invalidation. The SMP fabric holds valid until
+      // ready is observed.
+      inval_ready_o         = 1'b1;
+      dcache_rtrn_type_d    = wt_cache_pkg::DCACHE_INV_REQ;
+      dcache_rtrn_vld_d     = 1'b1;
+      dcache_rtrn_inv_d.all = 1'b1;
+      dcache_rtrn_inv_d.idx = inval_addr_i[CVA6Cfg.DCACHE_INDEX_WIDTH-1:0];
     end
     //////////////////////////////////////
   end

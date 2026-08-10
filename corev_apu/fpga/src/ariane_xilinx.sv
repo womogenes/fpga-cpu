@@ -45,7 +45,7 @@ module ariane_xilinx (
   output wire [3:0]    eth_txd     ,
   inout  wire          eth_mdio    ,
   output logic         eth_mdc     ,
-  output logic [ 7:0]  led         ,
+  output logic [31:0]  led         ,
   input  logic [ 7:0]  sw          ,
   output logic         fan_pwm     ,
   input  logic         trst_n      ,
@@ -227,13 +227,15 @@ localparam type rvfi_probes_t = struct packed {
 // 24 MByte in 8 byte words
 localparam NumWords = (24 * 1024 * 1024) / 8;
   
-// WARNING: If NBSlave is modified, Xilinx's IPs under fpga/xilinx need to be updated with the new AXI id width and regenerated.
-// Otherwise reads and writes to DRAM may be returned to the wrong master and the crossbar will freeze. See issue #568.
-localparam NBSlave = 2; // debug, ariane
+localparam NumCores = ariane_soc::NumCores;
+localparam NBSlave = ariane_soc::NrSlaves; // hart 0, debug, then remaining harts
 localparam AxiAddrWidth = 64;
 localparam AxiDataWidth = 64;
-localparam AxiIdWidthMaster = 4;
-localparam AxiIdWidthSlaves = AxiIdWidthMaster + $clog2(NBSlave); // 5
+localparam AxiIdWidthMaster = CVA6Cfg.AxiIdWidth;
+localparam SmpSourceWidth = $clog2(NBSlave);
+// Two-bit local IDs plus three source bits preserve the existing five-bit
+// downstream interface used by the MIG and other generated Xilinx IP.
+localparam AxiIdWidthSlaves = AxiIdWidthMaster + $clog2(NBSlave);
 localparam AxiUserWidth = CVA6Cfg.AxiUserWidth;
 
 `AXI_TYPEDEF_ALL(axi_slave,
@@ -268,9 +270,18 @@ AXI_BUS #(
 logic test_en;
 logic ndmreset;
 logic ndmreset_n;
-logic debug_req_irq;
-logic timer_irq;
-logic ipi;
+logic [NumCores-1:0] debug_req_irq;
+logic [NumCores-1:0] timer_irq;
+logic [NumCores-1:0] ipi;
+logic [NumCores-1:0] smp_inval_valid;
+logic [NumCores-1:0] smp_inval_ready;
+logic [CVA6Cfg.PLEN-1:0] smp_inval_addr;
+logic [CVA6Cfg.PLEN-1:0] smp_write_addr_q;
+logic [SmpSourceWidth-1:0] smp_write_source_q;
+logic [NumCores-1:0] smp_inval_pending_q;
+logic [NumCores-1:0] smp_peer_mask;
+logic smp_inval_active_q;
+logic smp_inval_done;
 
 logic clk;
 logic eth_clk;
@@ -302,6 +313,19 @@ assign cpu_reset  = ~cpu_resetn;
 `endif
 
 logic pll_locked;
+logic [31:0] lfm_status_ddr;
+logic [23:0] lfm_status_meta;
+logic [23:0] lfm_status_sync;
+
+always_ff @(posedge clk or negedge ndmreset_n) begin
+  if (!ndmreset_n) begin
+    lfm_status_meta <= '0;
+    lfm_status_sync <= '0;
+  end else begin
+    lfm_status_meta <= lfm_status_ddr[31:8];
+    lfm_status_sync <= lfm_status_meta;
+  end
+end
 
 // ROM
 logic                    rom_req;
@@ -319,7 +343,7 @@ dm::dmi_resp_t debug_resp;
 logic dmactive;
 
 // IRQ
-logic [1:0] irq;
+logic [ariane_soc::NumTargets-1:0] irq;
 assign test_en    = 1'b0;
 
 logic [NBSlave-1:0] pc_asserted;
@@ -428,9 +452,9 @@ logic [CVA6Cfg.XLEN-1:0]    dm_master_r_rdata;
 
 // debug module
 dm_top #(
-    .NrHarts          ( 1                 ),
+    .NrHarts          ( NumCores          ),
     .BusWidth         ( CVA6Cfg.XLEN      ),
-    .SelectableHarts  ( 1'b1              )
+    .SelectableHarts  ( {NumCores{1'b1}}  )
 ) i_dm_top (
     .clk_i            ( clk               ),
     .rst_ni           ( rst_n             ), // PoR
@@ -439,7 +463,7 @@ dm_top #(
     .dmactive_o       ( dmactive          ), // active debug session
     .debug_req_o      ( debug_req_irq     ),
     .unavailable_i    ( '0                ),
-    .hartinfo_i       ( {ariane_pkg::DebugHartInfo} ),
+    .hartinfo_i       ( {NumCores{ariane_pkg::DebugHartInfo}} ),
     .slave_req_i      ( dm_slave_req      ),
     .slave_we_i       ( dm_slave_we       ),
     .slave_addr_i     ( dm_slave_addr     ),
@@ -769,35 +793,48 @@ end
 // ---------------
 // Core
 // ---------------
-ariane_axi::req_t    axi_ariane_req;
-ariane_axi::resp_t   axi_ariane_resp;
-rvfi_probes_t rvfi_probes;
+ariane_axi::req_t  [NumCores-1:0] axi_ariane_req;
+ariane_axi::resp_t [NumCores-1:0] axi_ariane_resp;
+rvfi_probes_t      [NumCores-1:0] rvfi_probes;
 
 rvfi_instr_t [CVA6Cfg.NrCommitPorts-1:0]  rvfi_instr;
 rvfi_to_iti_t rvfi_to_iti;
 iti_to_encoder_t iti_to_encoder;
 
-ariane #(
-    .CVA6Cfg ( CVA6Cfg ),
-    .rvfi_probes_instr_t ( rvfi_probes_instr_t ),
-    .rvfi_probes_csr_t ( rvfi_probes_csr_t ),
-    .rvfi_probes_t ( rvfi_probes_t )
-) i_ariane (
-    .clk_i        ( clk                 ),
-    .rst_ni       ( ndmreset_n          ),
-    .boot_addr_i  ( ariane_soc::ROMBase ), // start fetching from ROM
-    .hart_id_i    ( '0                  ),
-    .irq_i        ( irq                 ),
-    .ipi_i        ( ipi                 ),
-    .time_irq_i   ( timer_irq           ),
-    .rvfi_probes_o( rvfi_probes         ),
-    .debug_req_i  ( debug_req_irq       ),
-    .noc_req_o    ( axi_ariane_req      ),
-    .noc_resp_i   ( axi_ariane_resp     )
-);
+for (genvar core = 0; core < NumCores; core++) begin : gen_ariane
+  // Preserve slave port 1 for the debug system bus to minimize changes to
+  // the generated debug adapter; additional harts occupy ports 2 through 4.
+  localparam int unsigned CorePort = (core == 0) ? 0 : core + 1;
 
-`AXI_ASSIGN_FROM_REQ(slave[0], axi_ariane_req)
-`AXI_ASSIGN_TO_RESP(axi_ariane_resp, slave[0])
+  ariane #(
+      .CVA6Cfg ( CVA6Cfg ),
+      .rvfi_probes_instr_t ( rvfi_probes_instr_t ),
+      .rvfi_probes_csr_t ( rvfi_probes_csr_t ),
+      .rvfi_probes_t ( rvfi_probes_t )
+  ) i_ariane (
+      .clk_i        ( clk                         ),
+      .rst_ni       ( ndmreset_n                  ),
+      .boot_addr_i  ( ariane_soc::ROMBase         ),
+      .hart_id_i    ( CVA6Cfg.XLEN'(core)         ),
+      .irq_i        ( irq[2*core +: 2]            ),
+      .ipi_i        ( ipi[core]                   ),
+      .time_irq_i   ( timer_irq[core]             ),
+      .rvfi_probes_o( rvfi_probes[core]           ),
+      .debug_req_i  ( debug_req_irq[core]         ),
+      .smp_inval_valid_i ( smp_inval_valid[core]  ),
+      .smp_inval_addr_i  ( smp_inval_addr         ),
+      .smp_inval_ready_o ( smp_inval_ready[core]  ),
+      .noc_req_o    ( axi_ariane_req[core]        ),
+      .noc_resp_i   ( axi_ariane_resp[core]       )
+  );
+
+  `AXI_ASSIGN_FROM_REQ(slave[CorePort], axi_ariane_req[core])
+  `AXI_ASSIGN_TO_RESP(axi_ariane_resp[core], slave[CorePort])
+
+  // The writer's cache already updates its own line. Excluding it from the
+  // broadcast avoids turning ordinary private stores into self-evictions.
+  assign smp_inval_valid[core] = smp_inval_pending_q[core];
+end
 
   cva6_rvfi #(
       .CVA6Cfg   (CVA6Cfg),
@@ -810,7 +847,7 @@ ariane #(
   ) i_cva6_rvfi (
       .clk_i        (clk),
       .rst_ni       (ndmreset_n),
-      .rvfi_probes_i(rvfi_probes),
+      .rvfi_probes_i(rvfi_probes[0]),
       .rvfi_instr_o (rvfi_instr),
       .rvfi_to_iti_o   (rvfi_to_iti),
       .rvfi_csr_o   ()
@@ -949,7 +986,7 @@ clint #(
     .AXI_ADDR_WIDTH ( AxiAddrWidth     ),
     .AXI_DATA_WIDTH ( AxiDataWidth     ),
     .AXI_ID_WIDTH   ( AxiIdWidthSlaves ),
-    .NR_CORES       ( 1                ),
+    .NR_CORES       ( NumCores         ),
     .axi_req_t      ( axi_slave_req_t  ),
     .axi_resp_t     ( axi_slave_resp_t )
 ) i_clint (
@@ -1124,12 +1161,15 @@ ariane_peripherals #(
     .spi_mosi       ( spi_mosi                    ),
     .spi_miso       ( spi_miso                    ),
     .spi_ss         ( spi_ss                      ),
-    `ifdef KC705
+    `ifdef GENESYSII
+      .leds_o         ( led                       ),
+      .dip_switches_i ( {lfm_status_sync, sw}     )
+    `elsif KC705
       .leds_o         ( {led[3:0], unused_led[7:4]}),
-      .dip_switches_i ( {sw, unused_switches}     )
+      .dip_switches_i ( {24'b0, sw, unused_switches} )
     `else
       .leds_o         ( led                       ),
-      .dip_switches_i ( sw                        )
+      .dip_switches_i ( {24'b0, sw}               )
     `endif
 );
 
@@ -1185,7 +1225,49 @@ AXI_BUS #(
     .AXI_DATA_WIDTH ( AxiDataWidth     ),
     .AXI_ID_WIDTH   ( AxiIdWidthSlaves ),
     .AXI_USER_WIDTH ( AxiUserWidth     )
+) cpu_ddr_ui();
+
+AXI_BUS #(
+    .AXI_ADDR_WIDTH ( AxiAddrWidth     ),
+    .AXI_DATA_WIDTH ( AxiDataWidth     ),
+    .AXI_ID_WIDTH   ( AxiIdWidthSlaves ),
+    .AXI_USER_WIDTH ( AxiUserWidth     )
+) lfm_ddr_ui();
+
+// Full register slice between the accelerator and the exclusive arbiter.
+// It breaks every combinational path from the 200 MHz accelerator datapath
+// (reader ready/valid, write engine) into the MIG AXI shim, which otherwise
+// fails setup on the ui_clk domain.
+AXI_BUS #(
+    .AXI_ADDR_WIDTH ( AxiAddrWidth     ),
+    .AXI_DATA_WIDTH ( AxiDataWidth     ),
+    .AXI_ID_WIDTH   ( AxiIdWidthSlaves ),
+    .AXI_USER_WIDTH ( AxiUserWidth     )
+) lfm_ddr_cut();
+
+AXI_BUS #(
+    .AXI_ADDR_WIDTH ( AxiAddrWidth     ),
+    .AXI_DATA_WIDTH ( AxiDataWidth     ),
+    .AXI_ID_WIDTH   ( AxiIdWidthSlaves ),
+    .AXI_USER_WIDTH ( AxiUserWidth     )
+) mig_ddr_ui();
+
+logic lfm_bus_request;
+logic lfm_bus_grant;
+
+AXI_BUS #(
+    .AXI_ADDR_WIDTH ( AxiAddrWidth     ),
+    .AXI_DATA_WIDTH ( AxiDataWidth     ),
+    .AXI_ID_WIDTH   ( AxiIdWidthSlaves ),
+    .AXI_USER_WIDTH ( AxiUserWidth     )
 ) dram();
+
+AXI_BUS #(
+    .AXI_ADDR_WIDTH ( AxiAddrWidth     ),
+    .AXI_DATA_WIDTH ( AxiDataWidth     ),
+    .AXI_ID_WIDTH   ( AxiIdWidthSlaves ),
+    .AXI_USER_WIDTH ( AxiUserWidth     )
+) dram_cpu();
 
 axi_riscv_atomics_wrap #(
     .AXI_ADDR_WIDTH ( AxiAddrWidth     ),
@@ -1198,8 +1280,60 @@ axi_riscv_atomics_wrap #(
     .clk_i  ( clk                      ),
     .rst_ni ( ndmreset_n               ),
     .slv    ( master[ariane_soc::DRAM] ),
-    .mst    ( dram                     )
+    .mst    ( dram_cpu                 )
 );
+
+// The L1 data caches are private write-through structures. All stores reach
+// this single post-crossbar channel and this wrapper permits one outstanding
+// write. Hold the DDR response while each peer cache accepts an invalidation;
+// only then can the writer observe completion and issue another write.
+`AXI_ASSIGN_AW(dram, dram_cpu)
+`AXI_ASSIGN_W(dram, dram_cpu)
+`AXI_ASSIGN_AR(dram, dram_cpu)
+`AXI_ASSIGN_R(dram_cpu, dram)
+
+assign dram_cpu.b_id = dram.b_id;
+assign dram_cpu.b_resp = dram.b_resp;
+assign dram_cpu.b_user = dram.b_user;
+assign smp_inval_done = smp_inval_active_q &&
+    ((smp_inval_pending_q & ~smp_inval_ready) == '0);
+assign dram_cpu.b_valid = dram.b_valid && smp_inval_done;
+assign dram.b_ready = dram_cpu.b_ready && smp_inval_done;
+
+always_comb begin
+  for (int unsigned core = 0; core < NumCores; core++) begin
+    smp_peer_mask[core] = smp_write_source_q !=
+        SmpSourceWidth'((core == 0) ? 0 : core + 1);
+  end
+end
+
+always_ff @(posedge clk or negedge ndmreset_n) begin
+  if (!ndmreset_n) begin
+    smp_write_addr_q <= '0;
+    smp_write_source_q <= '0;
+    smp_inval_pending_q <= '0;
+    smp_inval_active_q <= 1'b0;
+  end else begin
+    if (dram_cpu.aw_valid && dram_cpu.aw_ready) begin
+      smp_write_addr_q <= dram_cpu.aw_addr[CVA6Cfg.PLEN-1:0];
+      smp_write_source_q <=
+          dram_cpu.aw_id[AxiIdWidthMaster +: SmpSourceWidth];
+    end
+
+    if (!smp_inval_active_q && dram.b_valid) begin
+      smp_inval_pending_q <= smp_peer_mask;
+      smp_inval_active_q <= 1'b1;
+    end else if (smp_inval_active_q) begin
+      smp_inval_pending_q <= smp_inval_pending_q & ~smp_inval_ready;
+      if (dram.b_valid && dram.b_ready) begin
+        smp_inval_pending_q <= '0;
+        smp_inval_active_q <= 1'b0;
+      end
+    end
+  end
+end
+
+assign smp_inval_addr = smp_write_addr_q;
 
 `ifdef PROTOCOL_CHECKER
 logic pc_status;
@@ -1345,6 +1479,90 @@ xlnx_axi_clock_converter i_xlnx_axi_clock_converter_ddr (
   .m_axi_rready   ( s_axi_rready     )
 );
 
+// Bridge the clock converter's discrete AXI ports into interfaces for an
+// exclusive accelerator/CPU mux at the native 200 MHz MIG UI.
+assign cpu_ddr_ui.aw_id     = s_axi_awid;
+assign cpu_ddr_ui.aw_addr   = s_axi_awaddr;
+assign cpu_ddr_ui.aw_len    = s_axi_awlen;
+assign cpu_ddr_ui.aw_size   = s_axi_awsize;
+assign cpu_ddr_ui.aw_burst  = s_axi_awburst;
+assign cpu_ddr_ui.aw_lock   = s_axi_awlock;
+assign cpu_ddr_ui.aw_cache  = s_axi_awcache;
+assign cpu_ddr_ui.aw_prot   = s_axi_awprot;
+assign cpu_ddr_ui.aw_region = s_axi_awregion;
+assign cpu_ddr_ui.aw_qos    = s_axi_awqos;
+assign cpu_ddr_ui.aw_atop   = '0;
+assign cpu_ddr_ui.aw_user   = '0;
+assign cpu_ddr_ui.aw_valid  = s_axi_awvalid;
+assign s_axi_awready        = cpu_ddr_ui.aw_ready;
+assign cpu_ddr_ui.w_data    = s_axi_wdata;
+assign cpu_ddr_ui.w_strb    = s_axi_wstrb;
+assign cpu_ddr_ui.w_last    = s_axi_wlast;
+assign cpu_ddr_ui.w_user    = '0;
+assign cpu_ddr_ui.w_valid   = s_axi_wvalid;
+assign s_axi_wready         = cpu_ddr_ui.w_ready;
+assign s_axi_bid            = cpu_ddr_ui.b_id;
+assign s_axi_bresp          = cpu_ddr_ui.b_resp;
+assign s_axi_bvalid         = cpu_ddr_ui.b_valid;
+assign cpu_ddr_ui.b_ready   = s_axi_bready;
+assign cpu_ddr_ui.ar_id     = s_axi_arid;
+assign cpu_ddr_ui.ar_addr   = s_axi_araddr;
+assign cpu_ddr_ui.ar_len    = s_axi_arlen;
+assign cpu_ddr_ui.ar_size   = s_axi_arsize;
+assign cpu_ddr_ui.ar_burst  = s_axi_arburst;
+assign cpu_ddr_ui.ar_lock   = s_axi_arlock;
+assign cpu_ddr_ui.ar_cache  = s_axi_arcache;
+assign cpu_ddr_ui.ar_prot   = s_axi_arprot;
+assign cpu_ddr_ui.ar_region = s_axi_arregion;
+assign cpu_ddr_ui.ar_qos    = s_axi_arqos;
+assign cpu_ddr_ui.ar_user   = '0;
+assign cpu_ddr_ui.ar_valid  = s_axi_arvalid;
+assign s_axi_arready        = cpu_ddr_ui.ar_ready;
+assign s_axi_rid            = cpu_ddr_ui.r_id;
+assign s_axi_rdata          = cpu_ddr_ui.r_data;
+assign s_axi_rresp          = cpu_ddr_ui.r_resp;
+assign s_axi_rlast          = cpu_ddr_ui.r_last;
+assign s_axi_rvalid         = cpu_ddr_ui.r_valid;
+assign cpu_ddr_ui.r_ready   = s_axi_rready;
+
+assign mig_ddr_ui.b_user = '0;
+assign mig_ddr_ui.r_user = '0;
+
+lfm_matvec_accelerator #(
+    .ID_WIDTH(AxiIdWidthSlaves)
+) i_lfm_matvec_accelerator (
+    .clk_i         ( ddr_clock_out ),
+    .rst_ni        ( ndmreset_n    ),
+    .command_i     ( led           ),
+    .status_o      ( lfm_status_ddr),
+    .bus_request_o ( lfm_bus_request ),
+    .bus_grant_i   ( lfm_bus_grant ),
+    .axi            ( lfm_ddr_ui    )
+);
+
+axi_cut_intf #(
+    .BYPASS     ( 1'b0             ),
+    .ADDR_WIDTH ( AxiAddrWidth     ),
+    .DATA_WIDTH ( AxiDataWidth     ),
+    .ID_WIDTH   ( AxiIdWidthSlaves ),
+    .USER_WIDTH ( AxiUserWidth     )
+) i_lfm_axi_cut (
+    .clk_i  ( ddr_clock_out ),
+    .rst_ni ( ndmreset_n    ),
+    .in     ( lfm_ddr_ui    ),
+    .out    ( lfm_ddr_cut   )
+);
+
+lfm_axi_arbiter i_lfm_axi_arbiter (
+    .clk_i                 ( ddr_clock_out  ),
+    .rst_ni                ( ndmreset_n     ),
+    .accelerator_request_i ( lfm_bus_request),
+    .accelerator_grant_o   ( lfm_bus_grant  ),
+    .cpu                    ( cpu_ddr_ui      ),
+    .accelerator            ( lfm_ddr_cut     ),
+    .ddr                    ( mig_ddr_ui      )
+);
+
 `ifdef NEXYS_VIDEO
 xlnx_clk_gen i_xlnx_clk_gen (
   .clk_out1 ( clk             ), // 25 MHz
@@ -1360,7 +1578,7 @@ xlnx_clk_gen i_xlnx_clk_gen (
 `else
 
 xlnx_clk_gen i_xlnx_clk_gen (
-  .clk_out1 ( clk           ), // 50 MHz
+  .clk_out1 ( clk           ), // 100 MHz
   .clk_out2 ( phy_tx_clk    ), // 125 MHz (for RGMII PHY)
   .clk_out3 ( eth_clk       ), // 125 MHz quadrature (90 deg phase shift)
   .clk_out4 ( sd_clk_sys    ), // 50 MHz clock
@@ -1408,43 +1626,43 @@ xlnx_mig_7_ddr3 i_ddr (
     .ui_clk          ( ddr_clock_out  ),
     .ui_clk_sync_rst ( ddr_sync_reset ),
     .aresetn         ( ndmreset_n     ),
-    .s_axi_awid,
-    .s_axi_awaddr    ( s_axi_awaddr[29:0] ),
-    .s_axi_awlen,
-    .s_axi_awsize,
-    .s_axi_awburst,
-    .s_axi_awlock,
-    .s_axi_awcache,
-    .s_axi_awprot,
-    .s_axi_awqos,
-    .s_axi_awvalid,
-    .s_axi_awready,
-    .s_axi_wdata,
-    .s_axi_wstrb,
-    .s_axi_wlast,
-    .s_axi_wvalid,
-    .s_axi_wready,
-    .s_axi_bready,
-    .s_axi_bid,
-    .s_axi_bresp,
-    .s_axi_bvalid,
-    .s_axi_arid,
-    .s_axi_araddr     ( s_axi_araddr[29:0] ),
-    .s_axi_arlen,
-    .s_axi_arsize,
-    .s_axi_arburst,
-    .s_axi_arlock,
-    .s_axi_arcache,
-    .s_axi_arprot,
-    .s_axi_arqos,
-    .s_axi_arvalid,
-    .s_axi_arready,
-    .s_axi_rready,
-    .s_axi_rid,
-    .s_axi_rdata,
-    .s_axi_rresp,
-    .s_axi_rlast,
-    .s_axi_rvalid,
+    .s_axi_awid       ( mig_ddr_ui.aw_id       ),
+    .s_axi_awaddr     ( mig_ddr_ui.aw_addr[29:0] ),
+    .s_axi_awlen      ( mig_ddr_ui.aw_len      ),
+    .s_axi_awsize     ( mig_ddr_ui.aw_size     ),
+    .s_axi_awburst    ( mig_ddr_ui.aw_burst    ),
+    .s_axi_awlock     ( mig_ddr_ui.aw_lock     ),
+    .s_axi_awcache    ( mig_ddr_ui.aw_cache    ),
+    .s_axi_awprot     ( mig_ddr_ui.aw_prot     ),
+    .s_axi_awqos      ( mig_ddr_ui.aw_qos      ),
+    .s_axi_awvalid    ( mig_ddr_ui.aw_valid    ),
+    .s_axi_awready    ( mig_ddr_ui.aw_ready    ),
+    .s_axi_wdata      ( mig_ddr_ui.w_data      ),
+    .s_axi_wstrb      ( mig_ddr_ui.w_strb      ),
+    .s_axi_wlast      ( mig_ddr_ui.w_last      ),
+    .s_axi_wvalid     ( mig_ddr_ui.w_valid     ),
+    .s_axi_wready     ( mig_ddr_ui.w_ready     ),
+    .s_axi_bready     ( mig_ddr_ui.b_ready     ),
+    .s_axi_bid        ( mig_ddr_ui.b_id        ),
+    .s_axi_bresp      ( mig_ddr_ui.b_resp      ),
+    .s_axi_bvalid     ( mig_ddr_ui.b_valid     ),
+    .s_axi_arid       ( mig_ddr_ui.ar_id       ),
+    .s_axi_araddr     ( mig_ddr_ui.ar_addr[29:0] ),
+    .s_axi_arlen      ( mig_ddr_ui.ar_len      ),
+    .s_axi_arsize     ( mig_ddr_ui.ar_size     ),
+    .s_axi_arburst    ( mig_ddr_ui.ar_burst    ),
+    .s_axi_arlock     ( mig_ddr_ui.ar_lock     ),
+    .s_axi_arcache    ( mig_ddr_ui.ar_cache    ),
+    .s_axi_arprot     ( mig_ddr_ui.ar_prot     ),
+    .s_axi_arqos      ( mig_ddr_ui.ar_qos      ),
+    .s_axi_arvalid    ( mig_ddr_ui.ar_valid    ),
+    .s_axi_arready    ( mig_ddr_ui.ar_ready    ),
+    .s_axi_rready     ( mig_ddr_ui.r_ready     ),
+    .s_axi_rid        ( mig_ddr_ui.r_id        ),
+    .s_axi_rdata      ( mig_ddr_ui.r_data      ),
+    .s_axi_rresp      ( mig_ddr_ui.r_resp      ),
+    .s_axi_rlast      ( mig_ddr_ui.r_last      ),
+    .s_axi_rvalid     ( mig_ddr_ui.r_valid     ),
     .init_calib_complete (            ), // keep open
     .device_temp         (            ), // keep open
     .sys_rst             ( cpu_resetn )

@@ -120,6 +120,9 @@ module ariane_gate_tb;
         .ipi_i                ( 1'b0  /*ipi*/       ),
         .time_irq_i           ( 1'b0  /*timer_irq*/ ),
         .debug_req_i          ( 1'b0                ),
+        .smp_inval_valid_i    ( 1'b0                ),
+        .smp_inval_addr_i     ( '0                  ),
+        .smp_inval_ready_o    (                     ),
         .rvfi_probes_o        ( rvfi_probes         ),
         .noc_req_o            ( axi_ariane_req      ),
         .noc_resp_i           ( axi_ariane_resp     )

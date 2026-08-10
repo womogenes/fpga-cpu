@@ -8,14 +8,18 @@
   .option norvc
   .globl _prog_start
 _prog_start:
-  smp_pause(s1, s2)
-  li sp, 0x84000000
+  // Every hart must reach the SMP-aware C boot path. The stock smp_pause
+  // macro parks secondary harts before main(), which is correct only for the
+  // original single-core FPGA system. Give each hart a private 4 KiB stack.
+  csrr s1, mhartid
+  slli s2, s1, 12
+  // Keep boot stacks outside the Linux image, model, stage-2 code, and FDT.
+  li sp, 0xbfd00000
+  sub sp, sp, s2
   call main
-  smp_resume(s1, s2)
-  csrr a0, mhartid
-  la a1, _dtb
-  li s1, DRAM_BASE
-  jr s1
+1:
+  wfi
+  j 1b
 
   .section .dtb
   .globl _dtb

@@ -707,6 +707,9 @@ ariane #(
     .time_irq_i   ( timer_irq           ),
     .rvfi_probes_o( /* open */          ),
     .debug_req_i  ( debug_req_irq       ),
+    .smp_inval_valid_i ( 1'b0           ),
+    .smp_inval_addr_i  ( '0             ),
+    .smp_inval_ready_o (                ),
     .noc_req_o    ( axi_ariane_req      ),
     .noc_resp_i   ( axi_ariane_resp     )
 );

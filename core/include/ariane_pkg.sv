@@ -43,14 +43,16 @@ package ariane_pkg;
   localparam logic [2:0] DEPTH_COMMIT = 'd4;
 
   // Transprecision float unit
-  localparam int unsigned LAT_COMP_FP32 = 'd2;
+  // One additional stage in the high-use floating-point paths is cheaper than
+  // overclocking a long result/bypass cone on the 100 MHz FPGA implementation.
+  localparam int unsigned LAT_COMP_FP32 = 'd3;
   localparam int unsigned LAT_COMP_FP64 = 'd3;
   localparam int unsigned LAT_COMP_FP16 = 'd1;
   localparam int unsigned LAT_COMP_FP16ALT = 'd1;
   localparam int unsigned LAT_COMP_FP8 = 'd1;
   localparam int unsigned LAT_DIVSQRT = 'd2;
-  localparam int unsigned LAT_NONCOMP = 'd1;
-  localparam int unsigned LAT_CONV = 'd2;
+  localparam int unsigned LAT_NONCOMP = 'd2;
+  localparam int unsigned LAT_CONV = 'd3;
 
   localparam logic [31:0] OPENHWGROUP_MVENDORID = 32'h0602;
   localparam logic [31:0] ARIANE_MARCHID = 32'd3;

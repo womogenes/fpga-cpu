@@ -84,6 +84,7 @@ add_files -fileset constrs_1 -norecurse constraints/$project.xdc
 
 synth_design -rtl -name rtl_1
 
+set_property strategy Flow_PerfOptimized_high [get_runs synth_1]
 set_property STEPS.SYNTH_DESIGN.ARGS.RETIMING true [get_runs synth_1]
 
 launch_runs synth_1
@@ -100,9 +101,12 @@ report_utilization -hierarchical                                        -file re
 report_cdc                                                              -file reports/$project.cdc.rpt
 report_clock_interaction                                                -file reports/$project.clock_interaction.rpt
 
-# set for RuntimeOptimized implementation
-set_property "steps.place_design.args.directive" "RuntimeOptimized" [get_runs impl_1]
-set_property "steps.route_design.args.directive" "RuntimeOptimized" [get_runs impl_1]
+# This design targets 100 MHz on the CVA6 clock and 200 MHz on the native DDR
+# interface, so favor timing closure and include post-route physical synthesis.
+set_property strategy Performance_ExplorePostRoutePhysOpt [get_runs impl_1]
+# Accelerator multicycle exceptions must be applied against the linked
+# netlist; XDC evaluation happens too early for their cell filters.
+set_property STEPS.OPT_DESIGN.TCL.PRE [file normalize $::env(CVA6_HDMI_ROOT)/scripts/lfm_multicycle_hook.tcl] [get_runs impl_1]
 
 launch_runs impl_1
 wait_on_run impl_1

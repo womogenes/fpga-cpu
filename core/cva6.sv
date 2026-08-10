@@ -334,6 +334,10 @@ module cva6
     input logic time_irq_i,
     // Debug (async) request - SUBSYSTEM
     input logic debug_req_i,
+    // External write-through-cache invalidation from the SMP fabric.
+    input logic smp_inval_valid_i,
+    input logic [CVA6Cfg.PLEN-1:0] smp_inval_addr_i,
+    output logic smp_inval_ready_o,
     // Probes to build RVFI, can be left open when not used - RVFI
     output rvfi_probes_t rvfi_probes_o,
     // CVXIF request - SUBSYSTEM
@@ -1707,13 +1711,17 @@ module cva6
     // MMU access is unused
     assign acc_mmu_req                = '0;
 
-    // No invalidation interface
-    assign inval_valid                = '0;
-    assign inval_addr                 = '0;
+    // Invalidate the matching index in every private write-through cache when
+    // any hart commits a DRAM write. The cache adapter invalidates all ways at
+    // the supplied index, so no tag lookup is needed in the broadcast fabric.
+    assign inval_valid                = smp_inval_valid_i;
+    assign inval_addr                 = smp_inval_addr_i;
 
     // Feed through cvxif
     assign cvxif_req_o                = cvxif_req;
   end : gen_no_accelerator
+
+  assign smp_inval_ready_o = inval_ready;
 
   // -------------------
   // Parameter Check

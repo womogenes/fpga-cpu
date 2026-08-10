@@ -326,6 +326,9 @@ module ariane_verilog_wrap
     .ipi_i       ( ipi        ),
     .time_irq_i  ( time_irq   ),
     .debug_req_i ( debug_req  ),
+    .smp_inval_valid_i ( 1'b0 ),
+    .smp_inval_addr_i  ( '0   ),
+    .smp_inval_ready_o (      ),
     .noc_req_o   ( l15_req    ),
     .noc_resp_i  ( l15_rtrn   )
   );

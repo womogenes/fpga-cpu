@@ -653,6 +653,9 @@ module ariane_testharness #(
 `else
     .debug_req_i          ( debug_req_core      ),
 `endif
+    .smp_inval_valid_i  ( 1'b0                ),
+    .smp_inval_addr_i   ( '0                  ),
+    .smp_inval_ready_o  (                     ),
     .noc_req_o            ( axi_ariane_req      ),
     .noc_resp_i           ( axi_ariane_resp     )
   );

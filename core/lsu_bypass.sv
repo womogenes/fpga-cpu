@@ -118,14 +118,12 @@ module lsu_bypass
     status_cnt_n    = status_cnt;
   end
 
-  // output assignment
-  always_comb begin : output_assignments
-    if (empty) begin
-      lsu_ctrl_o = lsu_req_i;
-    end else begin
-      lsu_ctrl_o = mem_q[read_pointer_q];
-    end
-  end
+  // Register every request before address generation. The original fall-through
+  // path put the 64-bit address adder, Sv39 translation, cache tag logic, and
+  // BRAM control in one FPGA cycle. Keep the original single-request ready
+  // contract: a new memory instruction is accepted only after the current one
+  // has been popped by the load or store unit.
+  assign lsu_ctrl_o = mem_q[read_pointer_q];
 
   // registers
   always_ff @(posedge clk_i or negedge rst_ni) begin

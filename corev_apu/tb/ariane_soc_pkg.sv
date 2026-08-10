@@ -11,13 +11,17 @@
 // Author: Florian Zaruba, ETH Zurich
 // Description: Contains SoC information as constants
 package ariane_soc;
+  // Four RV64IMAFC harts use the XC7K325T efficiently without carrying the
+  // much larger double-precision, crypto, trace, and per-core debug logic.
+  localparam int unsigned NumCores = 4;
   // M-Mode Hart, S-Mode Hart
-  localparam int unsigned NumTargets = 2;
+  localparam int unsigned NumTargets = 2 * NumCores;
   // Uart, SPI, Ethernet, reserved
   localparam int unsigned NumSources = 30;
   localparam int unsigned MaxPriority = 7;
 
-  localparam NrSlaves = 2; // actually masters, but slaves on the crossbar
+  // One AXI initiator per hart plus the debug system-bus initiator.
+  localparam NrSlaves = NumCores + 1; // actually masters, but slaves on the crossbar
 
   typedef enum int unsigned {
     DRAM     = 0,

@@ -29,7 +29,7 @@ $(bit): $(ips)
 	$(VIVADO) $(VIVADOFLAGS) -source scripts/run.tcl
 	cp ariane.runs/impl_1/ariane_xilinx* ./$(work-dir)
 
-$(ips): %.xci :
+$(ips): $(work-dir)/%.xci : $(ip-dir)/%/tcl/run.tcl
 	mkdir -p $(work-dir)
 	@echo Generating $(@F)
 	@cd $(ip-dir)/$(basename $(@F)) && make clean && make

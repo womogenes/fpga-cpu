@@ -60,6 +60,9 @@ module ariane import ariane_pkg::*; #(
   // Timer facilities
   input  logic                         time_irq_i,   // timer interrupt in (async)
   input  logic                         debug_req_i,  // debug request (async)
+  input  logic                         smp_inval_valid_i,
+  input  logic [CVA6Cfg.PLEN-1:0]      smp_inval_addr_i,
+  output logic                         smp_inval_ready_o,
   // RISC-V formal interface port (`rvfi`):
   // Can be left open when formal tracing is not needed.
   output rvfi_probes_t rvfi_probes_o,
@@ -103,6 +106,9 @@ module ariane import ariane_pkg::*; #(
     .ipi_i                ( ipi_i                     ),
     .time_irq_i           ( time_irq_i                ),
     .debug_req_i          ( debug_req_i               ),
+    .smp_inval_valid_i    ( smp_inval_valid_i         ),
+    .smp_inval_addr_i     ( smp_inval_addr_i          ),
+    .smp_inval_ready_o    ( smp_inval_ready_o         ),
     .rvfi_probes_o        ( rvfi_probes_o             ),
     .cvxif_req_o          ( cvxif_req                 ),
     .cvxif_resp_i         ( cvxif_resp                ),

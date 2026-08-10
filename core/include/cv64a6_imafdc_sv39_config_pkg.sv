@@ -13,13 +13,13 @@ package cva6_config_pkg;
   localparam CVA6ConfigXlen = 64;
 
   localparam CVA6ConfigRVF = 1;
-  localparam CVA6ConfigRVD = 1;
+  localparam CVA6ConfigRVD = 0;
   localparam CVA6ConfigF16En = 0;
   localparam CVA6ConfigF16AltEn = 0;
   localparam CVA6ConfigF8En = 0;
   localparam CVA6ConfigFVecEn = 0;
 
-  localparam CVA6ConfigCvxifEn = 1;
+  localparam CVA6ConfigCvxifEn = 0;
   localparam CVA6ConfigCExtEn = 1;
   localparam CVA6ConfigZcbExtEn = 1;
   localparam CVA6ConfigZcmpExtEn = 0;
@@ -29,7 +29,9 @@ package cva6_config_pkg;
   localparam CVA6ConfigVExtEn = 0;
   localparam CVA6ConfigRVZiCond = 1;
 
-  localparam CVA6ConfigAxiIdWidth = 4;
+  // Five initiators need three crossbar source bits. Two local ID bits keep
+  // the generated DDR and peripheral interfaces at their existing width.
+  localparam CVA6ConfigAxiIdWidth = 2;
   localparam CVA6ConfigAxiAddrWidth = 64;
   localparam CVA6ConfigAxiDataWidth = 64;
   localparam CVA6ConfigFetchUserEn = 0;
@@ -37,23 +39,31 @@ package cva6_config_pkg;
   localparam CVA6ConfigDataUserEn = 0;
   localparam CVA6ConfigDataUserWidth = CVA6ConfigXlen;
 
-  localparam CVA6ConfigIcacheByteSize = 16384;
-  localparam CVA6ConfigIcacheSetAssoc = 4;
+  // Match CVA6's FPGA-oriented cache geometry. The smaller structures reduce
+  // routing congestion on the single-cycle Sv39 load path at 100 MHz.
+  localparam CVA6ConfigIcacheByteSize = 8192;
+  localparam CVA6ConfigIcacheSetAssoc = 2;
   localparam CVA6ConfigIcacheLineWidth = 128;
-  localparam CVA6ConfigDcacheByteSize = 32768;
-  localparam CVA6ConfigDcacheSetAssoc = 8;
+  localparam CVA6ConfigDcacheByteSize = 8192;
+  localparam CVA6ConfigDcacheSetAssoc = 2;
   localparam CVA6ConfigDcacheLineWidth = 128;
 
+  // Accelerator scratch and output memory is mapped uncached, while SMP stores
+  // are broadcast to every private D$. A normal fence only needs to order the
+  // write-through path; flushing the whole cache on every matvec would discard
+  // hot model state hundreds of times per generated token.
   localparam CVA6ConfigDcacheFlushOnFence = 1'b0;
   localparam CVA6ConfigDcacheFlushOnFenceI = 1'b0;
-  localparam CVA6ConfigDcacheInvalidateOnFlush = 1'b0;
+  localparam CVA6ConfigDcacheInvalidateOnFlush = 1'b1;
 
   localparam CVA6ConfigDcacheIdWidth = 1;
   localparam CVA6ConfigMemTidWidth = 2;
 
-  localparam CVA6ConfigWtDcacheWbufDepth = 8;
+  // Two entries are the upstream FPGA default and keep forwarding control out
+  // of the load-path critical cone. Inference bulk math bypasses this cache.
+  localparam CVA6ConfigWtDcacheWbufDepth = 2;
 
-  localparam CVA6ConfigNrScoreboardEntries = 8;
+  localparam CVA6ConfigNrScoreboardEntries = 4;
 
   localparam CVA6ConfigNrLoadPipeRegs = 1;
   localparam CVA6ConfigNrStorePipeRegs = 0;
@@ -65,25 +75,28 @@ package cva6_config_pkg;
 
   localparam CVA6ConfigTvalEn = 1;
 
-  localparam CVA6ConfigNrPMPEntries = 8;
+  // This is a single-user development system. Removing the PMP comparator
+  // chain keeps the long load/store permission path within the 100 MHz target;
+  // Sv39 virtual-memory protection remains enabled for Linux.
+  localparam CVA6ConfigNrPMPEntries = 0;
 
-  localparam CVA6ConfigPerfCounterEn = 1;
+  localparam CVA6ConfigPerfCounterEn = 0;
 
   localparam config_pkg::cache_type_t CVA6ConfigDcacheType = config_pkg::WT;
 
   localparam CVA6ConfigMmuPresent = 1;
 
-  localparam CVA6ConfigRvfiTrace = 1;
+  localparam CVA6ConfigRvfiTrace = 0;
 
   localparam config_pkg::cva6_user_cfg_t cva6_cfg = '{
       XLEN: unsigned'(CVA6ConfigXlen),
       VLEN: unsigned'(64),
-      FpgaEn: bit'(0),  // for Xilinx and Altera
+      FpgaEn: bit'(1),  // use the FPGA-oriented distributed-RAM register files
       FpgaAlteraEn: bit'(0),  // for Altera (only)
       TechnoCut: bit'(0),
       SuperscalarEn: bit'(0),
       ALUBypass: bit'(0),
-      NrCommitPorts: unsigned'(2),
+      NrCommitPorts: unsigned'(1),
       AxiAddrWidth: unsigned'(CVA6ConfigAxiAddrWidth),
       AxiDataWidth: unsigned'(CVA6ConfigAxiDataWidth),
       AxiIdWidth: unsigned'(CVA6ConfigAxiIdWidth),
@@ -97,7 +110,7 @@ package cva6_config_pkg;
       XF8: bit'(CVA6ConfigF8En),
       RVA: bit'(CVA6ConfigAExtEn),
       RVB: bit'(CVA6ConfigBExtEn),
-      ZKN: bit'(1),
+      ZKN: bit'(0),
       RVV: bit'(CVA6ConfigVExtEn),
       RVC: bit'(CVA6ConfigCExtEn),
       RVH: bit'(CVA6ConfigHExtEn),
@@ -143,7 +156,7 @@ package cva6_config_pkg;
       CachedRegionAddrBase: 1024'({64'h8000_0000}),
       CachedRegionLength: 1024'({64'h40000000}),
       MaxOutstandingStores: unsigned'(7),
-      DebugEn: bit'(1),
+      DebugEn: bit'(0),
       Sdtrig: bit'(0),
       SdtrigMcontrol6: bit'(0),
       SdtrigMcontrol6ExecAddr: bit'(0),
@@ -154,7 +167,7 @@ package cva6_config_pkg;
       SdtrigIcount: bit'(0),
       SdtrigEtrigger: bit'(0),
       SdtrigItrigger: bit'(0),
-      SdtrigNrTriggers: int'(4),
+      SdtrigNrTriggers: int'(0),
       SdtrigTriggerChaining: bit'(0),
       SdtrigSupportedActions: {2{2'b01}},
       SdtrigSupportedMatch: {10{10'b00_0000_0001}},
