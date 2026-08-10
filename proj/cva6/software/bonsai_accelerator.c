@@ -58,6 +58,7 @@ static uint64_t cached_signature[3];
 static uintptr_t model_mapping_base;
 static int model_mapping_base_valid;
 static int whole_matrix_reported;
+static int hardware_argmax_reported;
 static int profile_enabled;
 static int model_slot_lock = -1;
 static uint64_t profile_calls;
@@ -601,6 +602,10 @@ int bonsai_accelerate_f32_matvec_argmax(const void *weights,
   if (!supported || !bonsai_accelerate_f32_matvec_submit_at(
           weights, columns, rows, input, 0u, 4u))
     return 0;
+  if (!hardware_argmax_reported) {
+    hardware_argmax_reported = 1;
+    fprintf(stderr, "Bonsai FPGA hardware argmax enabled\n");
+  }
   *best_token = (submit_status >> 8) & UINT32_C(0x0003ffff);
   bonsai_accelerate_release();
   return 1;

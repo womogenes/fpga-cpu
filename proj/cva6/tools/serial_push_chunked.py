@@ -48,11 +48,14 @@ def run(port: serial.Serial, command: str, char_delay: float,
     send_line(port, f"{command}; echo {marker}", char_delay)
     deadline = time.monotonic() + max(idle, 30.0)
     data = bytearray()
+    # The UART terminal echoes the command line, including the marker text.
+    # Only accept the marker when `echo` emits it as a complete output line.
+    marker_line = b"\r\n" + marker.encode() + b"\r\n"
     while time.monotonic() < deadline:
         chunk = port.read(4096)
         if chunk:
             data.extend(chunk)
-            if marker.encode() in bytes(data):
+            if marker_line in bytes(data):
                 break
     return bytes(data).decode(errors="replace")
 
