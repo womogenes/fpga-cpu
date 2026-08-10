@@ -1292,7 +1292,8 @@ int main(int argc, char **argv) {
   printf("\n");
   uint64_t decode_ns = now_ns() - decode_start;
   if (decoded > 0)
-    fprintf(stderr, "decode: %u tokens in %.2fs (%.3fs/token, %.3f tok/s)\n",
+    fprintf(stderr,
+            "decode: %u tokens in %.3fs (%.6fs/token, %.6f tok/s)\n",
             decoded, (double)decode_ns / 1e9,
             (double)decode_ns / 1e9 / (double)decoded,
             (double)decoded * 1e9 / (double)decode_ns);
