@@ -1,25 +1,115 @@
+diff --git a/core/cache_subsystem/wt_axi_adapter.sv b/core/cache_subsystem/wt_axi_adapter.sv
+index 784c193b2..f251870b8 100644
+--- a/core/cache_subsystem/wt_axi_adapter.sv
++++ b/core/cache_subsystem/wt_axi_adapter.sv
+@@ -200,7 +200,11 @@ module wt_axi_adapter
+         unique case (dcache_data.rtype)
+           //////////////////////////////////////
+           wt_cache_pkg::DCACHE_LOAD_REQ: begin
+-            axi_rd_req = 1'b1;
++            // Once a peer invalidation is pending, stop admitting new data
++            // reads so the outstanding-read FIFO can drain. Reads accepted
++            // before the writer's B response must complete before the stale
++            // line is invalidated; reads issued afterwards may safely resume.
++            axi_rd_req = ~inval_valid_i;
+           end
+           //////////////////////////////////////
+           wt_cache_pkg::DCACHE_STORE_REQ: begin
+@@ -608,24 +612,8 @@ module wt_axi_adapter
+     b_pop              = 1'b0;
+     dcache_sc_rtrn     = 1'b0;
+ 
+-    // External invalidation requests (from coprocessor). This is safe as
+-    // there are no other transactions when a coprocessor has pending stores.
+     inval_ready_o      = 1'b0;
+-    if (inval_valid_i) begin
+-      inval_ready_o         = 1'b1;
+-      dcache_rtrn_type_d    = wt_cache_pkg::DCACHE_INV_REQ;
+-      dcache_rtrn_vld_d     = 1'b1;
+-      dcache_rtrn_inv_d.all = 1'b1;
+-      dcache_rtrn_inv_d.idx = inval_addr_i[CVA6Cfg.DCACHE_INDEX_WIDTH-1:0];
+-      //////////////////////////////////////
+-      // dcache needs some special treatment
+-      // for arbitration and decoding of atomics
+-      //////////////////////////////////////
+-      // this is safe, there is no other read tx in flight than this atomic.
+-      // note that this self invalidation is handled in this way due to the
+-      // write-through cache architecture, which is aligned with the openpiton
+-      // cache subsystem.
+-    end else if (CVA6Cfg.RVA && invalidate) begin
++    if (CVA6Cfg.RVA && invalidate) begin
+       dcache_rtrn_type_d = wt_cache_pkg::DCACHE_INV_REQ;
+       dcache_rtrn_vld_d = 1'b1;
+ 
+@@ -675,6 +663,17 @@ module wt_axi_adapter
+         dcache_rtrn_vld_d  = 1'b1;
+         dcache_wr_pop      = 1'b1;
+       end
++    end else if (inval_valid_i && dcache_rd_empty) begin
++      // External invalidations share the single cache return port. Accept one
++      // only when all older reads have completed and older read/write responses
++      // have been delivered. Otherwise a pre-write miss response could refill
++      // stale data after the invalidation. The SMP fabric holds valid until
++      // ready is observed.
++      inval_ready_o         = 1'b1;
++      dcache_rtrn_type_d    = wt_cache_pkg::DCACHE_INV_REQ;
++      dcache_rtrn_vld_d     = 1'b1;
++      dcache_rtrn_inv_d.all = 1'b1;
++      dcache_rtrn_inv_d.idx = inval_addr_i[CVA6Cfg.DCACHE_INDEX_WIDTH-1:0];
+     end
+     //////////////////////////////////////
+   end
 diff --git a/core/csr_regfile.sv b/core/csr_regfile.sv
-index 8de2a188c..d73e71a25 100644
+index 8de2a188c..f3cabcb29 100644
 --- a/core/csr_regfile.sv
 +++ b/core/csr_regfile.sv
-@@ -2803,7 +2803,10 @@ module csr_regfile
+@@ -2803,6 +2803,9 @@ module csr_regfile
        mscratch_q       <= {CVA6Cfg.XLEN{1'b0}};
        if (CVA6Cfg.TvalEn) mtval_q <= {CVA6Cfg.XLEN{1'b0}};
        fiom_q          <= '0;
--      dcache_q        <= {{CVA6Cfg.XLEN - 1{1'b0}}, 1'b1};
-+      // The standalone FPGA SoC has no inter-hart cache-coherence fabric yet.
-+      // Start with private data caches disabled so SMP software observes a
-+      // single coherent DDR image; instruction caches remain enabled.
-+      dcache_q        <= '0;
++      // The FPGA SoC broadcasts every committed DRAM write as a line
++      // invalidation to all harts, making the private write-through caches
++      // coherent under SMP.
+       dcache_q        <= {{CVA6Cfg.XLEN - 1{1'b0}}, 1'b1};
        icache_q        <= {{CVA6Cfg.XLEN - 1{1'b0}}, 1'b1};
        mcountinhibit_q <= '0;
-       acc_cons_q      <= {{CVA6Cfg.XLEN - 1{1'b0}}, CVA6Cfg.EnableAccelerator};
-diff --git a/core/cvfpu b/core/cvfpu
---- a/core/cvfpu
-+++ b/core/cvfpu
-@@ -1 +1 @@
--Subproject commit 3eb6afeab2cb33f7d8689222955d0171aeb3a801
-+Subproject commit 3eb6afeab2cb33f7d8689222955d0171aeb3a801-dirty
+diff --git a/core/cva6.sv b/core/cva6.sv
+index c73eea42c..bdeb12ccc 100644
+--- a/core/cva6.sv
++++ b/core/cva6.sv
+@@ -334,6 +334,10 @@ module cva6
+     input logic time_irq_i,
+     // Debug (async) request - SUBSYSTEM
+     input logic debug_req_i,
++    // External write-through-cache invalidation from the SMP fabric.
++    input logic smp_inval_valid_i,
++    input logic [CVA6Cfg.PLEN-1:0] smp_inval_addr_i,
++    output logic smp_inval_ready_o,
+     // Probes to build RVFI, can be left open when not used - RVFI
+     output rvfi_probes_t rvfi_probes_o,
+     // CVXIF request - SUBSYSTEM
+@@ -1707,14 +1711,18 @@ module cva6
+     // MMU access is unused
+     assign acc_mmu_req                = '0;
+ 
+-    // No invalidation interface
+-    assign inval_valid                = '0;
+-    assign inval_addr                 = '0;
++    // Invalidate the matching index in every private write-through cache when
++    // any hart commits a DRAM write. The cache adapter invalidates all ways at
++    // the supplied index, so no tag lookup is needed in the broadcast fabric.
++    assign inval_valid                = smp_inval_valid_i;
++    assign inval_addr                 = smp_inval_addr_i;
+ 
+     // Feed through cvxif
+     assign cvxif_req_o                = cvxif_req;
+   end : gen_no_accelerator
+ 
++  assign smp_inval_ready_o = inval_ready;
++
+   // -------------------
+   // Parameter Check
+   // -------------------
 diff --git a/core/include/ariane_pkg.sv b/core/include/ariane_pkg.sv
 index 48736329e..af85e6367 100644
 --- a/core/include/ariane_pkg.sv
@@ -45,21 +135,37 @@ index 48736329e..af85e6367 100644
    localparam logic [31:0] OPENHWGROUP_MVENDORID = 32'h0602;
    localparam logic [31:0] ARIANE_MARCHID = 32'd3;
 diff --git a/core/include/cv64a6_imafdc_sv39_config_pkg.sv b/core/include/cv64a6_imafdc_sv39_config_pkg.sv
-index e45851138..c044894a2 100644
+index e45851138..01c91f7ce 100644
 --- a/core/include/cv64a6_imafdc_sv39_config_pkg.sv
 +++ b/core/include/cv64a6_imafdc_sv39_config_pkg.sv
+@@ -13,13 +13,13 @@ package cva6_config_pkg;
+   localparam CVA6ConfigXlen = 64;
+ 
+   localparam CVA6ConfigRVF = 1;
+-  localparam CVA6ConfigRVD = 1;
++  localparam CVA6ConfigRVD = 0;
+   localparam CVA6ConfigF16En = 0;
+   localparam CVA6ConfigF16AltEn = 0;
+   localparam CVA6ConfigF8En = 0;
+   localparam CVA6ConfigFVecEn = 0;
+ 
+-  localparam CVA6ConfigCvxifEn = 1;
++  localparam CVA6ConfigCvxifEn = 0;
+   localparam CVA6ConfigCExtEn = 1;
+   localparam CVA6ConfigZcbExtEn = 1;
+   localparam CVA6ConfigZcmpExtEn = 0;
 @@ -29,7 +29,9 @@ package cva6_config_pkg;
    localparam CVA6ConfigVExtEn = 0;
    localparam CVA6ConfigRVZiCond = 1;
  
 -  localparam CVA6ConfigAxiIdWidth = 4;
-+  // Keep the downstream AXI ID width at five bits when the SoC grows from two
-+  // initiators to four: three local ID bits plus two crossbar source bits.
-+  localparam CVA6ConfigAxiIdWidth = 3;
++  // Five initiators need three crossbar source bits. Two local ID bits keep
++  // the generated DDR and peripheral interfaces at their existing width.
++  localparam CVA6ConfigAxiIdWidth = 2;
    localparam CVA6ConfigAxiAddrWidth = 64;
    localparam CVA6ConfigAxiDataWidth = 64;
    localparam CVA6ConfigFetchUserEn = 0;
-@@ -37,23 +39,29 @@ package cva6_config_pkg;
+@@ -37,23 +39,31 @@ package cva6_config_pkg;
    localparam CVA6ConfigDataUserEn = 0;
    localparam CVA6ConfigDataUserWidth = CVA6ConfigXlen;
  
@@ -76,10 +182,11 @@ index e45851138..c044894a2 100644
 +  localparam CVA6ConfigDcacheSetAssoc = 2;
    localparam CVA6ConfigDcacheLineWidth = 128;
  
--  localparam CVA6ConfigDcacheFlushOnFence = 1'b0;
-+  // The LFM accelerator is a non-coherent DDR master. Make each software
-+  // fence drain the write-through buffer and invalidate cached DMA output.
-+  localparam CVA6ConfigDcacheFlushOnFence = 1'b1;
++  // Accelerator scratch and output memory is mapped uncached, while SMP stores
++  // are broadcast to every private D$. A normal fence only needs to order the
++  // write-through path; flushing the whole cache on every matvec would discard
++  // hot model state hundreds of times per generated token.
+   localparam CVA6ConfigDcacheFlushOnFence = 1'b0;
    localparam CVA6ConfigDcacheFlushOnFenceI = 1'b0;
 -  localparam CVA6ConfigDcacheInvalidateOnFlush = 1'b0;
 +  localparam CVA6ConfigDcacheInvalidateOnFlush = 1'b1;
@@ -97,7 +204,7 @@ index e45851138..c044894a2 100644
  
    localparam CVA6ConfigNrLoadPipeRegs = 1;
    localparam CVA6ConfigNrStorePipeRegs = 0;
-@@ -65,9 +73,12 @@ package cva6_config_pkg;
+@@ -65,25 +75,28 @@ package cva6_config_pkg;
  
    localparam CVA6ConfigTvalEn = 1;
  
@@ -112,7 +219,11 @@ index e45851138..c044894a2 100644
  
    localparam config_pkg::cache_type_t CVA6ConfigDcacheType = config_pkg::WT;
  
-@@ -78,12 +89,12 @@ package cva6_config_pkg;
+   localparam CVA6ConfigMmuPresent = 1;
+ 
+-  localparam CVA6ConfigRvfiTrace = 1;
++  localparam CVA6ConfigRvfiTrace = 0;
+ 
    localparam config_pkg::cva6_user_cfg_t cva6_cfg = '{
        XLEN: unsigned'(CVA6ConfigXlen),
        VLEN: unsigned'(64),
@@ -127,6 +238,33 @@ index e45851138..c044894a2 100644
        AxiAddrWidth: unsigned'(CVA6ConfigAxiAddrWidth),
        AxiDataWidth: unsigned'(CVA6ConfigAxiDataWidth),
        AxiIdWidth: unsigned'(CVA6ConfigAxiIdWidth),
+@@ -97,7 +110,7 @@ package cva6_config_pkg;
+       XF8: bit'(CVA6ConfigF8En),
+       RVA: bit'(CVA6ConfigAExtEn),
+       RVB: bit'(CVA6ConfigBExtEn),
+-      ZKN: bit'(1),
++      ZKN: bit'(0),
+       RVV: bit'(CVA6ConfigVExtEn),
+       RVC: bit'(CVA6ConfigCExtEn),
+       RVH: bit'(CVA6ConfigHExtEn),
+@@ -143,7 +156,7 @@ package cva6_config_pkg;
+       CachedRegionAddrBase: 1024'({64'h8000_0000}),
+       CachedRegionLength: 1024'({64'h40000000}),
+       MaxOutstandingStores: unsigned'(7),
+-      DebugEn: bit'(1),
++      DebugEn: bit'(0),
+       Sdtrig: bit'(0),
+       SdtrigMcontrol6: bit'(0),
+       SdtrigMcontrol6ExecAddr: bit'(0),
+@@ -154,7 +167,7 @@ package cva6_config_pkg;
+       SdtrigIcount: bit'(0),
+       SdtrigEtrigger: bit'(0),
+       SdtrigItrigger: bit'(0),
+-      SdtrigNrTriggers: int'(4),
++      SdtrigNrTriggers: int'(0),
+       SdtrigTriggerChaining: bit'(0),
+       SdtrigSupportedActions: {2{2'b01}},
+       SdtrigSupportedMatch: {10{10'b00_0000_0001}},
 diff --git a/core/lsu_bypass.sv b/core/lsu_bypass.sv
 index f184a4d26..2807f0779 100644
 --- a/core/lsu_bypass.sv
@@ -152,6 +290,20 @@ index f184a4d26..2807f0779 100644
  
    // registers
    always_ff @(posedge clk_i or negedge rst_ni) begin
+diff --git a/corev_apu/altera/src/cva6_altera.sv b/corev_apu/altera/src/cva6_altera.sv
+index 226a4cb76..b0f24408f 100644
+--- a/corev_apu/altera/src/cva6_altera.sv
++++ b/corev_apu/altera/src/cva6_altera.sv
+@@ -707,6 +707,9 @@ ariane #(
+     .time_irq_i   ( timer_irq           ),
+     .rvfi_probes_o( /* open */          ),
+     .debug_req_i  ( debug_req_irq       ),
++    .smp_inval_valid_i ( 1'b0           ),
++    .smp_inval_addr_i  ( '0             ),
++    .smp_inval_ready_o (                ),
+     .noc_req_o    ( axi_ariane_req      ),
+     .noc_resp_i   ( axi_ariane_resp     )
+ );
 diff --git a/corev_apu/fpga/Makefile b/corev_apu/fpga/Makefile
 index 370b981a9..a48a0e87e 100644
 --- a/corev_apu/fpga/Makefile
@@ -165,8 +317,19 @@ index 370b981a9..a48a0e87e 100644
  	mkdir -p $(work-dir)
  	@echo Generating $(@F)
  	@cd $(ip-dir)/$(basename $(@F)) && make clean && make
+diff --git a/corev_apu/fpga/constraints/ariane.xdc b/corev_apu/fpga/constraints/ariane.xdc
+index c2b6a1389..c51680509 100644
+--- a/corev_apu/fpga/constraints/ariane.xdc
++++ b/corev_apu/fpga/constraints/ariane.xdc
+@@ -41,4 +41,4 @@ set_property IOB TRUE [get_ports prog_txen]
+ 
+ set_property DONT_TOUCH true [get_cells i_cva6_rvfi]
+ set_property DONT_TOUCH true [get_cells i_iti]
+-set_property DONT_TOUCH true [get_cells i_encapsulator]
+\ No newline at end of file
++set_property DONT_TOUCH true [get_cells i_encapsulator]
 diff --git a/corev_apu/fpga/scripts/run.tcl b/corev_apu/fpga/scripts/run.tcl
-index 3d6db4f3c..d22e6dbcf 100644
+index 3d6db4f3c..fb78db6d4 100644
 --- a/corev_apu/fpga/scripts/run.tcl
 +++ b/corev_apu/fpga/scripts/run.tcl
 @@ -84,6 +84,7 @@ add_files -fileset constrs_1 -norecurse constraints/$project.xdc
@@ -177,7 +340,7 @@ index 3d6db4f3c..d22e6dbcf 100644
  set_property STEPS.SYNTH_DESIGN.ARGS.RETIMING true [get_runs synth_1]
  
  launch_runs synth_1
-@@ -100,9 +101,9 @@ report_utilization -hierarchical                                        -file re
+@@ -100,9 +101,12 @@ report_utilization -hierarchical                                        -file re
  report_cdc                                                              -file reports/$project.cdc.rpt
  report_clock_interaction                                                -file reports/$project.clock_interaction.rpt
  
@@ -187,15 +350,12 @@ index 3d6db4f3c..d22e6dbcf 100644
 +# This design targets 100 MHz on the CVA6 clock and 200 MHz on the native DDR
 +# interface, so favor timing closure and include post-route physical synthesis.
 +set_property strategy Performance_ExplorePostRoutePhysOpt [get_runs impl_1]
++# Accelerator multicycle exceptions must be applied against the linked
++# netlist; XDC evaluation happens too early for their cell filters.
++set_property STEPS.OPT_DESIGN.TCL.PRE [file normalize $::env(CVA6_HDMI_ROOT)/scripts/lfm_multicycle_hook.tcl] [get_runs impl_1]
  
  launch_runs impl_1
  wait_on_run impl_1
-diff --git a/corev_apu/fpga/src/apb_uart b/corev_apu/fpga/src/apb_uart
---- a/corev_apu/fpga/src/apb_uart
-+++ b/corev_apu/fpga/src/apb_uart
-@@ -1 +1 @@
--Subproject commit 6c7dde3d749ac8274377745c105da8c8b8cd27c6
-+Subproject commit 6c7dde3d749ac8274377745c105da8c8b8cd27c6-dirty
 diff --git a/corev_apu/fpga/src/ariane_peripherals_xilinx.sv b/corev_apu/fpga/src/ariane_peripherals_xilinx.sv
 index 164db20e4..c2092ca87 100644
 --- a/corev_apu/fpga/src/ariane_peripherals_xilinx.sv
@@ -221,7 +381,7 @@ index 164db20e4..c2092ca87 100644
  
      // ---------------
 diff --git a/corev_apu/fpga/src/ariane_xilinx.sv b/corev_apu/fpga/src/ariane_xilinx.sv
-index d1ec621e3..6020817ee 100644
+index d1ec621e3..697986d3a 100644
 --- a/corev_apu/fpga/src/ariane_xilinx.sv
 +++ b/corev_apu/fpga/src/ariane_xilinx.sv
 @@ -45,7 +45,7 @@ module ariane_xilinx (
@@ -233,7 +393,7 @@ index d1ec621e3..6020817ee 100644
    input  logic [ 7:0]  sw          ,
    output logic         fan_pwm     ,
    input  logic         trst_n      ,
-@@ -227,13 +227,14 @@ localparam type rvfi_probes_t = struct packed {
+@@ -227,13 +227,15 @@ localparam type rvfi_probes_t = struct packed {
  // 24 MByte in 8 byte words
  localparam NumWords = (24 * 1024 * 1024) / 8;
    
@@ -247,13 +407,14 @@ index d1ec621e3..6020817ee 100644
 -localparam AxiIdWidthMaster = 4;
 -localparam AxiIdWidthSlaves = AxiIdWidthMaster + $clog2(NBSlave); // 5
 +localparam AxiIdWidthMaster = CVA6Cfg.AxiIdWidth;
-+// Three-bit local IDs plus two source bits preserve the existing five-bit
++localparam SmpSourceWidth = $clog2(NBSlave);
++// Two-bit local IDs plus three source bits preserve the existing five-bit
 +// downstream interface used by the MIG and other generated Xilinx IP.
 +localparam AxiIdWidthSlaves = AxiIdWidthMaster + $clog2(NBSlave);
  localparam AxiUserWidth = CVA6Cfg.AxiUserWidth;
  
  `AXI_TYPEDEF_ALL(axi_slave,
-@@ -268,9 +269,9 @@ AXI_BUS #(
+@@ -268,9 +270,18 @@ AXI_BUS #(
  logic test_en;
  logic ndmreset;
  logic ndmreset_n;
@@ -263,10 +424,19 @@ index d1ec621e3..6020817ee 100644
 +logic [NumCores-1:0] debug_req_irq;
 +logic [NumCores-1:0] timer_irq;
 +logic [NumCores-1:0] ipi;
++logic [NumCores-1:0] smp_inval_valid;
++logic [NumCores-1:0] smp_inval_ready;
++logic [CVA6Cfg.PLEN-1:0] smp_inval_addr;
++logic [CVA6Cfg.PLEN-1:0] smp_write_addr_q;
++logic [SmpSourceWidth-1:0] smp_write_source_q;
++logic [NumCores-1:0] smp_inval_pending_q;
++logic [NumCores-1:0] smp_peer_mask;
++logic smp_inval_active_q;
++logic smp_inval_done;
  
  logic clk;
  logic eth_clk;
-@@ -302,6 +303,19 @@ assign cpu_reset  = ~cpu_resetn;
+@@ -302,6 +313,19 @@ assign cpu_reset  = ~cpu_resetn;
  `endif
  
  logic pll_locked;
@@ -286,7 +456,7 @@ index d1ec621e3..6020817ee 100644
  
  // ROM
  logic                    rom_req;
-@@ -319,7 +333,7 @@ dm::dmi_resp_t debug_resp;
+@@ -319,7 +343,7 @@ dm::dmi_resp_t debug_resp;
  logic dmactive;
  
  // IRQ
@@ -295,7 +465,7 @@ index d1ec621e3..6020817ee 100644
  assign test_en    = 1'b0;
  
  logic [NBSlave-1:0] pc_asserted;
-@@ -428,9 +442,9 @@ logic [CVA6Cfg.XLEN-1:0]    dm_master_r_rdata;
+@@ -428,9 +452,9 @@ logic [CVA6Cfg.XLEN-1:0]    dm_master_r_rdata;
  
  // debug module
  dm_top #(
@@ -307,7 +477,7 @@ index d1ec621e3..6020817ee 100644
  ) i_dm_top (
      .clk_i            ( clk               ),
      .rst_ni           ( rst_n             ), // PoR
-@@ -439,7 +453,7 @@ dm_top #(
+@@ -439,7 +463,7 @@ dm_top #(
      .dmactive_o       ( dmactive          ), // active debug session
      .debug_req_o      ( debug_req_irq     ),
      .unavailable_i    ( '0                ),
@@ -316,7 +486,7 @@ index d1ec621e3..6020817ee 100644
      .slave_req_i      ( dm_slave_req      ),
      .slave_we_i       ( dm_slave_we       ),
      .slave_addr_i     ( dm_slave_addr     ),
-@@ -769,35 +783,41 @@ end
+@@ -769,35 +793,48 @@ end
  // ---------------
  // Core
  // ---------------
@@ -351,7 +521,7 @@ index d1ec621e3..6020817ee 100644
 -);
 +for (genvar core = 0; core < NumCores; core++) begin : gen_ariane
 +  // Preserve slave port 1 for the debug system bus to minimize changes to
-+  // the generated debug adapter; additional harts occupy ports 2 and 3.
++  // the generated debug adapter; additional harts occupy ports 2 through 4.
 +  localparam int unsigned CorePort = (core == 0) ? 0 : core + 1;
 +
 +  ariane #(
@@ -369,19 +539,26 @@ index d1ec621e3..6020817ee 100644
 +      .time_irq_i   ( timer_irq[core]             ),
 +      .rvfi_probes_o( rvfi_probes[core]           ),
 +      .debug_req_i  ( debug_req_irq[core]         ),
++      .smp_inval_valid_i ( smp_inval_valid[core]  ),
++      .smp_inval_addr_i  ( smp_inval_addr         ),
++      .smp_inval_ready_o ( smp_inval_ready[core]  ),
 +      .noc_req_o    ( axi_ariane_req[core]        ),
 +      .noc_resp_i   ( axi_ariane_resp[core]       )
 +  );
++
++  `AXI_ASSIGN_FROM_REQ(slave[CorePort], axi_ariane_req[core])
++  `AXI_ASSIGN_TO_RESP(axi_ariane_resp[core], slave[CorePort])
  
 -`AXI_ASSIGN_FROM_REQ(slave[0], axi_ariane_req)
 -`AXI_ASSIGN_TO_RESP(axi_ariane_resp, slave[0])
-+  `AXI_ASSIGN_FROM_REQ(slave[CorePort], axi_ariane_req[core])
-+  `AXI_ASSIGN_TO_RESP(axi_ariane_resp[core], slave[CorePort])
++  // The writer's cache already updates its own line. Excluding it from the
++  // broadcast avoids turning ordinary private stores into self-evictions.
++  assign smp_inval_valid[core] = smp_inval_pending_q[core];
 +end
  
    cva6_rvfi #(
        .CVA6Cfg   (CVA6Cfg),
-@@ -810,7 +830,7 @@ ariane #(
+@@ -810,7 +847,7 @@ ariane #(
    ) i_cva6_rvfi (
        .clk_i        (clk),
        .rst_ni       (ndmreset_n),
@@ -390,7 +567,7 @@ index d1ec621e3..6020817ee 100644
        .rvfi_instr_o (rvfi_instr),
        .rvfi_to_iti_o   (rvfi_to_iti),
        .rvfi_csr_o   ()
-@@ -949,7 +969,7 @@ clint #(
+@@ -949,7 +986,7 @@ clint #(
      .AXI_ADDR_WIDTH ( AxiAddrWidth     ),
      .AXI_DATA_WIDTH ( AxiDataWidth     ),
      .AXI_ID_WIDTH   ( AxiIdWidthSlaves ),
@@ -399,7 +576,7 @@ index d1ec621e3..6020817ee 100644
      .axi_req_t      ( axi_slave_req_t  ),
      .axi_resp_t     ( axi_slave_resp_t )
  ) i_clint (
-@@ -1124,12 +1144,15 @@ ariane_peripherals #(
+@@ -1124,12 +1161,15 @@ ariane_peripherals #(
      .spi_mosi       ( spi_mosi                    ),
      .spi_miso       ( spi_miso                    ),
      .spi_ss         ( spi_ss                      ),
@@ -418,7 +595,7 @@ index d1ec621e3..6020817ee 100644
      `endif
  );
  
-@@ -1180,6 +1203,30 @@ logic                        s_axi_rlast;
+@@ -1180,6 +1220,41 @@ logic                        s_axi_rlast;
  logic                        s_axi_rvalid;
  logic                        s_axi_rready;
  
@@ -436,6 +613,17 @@ index d1ec621e3..6020817ee 100644
 +    .AXI_USER_WIDTH ( AxiUserWidth     )
 +) lfm_ddr_ui();
 +
++// Full register slice between the accelerator and the exclusive arbiter.
++// It breaks every combinational path from the 200 MHz accelerator datapath
++// (reader ready/valid, write engine) into the MIG AXI shim, which otherwise
++// fails setup on the ui_clk domain.
++AXI_BUS #(
++    .AXI_ADDR_WIDTH ( AxiAddrWidth     ),
++    .AXI_DATA_WIDTH ( AxiDataWidth     ),
++    .AXI_ID_WIDTH   ( AxiIdWidthSlaves ),
++    .AXI_USER_WIDTH ( AxiUserWidth     )
++) lfm_ddr_cut();
++
 +AXI_BUS #(
 +    .AXI_ADDR_WIDTH ( AxiAddrWidth     ),
 +    .AXI_DATA_WIDTH ( AxiDataWidth     ),
@@ -449,7 +637,84 @@ index d1ec621e3..6020817ee 100644
  AXI_BUS #(
      .AXI_ADDR_WIDTH ( AxiAddrWidth     ),
      .AXI_DATA_WIDTH ( AxiDataWidth     ),
-@@ -1345,6 +1392,77 @@ xlnx_axi_clock_converter i_xlnx_axi_clock_converter_ddr (
+@@ -1187,6 +1262,13 @@ AXI_BUS #(
+     .AXI_USER_WIDTH ( AxiUserWidth     )
+ ) dram();
+ 
++AXI_BUS #(
++    .AXI_ADDR_WIDTH ( AxiAddrWidth     ),
++    .AXI_DATA_WIDTH ( AxiDataWidth     ),
++    .AXI_ID_WIDTH   ( AxiIdWidthSlaves ),
++    .AXI_USER_WIDTH ( AxiUserWidth     )
++) dram_cpu();
++
+ axi_riscv_atomics_wrap #(
+     .AXI_ADDR_WIDTH ( AxiAddrWidth     ),
+     .AXI_DATA_WIDTH ( AxiDataWidth     ),
+@@ -1198,9 +1280,61 @@ axi_riscv_atomics_wrap #(
+     .clk_i  ( clk                      ),
+     .rst_ni ( ndmreset_n               ),
+     .slv    ( master[ariane_soc::DRAM] ),
+-    .mst    ( dram                     )
++    .mst    ( dram_cpu                 )
+ );
+ 
++// The L1 data caches are private write-through structures. All stores reach
++// this single post-crossbar channel and this wrapper permits one outstanding
++// write. Hold the DDR response while each peer cache accepts an invalidation;
++// only then can the writer observe completion and issue another write.
++`AXI_ASSIGN_AW(dram, dram_cpu)
++`AXI_ASSIGN_W(dram, dram_cpu)
++`AXI_ASSIGN_AR(dram, dram_cpu)
++`AXI_ASSIGN_R(dram_cpu, dram)
++
++assign dram_cpu.b_id = dram.b_id;
++assign dram_cpu.b_resp = dram.b_resp;
++assign dram_cpu.b_user = dram.b_user;
++assign smp_inval_done = smp_inval_active_q &&
++    ((smp_inval_pending_q & ~smp_inval_ready) == '0);
++assign dram_cpu.b_valid = dram.b_valid && smp_inval_done;
++assign dram.b_ready = dram_cpu.b_ready && smp_inval_done;
++
++always_comb begin
++  for (int unsigned core = 0; core < NumCores; core++) begin
++    smp_peer_mask[core] = smp_write_source_q !=
++        SmpSourceWidth'((core == 0) ? 0 : core + 1);
++  end
++end
++
++always_ff @(posedge clk or negedge ndmreset_n) begin
++  if (!ndmreset_n) begin
++    smp_write_addr_q <= '0;
++    smp_write_source_q <= '0;
++    smp_inval_pending_q <= '0;
++    smp_inval_active_q <= 1'b0;
++  end else begin
++    if (dram_cpu.aw_valid && dram_cpu.aw_ready) begin
++      smp_write_addr_q <= dram_cpu.aw_addr[CVA6Cfg.PLEN-1:0];
++      smp_write_source_q <=
++          dram_cpu.aw_id[AxiIdWidthMaster +: SmpSourceWidth];
++    end
++
++    if (!smp_inval_active_q && dram.b_valid) begin
++      smp_inval_pending_q <= smp_peer_mask;
++      smp_inval_active_q <= 1'b1;
++    end else if (smp_inval_active_q) begin
++      smp_inval_pending_q <= smp_inval_pending_q & ~smp_inval_ready;
++      if (dram.b_valid && dram.b_ready) begin
++        smp_inval_pending_q <= '0;
++        smp_inval_active_q <= 1'b0;
++      end
++    end
++  end
++end
++
++assign smp_inval_addr = smp_write_addr_q;
++
+ `ifdef PROTOCOL_CHECKER
+ logic pc_status;
+ 
+@@ -1345,6 +1479,90 @@ xlnx_axi_clock_converter i_xlnx_axi_clock_converter_ddr (
    .m_axi_rready   ( s_axi_rready     )
  );
  
@@ -514,20 +779,33 @@ index d1ec621e3..6020817ee 100644
 +    .axi            ( lfm_ddr_ui    )
 +);
 +
++axi_cut_intf #(
++    .BYPASS     ( 1'b0             ),
++    .ADDR_WIDTH ( AxiAddrWidth     ),
++    .DATA_WIDTH ( AxiDataWidth     ),
++    .ID_WIDTH   ( AxiIdWidthSlaves ),
++    .USER_WIDTH ( AxiUserWidth     )
++) i_lfm_axi_cut (
++    .clk_i  ( ddr_clock_out ),
++    .rst_ni ( ndmreset_n    ),
++    .in     ( lfm_ddr_ui    ),
++    .out    ( lfm_ddr_cut   )
++);
++
 +lfm_axi_arbiter i_lfm_axi_arbiter (
 +    .clk_i                 ( ddr_clock_out  ),
 +    .rst_ni                ( ndmreset_n     ),
 +    .accelerator_request_i ( lfm_bus_request),
 +    .accelerator_grant_o   ( lfm_bus_grant  ),
 +    .cpu                    ( cpu_ddr_ui      ),
-+    .accelerator            ( lfm_ddr_ui      ),
++    .accelerator            ( lfm_ddr_cut     ),
 +    .ddr                    ( mig_ddr_ui      )
 +);
 +
  `ifdef NEXYS_VIDEO
  xlnx_clk_gen i_xlnx_clk_gen (
    .clk_out1 ( clk             ), // 25 MHz
-@@ -1360,7 +1478,7 @@ xlnx_clk_gen i_xlnx_clk_gen (
+@@ -1360,7 +1578,7 @@ xlnx_clk_gen i_xlnx_clk_gen (
  `else
  
  xlnx_clk_gen i_xlnx_clk_gen (
@@ -536,7 +814,7 @@ index d1ec621e3..6020817ee 100644
    .clk_out2 ( phy_tx_clk    ), // 125 MHz (for RGMII PHY)
    .clk_out3 ( eth_clk       ), // 125 MHz quadrature (90 deg phase shift)
    .clk_out4 ( sd_clk_sys    ), // 50 MHz clock
-@@ -1408,43 +1526,43 @@ xlnx_mig_7_ddr3 i_ddr (
+@@ -1408,43 +1626,43 @@ xlnx_mig_7_ddr3 i_ddr (
      .ui_clk          ( ddr_clock_out  ),
      .ui_clk_sync_rst ( ddr_sync_reset ),
      .aresetn         ( ndmreset_n     ),
@@ -618,7 +896,7 @@ index d1ec621e3..6020817ee 100644
      .device_temp         (            ), // keep open
      .sys_rst             ( cpu_resetn )
 diff --git a/corev_apu/fpga/src/bootrom/Makefile b/corev_apu/fpga/src/bootrom/Makefile
-index e1fa839ae..d73229c94 100644
+index e1fa839ae..dc1a39d1d 100644
 --- a/corev_apu/fpga/src/bootrom/Makefile
 +++ b/corev_apu/fpga/src/bootrom/Makefile
 @@ -18,21 +18,24 @@ HAS_ETHERNET ?= 1
@@ -634,7 +912,7 @@ index e1fa839ae..d73229c94 100644
  endif
  
 +UART_CLOCK_FREQUENCY ?= $(CLOCK_FREQUENCY)
-+NUM_CORES ?= 3
++NUM_CORES ?= 4
 +
  ifeq ($(CC),cc)
    CC = $(RISCV)/bin/${CROSSCOMPILE}gcc
@@ -659,10 +937,19 @@ index e1fa839ae..d73229c94 100644
  	       -e "s/UART_BITRATE/$(UART_BITRATE)/g" \
  	       $(SED_DELETE_OPT) $< > $@
 diff --git a/corev_apu/fpga/src/bootrom/cv64a6.dts.in b/corev_apu/fpga/src/bootrom/cv64a6.dts.in
-index 6f0095ae2..ba748e6a0 100644
+index 6f0095ae2..7b483d730 100644
 --- a/corev_apu/fpga/src/bootrom/cv64a6.dts.in
 +++ b/corev_apu/fpga/src/bootrom/cv64a6.dts.in
-@@ -28,6 +28,36 @@
+@@ -18,7 +18,7 @@
+       reg = <0>;
+       status = "okay";
+       compatible = "eth, ariane", "riscv";
+-      riscv,isa = "rv64imafdc";
++      riscv,isa = "rv64imafc";
+       mmu-type = "riscv,sv39";
+       tlb-split;
+       // HLIC - hart local interrupt controller
+@@ -28,6 +28,51 @@
          compatible = "riscv,cpu-intc";
        };
      };
@@ -672,7 +959,7 @@ index 6f0095ae2..ba748e6a0 100644
 +      reg = <1>;
 +      status = "okay";
 +      compatible = "eth, ariane", "riscv";
-+      riscv,isa = "rv64imafdc";
++      riscv,isa = "rv64imafc";
 +      mmu-type = "riscv,sv39";
 +      tlb-split;
 +      CPU1_intc: interrupt-controller {
@@ -687,7 +974,7 @@ index 6f0095ae2..ba748e6a0 100644
 +      reg = <2>;
 +      status = "okay";
 +      compatible = "eth, ariane", "riscv";
-+      riscv,isa = "rv64imafdc";
++      riscv,isa = "rv64imafc";
 +      mmu-type = "riscv,sv39";
 +      tlb-split;
 +      CPU2_intc: interrupt-controller {
@@ -696,32 +983,49 @@ index 6f0095ae2..ba748e6a0 100644
 +        compatible = "riscv,cpu-intc";
 +      };
 +    };
++    CPU3: cpu@3 {
++      clock-frequency = <CLOCK_FREQUENCY>;
++      device_type = "cpu";
++      reg = <3>;
++      status = "okay";
++      compatible = "eth, ariane", "riscv";
++      riscv,isa = "rv64imafc";
++      mmu-type = "riscv,sv39";
++      tlb-split;
++      CPU3_intc: interrupt-controller {
++        #interrupt-cells = <1>;
++        interrupt-controller;
++        compatible = "riscv,cpu-intc";
++      };
++    };
    };
    memory@80000000 {
      device_type = "memory";
-@@ -48,7 +78,9 @@
+@@ -48,7 +93,10 @@
      ranges;
      clint@2000000 {
        compatible = "riscv,clint0";
 -      interrupts-extended = <&CPU0_intc 3 &CPU0_intc 7>;
 +      interrupts-extended = <&CPU0_intc 3 &CPU0_intc 7
 +                             &CPU1_intc 3 &CPU1_intc 7
-+                             &CPU2_intc 3 &CPU2_intc 7>;
++                             &CPU2_intc 3 &CPU2_intc 7
++                             &CPU3_intc 3 &CPU3_intc 7>;
        reg = <0x0 0x2000000 0x0 0xc0000>;
        reg-names = "control";
      };
-@@ -57,7 +89,9 @@
+@@ -57,7 +105,10 @@
        #interrupt-cells = <1>;
        compatible = "riscv,plic0";
        interrupt-controller;
 -      interrupts-extended = <&CPU0_intc 11 &CPU0_intc 9>;
 +      interrupts-extended = <&CPU0_intc 11 &CPU0_intc 9
 +                             &CPU1_intc 11 &CPU1_intc 9
-+                             &CPU2_intc 11 &CPU2_intc 9>;
++                             &CPU2_intc 11 &CPU2_intc 9
++                             &CPU3_intc 11 &CPU3_intc 9>;
        reg = <0x0 0xc000000 0x0 0x4000000>;
        riscv,max-priority = <7>;
        riscv,ndev = <30>;
-@@ -74,7 +108,7 @@
+@@ -74,7 +125,7 @@
      uart@10000000 {
        compatible = "ns16550a";
        reg = <0x0 0x10000000 0x0 0x1000>;
@@ -895,17 +1199,69 @@ index 2754a49ff..febd6825e 100644
                          CONFIG.CLKOUT2_REQUESTED_OUT_FREQ {125} \
                          CONFIG.CLKOUT3_REQUESTED_OUT_FREQ {125} \
                          CONFIG.CLKOUT3_REQUESTED_PHASE {90.000} \
+diff --git a/corev_apu/openpiton/ariane_verilog_wrap.sv b/corev_apu/openpiton/ariane_verilog_wrap.sv
+index 8e7cceb49..7dbb4dbfc 100644
+--- a/corev_apu/openpiton/ariane_verilog_wrap.sv
++++ b/corev_apu/openpiton/ariane_verilog_wrap.sv
+@@ -326,6 +326,9 @@ module ariane_verilog_wrap
+     .ipi_i       ( ipi        ),
+     .time_irq_i  ( time_irq   ),
+     .debug_req_i ( debug_req  ),
++    .smp_inval_valid_i ( 1'b0 ),
++    .smp_inval_addr_i  ( '0   ),
++    .smp_inval_ready_o (      ),
+     .noc_req_o   ( l15_req    ),
+     .noc_resp_i  ( l15_rtrn   )
+   );
+diff --git a/corev_apu/src/ariane.sv b/corev_apu/src/ariane.sv
+index 272b7f351..f2cf47094 100644
+--- a/corev_apu/src/ariane.sv
++++ b/corev_apu/src/ariane.sv
+@@ -60,6 +60,9 @@ module ariane import ariane_pkg::*; #(
+   // Timer facilities
+   input  logic                         time_irq_i,   // timer interrupt in (async)
+   input  logic                         debug_req_i,  // debug request (async)
++  input  logic                         smp_inval_valid_i,
++  input  logic [CVA6Cfg.PLEN-1:0]      smp_inval_addr_i,
++  output logic                         smp_inval_ready_o,
+   // RISC-V formal interface port (`rvfi`):
+   // Can be left open when formal tracing is not needed.
+   output rvfi_probes_t rvfi_probes_o,
+@@ -103,6 +106,9 @@ module ariane import ariane_pkg::*; #(
+     .ipi_i                ( ipi_i                     ),
+     .time_irq_i           ( time_irq_i                ),
+     .debug_req_i          ( debug_req_i               ),
++    .smp_inval_valid_i    ( smp_inval_valid_i         ),
++    .smp_inval_addr_i     ( smp_inval_addr_i          ),
++    .smp_inval_ready_o    ( smp_inval_ready_o         ),
+     .rvfi_probes_o        ( rvfi_probes_o             ),
+     .cvxif_req_o          ( cvxif_req                 ),
+     .cvxif_resp_i         ( cvxif_resp                ),
+diff --git a/corev_apu/tb/ariane_gate_tb.sv b/corev_apu/tb/ariane_gate_tb.sv
+index d07744329..029a0ce5a 100644
+--- a/corev_apu/tb/ariane_gate_tb.sv
++++ b/corev_apu/tb/ariane_gate_tb.sv
+@@ -120,6 +120,9 @@ module ariane_gate_tb;
+         .ipi_i                ( 1'b0  /*ipi*/       ),
+         .time_irq_i           ( 1'b0  /*timer_irq*/ ),
+         .debug_req_i          ( 1'b0                ),
++        .smp_inval_valid_i    ( 1'b0                ),
++        .smp_inval_addr_i     ( '0                  ),
++        .smp_inval_ready_o    (                     ),
+         .rvfi_probes_o        ( rvfi_probes         ),
+         .noc_req_o            ( axi_ariane_req      ),
+         .noc_resp_i           ( axi_ariane_resp     )
 diff --git a/corev_apu/tb/ariane_soc_pkg.sv b/corev_apu/tb/ariane_soc_pkg.sv
-index 778548531..aa7f78f75 100644
+index 778548531..ae66fc17b 100644
 --- a/corev_apu/tb/ariane_soc_pkg.sv
 +++ b/corev_apu/tb/ariane_soc_pkg.sv
 @@ -11,13 +11,17 @@
  // Author: Florian Zaruba, ETH Zurich
  // Description: Contains SoC information as constants
  package ariane_soc;
-+  // Three full CVA6 harts are the largest configuration expected to leave
-+  // practical placement and routing margin on the Genesys 2 XC7K325T.
-+  localparam int unsigned NumCores = 3;
++  // Four RV64IMAFC harts use the XC7K325T efficiently without carrying the
++  // much larger double-precision, crypto, trace, and per-core debug logic.
++  localparam int unsigned NumCores = 4;
    // M-Mode Hart, S-Mode Hart
 -  localparam int unsigned NumTargets = 2;
 +  localparam int unsigned NumTargets = 2 * NumCores;
@@ -919,3 +1275,31 @@ index 778548531..aa7f78f75 100644
  
    typedef enum int unsigned {
      DRAM     = 0,
+diff --git a/corev_apu/tb/ariane_testharness.sv b/corev_apu/tb/ariane_testharness.sv
+index 6e1d7a283..03ad892c9 100644
+--- a/corev_apu/tb/ariane_testharness.sv
++++ b/corev_apu/tb/ariane_testharness.sv
+@@ -653,6 +653,9 @@ module ariane_testharness #(
+ `else
+     .debug_req_i          ( debug_req_core      ),
+ `endif
++    .smp_inval_valid_i  ( 1'b0                ),
++    .smp_inval_addr_i   ( '0                  ),
++    .smp_inval_ready_o  (                     ),
+     .noc_req_o            ( axi_ariane_req      ),
+     .noc_resp_i           ( axi_ariane_resp     )
+   );
+diff --git a/verif/tb/uvmt/cva6_tb_wrapper.sv b/verif/tb/uvmt/cva6_tb_wrapper.sv
+index 09b3b8c03..a9ee90d17 100644
+--- a/verif/tb/uvmt/cva6_tb_wrapper.sv
++++ b/verif/tb/uvmt/cva6_tb_wrapper.sv
+@@ -114,6 +114,9 @@ module cva6_tb_wrapper import uvmt_cva6_pkg::*; #(
+     .ipi_i                ( 1'b0                         ),
+     .time_irq_i           ( irq_i[1]                     ),
+     .debug_req_i          ( debug_if.debug_req           ),
++    .smp_inval_valid_i    ( 1'b0                         ),
++    .smp_inval_addr_i     ( '0                           ),
++    .smp_inval_ready_o    (                              ),
+     .rvfi_probes_o        ( rvfi_probes                  ),
+     .cvxif_req_o          ( cvxif_req                    ),
+     .cvxif_resp_i         ( cvxif_resp                   ),

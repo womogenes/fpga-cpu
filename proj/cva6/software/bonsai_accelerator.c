@@ -71,6 +71,9 @@ static struct block_q8_0 quantized_input[6144u / 32u]
     __attribute__((aligned(64)));
 
 void quantize_row_q8_0(const float *input, void *output, int64_t count);
+void bonsai_quantize_q8_to_scratch(const float *input,
+                                   volatile uint64_t *output,
+                                   int64_t count) __attribute__((weak));
 
 void __real_ggml_vec_dot_q1_0_q8_0(int n, float *s, size_t bs,
                                    const void *vx, size_t bx,
@@ -122,17 +125,35 @@ static int stage_model(int memory) {
   const char *path = getenv("BONSAI_MODEL");
   if (path == NULL || path[0] == '\0')
     path = "/root/models/Bonsai-1.7B.gguf";
-  int source = open(path, O_RDONLY);
-  if (source < 0) return -1;
-  struct stat st;
-  if (fstat(source, &st) != 0 || !S_ISREG(st.st_mode) ||
-      (uint64_t)st.st_size != BONSAI_MODEL_FILE_SIZE) {
-    (void)close(source);
-    return -1;
+  const char *prestaged_env = getenv("BONSAI_MODEL_PRESTAGED");
+  int prestaged = prestaged_env != NULL && prestaged_env[0] != '\0' &&
+                  strcmp(prestaged_env, "0") != 0;
+  int source = -1;
+  struct stat st = {0};
+  if (!prestaged) {
+    source = open(path, O_RDONLY);
+    if (source < 0) {
+      perror("Bonsai model open");
+      return -1;
+    }
+    if (fstat(source, &st) != 0) {
+      perror("Bonsai model stat");
+      (void)close(source);
+      return -1;
+    }
+    if (!S_ISREG(st.st_mode) ||
+        (uint64_t)st.st_size != BONSAI_MODEL_FILE_SIZE) {
+      fprintf(stderr, "Bonsai model stat mismatch: size=%llu expected=%llu\n",
+              (unsigned long long)st.st_size,
+              (unsigned long long)BONSAI_MODEL_FILE_SIZE);
+      (void)close(source);
+      return -1;
+    }
   }
   int lock = open("/run/fpga-model.lock", O_RDWR | O_CREAT, 0600);
   if (lock < 0 || flock(lock, LOCK_EX) != 0) {
-    (void)close(source);
+    perror("Bonsai model lock");
+    if (source >= 0) (void)close(source);
     if (lock >= 0) (void)close(lock);
     return -1;
   }
@@ -140,7 +161,8 @@ static int stage_model(int memory) {
                        PROT_READ | PROT_WRITE, MAP_SHARED, memory,
                        (off_t)BONSAI_MODEL_PHYS);
   if (mapping == MAP_FAILED) {
-    (void)close(source);
+    perror("Bonsai model DDR mapping");
+    if (source >= 0) (void)close(source);
     (void)close(lock);
     return -1;
   }
@@ -156,9 +178,8 @@ static int stage_model(int memory) {
   int stamp = open("/run/fpga-model.stamp", O_RDONLY);
   ssize_t stamp_size = stamp >= 0 ? read(stamp, &actual, sizeof(actual)) : -1;
   if (stamp >= 0) (void)close(stamp);
-
-  if (stamp_size != (ssize_t)sizeof(actual) ||
-      !stamps_equal(&actual, &expected)) {
+  if (!prestaged && (stamp_size != (ssize_t)sizeof(actual) ||
+                     !stamps_equal(&actual, &expected))) {
     fprintf(stderr, "Staging Bonsai weights from SD:   0%%");
     size_t copied = 0;
     size_t next_report = 16u * 1024u * 1024u;
@@ -169,6 +190,7 @@ static int stage_model(int memory) {
       ssize_t received = read(source, (uint8_t *)mapping + copied, request);
       if (received < 0 && errno == EINTR) continue;
       if (received <= 0) {
+        perror("Bonsai model read");
         (void)munmap(mapping, (size_t)BONSAI_MODEL_FILE_SIZE);
         (void)close(source);
         (void)close(lock);
@@ -186,6 +208,7 @@ static int stage_model(int memory) {
                  O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (stamp < 0 || write(stamp, &expected, sizeof(expected)) !=
                        (ssize_t)sizeof(expected)) {
+      perror("Bonsai model stamp");
       (void)munmap(mapping, (size_t)BONSAI_MODEL_FILE_SIZE);
       (void)close(source);
       (void)close(lock);
@@ -195,15 +218,18 @@ static int stage_model(int memory) {
     fprintf(stderr, "\n");
   }
   const uint8_t *bytes = mapping;
-  int valid = bytes[0] == 'G' && bytes[1] == 'G' && bytes[2] == 'U' &&
-              bytes[3] == 'F';
+  uint8_t header[4] = {bytes[0], bytes[1], bytes[2], bytes[3]};
+  int valid = header[0] == 'G' && header[1] == 'G' && header[2] == 'U' &&
+              header[3] == 'F';
   (void)munmap(mapping, (size_t)BONSAI_MODEL_FILE_SIZE);
-  (void)close(source);
+  if (source >= 0) (void)close(source);
   if (valid) {
     /* Retain the exclusive lock until process exit so another model runtime
        cannot overwrite the shared accelerator-visible DDR slot mid-run. */
     model_slot_lock = lock;
   } else {
+    fprintf(stderr, "Bonsai staged model header mismatch: %02x %02x %02x %02x\n",
+            header[0], header[1], header[2], header[3]);
     (void)flock(lock, LOCK_UN);
     (void)close(lock);
   }
@@ -393,6 +419,8 @@ static int run_tensor(const struct bonsai_tensor_spec *tensor,
 static uint64_t submit_columns;
 static uint64_t submit_rows;
 static uint64_t submit_done_ns;
+static uint32_t submit_output_first;
+void bonsai_accelerate_release(void);
 
 /* Runs a whole-matrix matvec and leaves the raw Q30 results in the scratch
    region. On success returns 1 with the accelerator lock still held: the
@@ -410,9 +438,14 @@ static void debug_step(const char *step) {
   }
 }
 
-int bonsai_accelerate_f32_matvec_submit(const void *weights, uint32_t columns,
-                                        uint32_t rows, const float *input) {
+static int bonsai_accelerate_f32_matvec_submit_at(
+    const void *weights, uint32_t columns, uint32_t rows, const float *input,
+    uint32_t output_first) {
   if (columns == 0u || columns > 6144u || (columns % 128u) != 0u)
+    return 0;
+  if ((uint64_t)BONSAI_OUTPUT_LOCAL +
+          ((uint64_t)output_first + rows) * sizeof(int64_t) >
+      BONSAI_SCRATCH_BYTES)
     return 0;
   lock_accelerator();
   if (!accelerator_initialized) initialize_accelerator();
@@ -456,8 +489,13 @@ int bonsai_accelerate_f32_matvec_submit(const void *weights, uint32_t columns,
       packed_input_probe[0] != input[0] ||
       packed_input_probe[1] != input[columns / 2u] ||
       packed_input_probe[2] != input[columns - 1u]) {
-    quantize_row_q8_0(input, quantized_input, columns);
-    copy_q8_to_scratch(quantized_input, columns / 32u);
+    if (bonsai_quantize_q8_to_scratch != NULL) {
+      bonsai_quantize_q8_to_scratch(
+          input, (volatile uint64_t *)accelerator_scratch, columns);
+    } else {
+      quantize_row_q8_0(input, quantized_input, columns);
+      copy_q8_to_scratch(quantized_input, columns / 32u);
+    }
     accelerator_fence();
     packed_input_pointer = input;
     packed_input_columns = columns;
@@ -470,7 +508,7 @@ int bonsai_accelerate_f32_matvec_submit(const void *weights, uint32_t columns,
   uint32_t old_done = accelerator_gpio[2] & BONSAI_STATUS_DONE;
   write_register(0u, (uint32_t)(tensor->offset >> 3));
   write_register(1u, BONSAI_INPUT_OFFSET >> 3);
-  write_register(2u, BONSAI_OUTPUT_OFFSET >> 3);
+  write_register(2u, (BONSAI_OUTPUT_OFFSET >> 3) + output_first);
   write_register(3u, tensor->ne0);
   write_register(4u, tensor->ne1);
   write_register(5u, 3u);
@@ -528,26 +566,69 @@ int bonsai_accelerate_f32_matvec_submit(const void *weights, uint32_t columns,
   cached_tensor_address = tensor_address;
   submit_columns = columns;
   submit_rows = rows;
+  submit_output_first = output_first;
   submit_done_ns = profile_enabled ? profile_now() : 0u;
+  return 1;
+}
+
+int bonsai_accelerate_f32_matvec_submit(const void *weights, uint32_t columns,
+                                        uint32_t rows, const float *input) {
+  return bonsai_accelerate_f32_matvec_submit_at(weights, columns, rows, input,
+                                                0u);
+}
+
+int bonsai_accelerate_f32_matvec_store(const void *weights, uint32_t columns,
+                                       uint32_t rows, const float *input,
+                                       uint32_t output_first) {
+  if (!bonsai_accelerate_f32_matvec_submit_at(
+          weights, columns, rows, input, output_first))
+    return 0;
+  bonsai_accelerate_release();
   return 1;
 }
 
 /* This FPU's 64-bit integer converts (fcvt.s.l) are unreliable, so build
    the float from 32-bit halves, which convert correctly. */
-static inline float s64_to_float(int64_t value) {
+static inline float s64_q30_to_float(int64_t value) {
   int32_t high = (int32_t)(value >> 32);
   uint32_t low = (uint32_t)value;
-  return (float)high * 4294967296.0f +
-         (float)(int32_t)(low >> 1) * 2.0f + (float)(int32_t)(low & 1u);
+  return (float)high * 4.0f + (float)low * (1.0f / 1073741824.0f);
 }
 
 void bonsai_accelerate_read_rows(float *output, uint32_t first,
                                  uint32_t count) {
   const volatile int64_t *hardware_output =
-      (const volatile int64_t *)(accelerator_scratch + BONSAI_OUTPUT_LOCAL);
+      (const volatile int64_t *)(accelerator_scratch + BONSAI_OUTPUT_LOCAL) +
+      submit_output_first;
   for (uint32_t row = first; row < first + count; ++row)
-    output[row] = s64_to_float(hardware_output[row]) *
-                  (1.0f / 1073741824.0f);
+    output[row] = s64_q30_to_float(hardware_output[row]);
+}
+
+void bonsai_accelerate_read_stored_rows(float *output, uint32_t source_first,
+                                        uint32_t count) {
+  const volatile int64_t *hardware_output =
+      (const volatile int64_t *)(accelerator_scratch + BONSAI_OUTPUT_LOCAL) +
+      source_first;
+  for (uint32_t row = 0; row < count; ++row)
+    output[row] = s64_q30_to_float(hardware_output[row]);
+}
+
+void bonsai_accelerate_argmax_rows(uint32_t first, uint32_t count,
+                                   float *best_score, uint32_t *best_token) {
+  const volatile int64_t *hardware_output =
+      (const volatile int64_t *)(accelerator_scratch + BONSAI_OUTPUT_LOCAL) +
+      submit_output_first;
+  float score = -3.402823466e38f;
+  uint32_t token = first;
+  for (uint32_t row = first; row < first + count; ++row) {
+    float value = s64_q30_to_float(hardware_output[row]);
+    if (value > score) {
+      score = value;
+      token = row;
+    }
+  }
+  *best_score = score;
+  *best_token = token;
 }
 
 void bonsai_accelerate_release(void) {
@@ -620,6 +701,6 @@ void __wrap_ggml_vec_dot_q1_0_q8_0(int n, float *s, size_t bs,
   }
   const volatile int64_t *output =
       (const volatile int64_t *)(accelerator_scratch + BONSAI_OUTPUT_LOCAL);
-  *s = s64_to_float(output[row]) * (1.0f / 1073741824.0f);
+  *s = s64_q30_to_float(output[row]);
   unlock_accelerator();
 }

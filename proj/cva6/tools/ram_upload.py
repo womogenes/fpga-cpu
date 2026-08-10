@@ -198,6 +198,7 @@ def main() -> None:
     parser.add_argument("--resume-stage2", action="store_true", help="resume at the post-upload checksum gate")
     parser.add_argument("--no-console", action="store_true")
     parser.add_argument("--console-char-delay-us", type=float, default=None, help="delay pasted console input between bytes")
+    parser.add_argument("--stop-autoboot", action="store_true", help="send a key after stage-2 launch to stop U-Boot autoboot")
     args = parser.parse_args()
 
     import os
@@ -236,6 +237,12 @@ def main() -> None:
             upload_bootrom(port, loader, rate_kib * 1024, chunk_size, args.boot_wait)
             print(f"Uploading {len(image) / 1024 / 1024:.1f} MiB Linux and {len(model) / 1024 / 1024:.1f} MiB model with block acknowledgements...")
             upload_stage2(port, image, model)
+        if args.stop_autoboot:
+            # Let OpenSBI hand the UART to U-Boot, then inject the key directly
+            # through the already-open port before the countdown can expire.
+            time.sleep(1.5)
+            port.write(b" ")
+            port.flush()
         if args.no_console:
             return
         print("Entering console; press Ctrl-] to exit.")

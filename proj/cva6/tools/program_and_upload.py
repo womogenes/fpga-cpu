@@ -18,6 +18,8 @@ def main() -> None:
     parser.add_argument("--baud", type=int, default=3_000_000)
     parser.add_argument("--jtag-frequency", type=int, default=1_000_000)
     parser.add_argument("--boot-wait", type=float, default=180.0)
+    parser.add_argument("--stop-autoboot", action="store_true")
+    parser.add_argument("--no-console", action="store_true")
     args = parser.parse_args()
 
     uploader_command = [
@@ -34,6 +36,10 @@ def main() -> None:
     ]
     if args.model is not None:
         uploader_command.extend(("--model", str(args.model)))
+    if args.stop_autoboot:
+        uploader_command.append("--stop-autoboot")
+    if args.no_console:
+        uploader_command.append("--no-console")
     uploader_command.append(str(args.image))
 
     uploader = subprocess.Popen(uploader_command)

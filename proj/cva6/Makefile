@@ -1,4 +1,4 @@
-.PHONY: help init sim lint timing-accelerator gateware smp-smoke image ram-image stage2-loader upload-ram upload-ram-model upload-sd-model upload-model monitor deploy-remote remote-boot remote-boot-model remote-boot-sd-model deploy-model-remote remote-model status
+.PHONY: help init sim lint timing-accelerator gateware smp-smoke smp-cache-stress image ram-image stage2-loader upload-ram upload-ram-model upload-sd-model upload-model monitor deploy-remote remote-boot remote-boot-model remote-boot-sd-model deploy-model-remote remote-model status
 
 ROOT := $(abspath ../..)
 OUTPUT := $(CURDIR)/build/sdk
@@ -25,6 +25,7 @@ help:
 	@echo "make timing-accelerator Route only the LFM accelerator at its 200 MHz clock"
 	@echo "make gateware Build the CVA6 Genesys 2 HDMI bitstream"
 	@echo "make smp-smoke Build the four-hart bare-metal smoke test"
+	@echo "make smp-cache-stress Build the Linux D-cache coherence stress test"
 	@echo "make image    Build the 64-bit Linux userspace and SD-card image"
 	@echo "make ram-image Build Linux with the root filesystem embedded in DRAM firmware"
 	@echo "make stage2-loader Build the flow-controlled fast RAM loader"
@@ -70,6 +71,10 @@ smp-smoke:
 	mkdir -p build/diagnostics
 	$$(command -v riscv64-elf-gcc || command -v riscv64-unknown-elf-gcc) -march=rv64ima_zicsr -mabi=lp64 -mcmodel=medany -nostdlib -nostartfiles -T diagnostics/smp_smoke.ld -o build/diagnostics/smp_smoke.elf diagnostics/smp_smoke.S
 	$$(command -v riscv64-elf-objcopy || command -v riscv64-unknown-elf-objcopy) -O binary build/diagnostics/smp_smoke.elf build/diagnostics/smp_smoke.bin
+
+smp-cache-stress:
+	mkdir -p build/diagnostics
+	build/buildroot/host/bin/riscv64-buildroot-linux-gnu-gcc -O3 -Wall -Wextra -Werror -std=gnu11 -pthread -march=rv64imafc_zicsr_zifencei -mabi=lp64 diagnostics/smp_cache_stress.c -o build/diagnostics/smp_cache_stress
 
 monitor:
 	SERIAL=$(SERIAL) UART_BAUD=$(UART_BAUD) ./tools/monitor.sh

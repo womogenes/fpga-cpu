@@ -10,6 +10,7 @@
 #define _GNU_SOURCE
 
 #include <fcntl.h>
+#include <linux/futex.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -18,6 +19,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -48,12 +50,21 @@ int bonsai_accelerate_f32_matvec_submit(const void *weights, uint32_t columns,
 void bonsai_accelerate_read_rows(float *output, uint32_t first,
                                  uint32_t count);
 void bonsai_accelerate_release(void);
+int bonsai_accelerate_f32_matvec_store(const void *weights, uint32_t columns,
+                                       uint32_t rows, const float *input,
+                                       uint32_t output_first);
+void bonsai_accelerate_read_stored_rows(float *output, uint32_t source_first,
+                                        uint32_t count);
+void bonsai_accelerate_argmax_rows(uint32_t first, uint32_t count,
+                                   float *best_score, uint32_t *best_token);
 #else
 int bonsai_accelerate_f32_matvec_submit(const void *weights, uint32_t columns,
                                         uint32_t rows, const float *input);
 void bonsai_accelerate_read_rows(float *output, uint32_t first,
                                  uint32_t count);
 void bonsai_accelerate_release(void);
+void bonsai_accelerate_argmax_rows(uint32_t first, uint32_t count,
+                                   float *best_score, uint32_t *best_token);
 #endif
 
 typedef uint16_t fp16_t;
@@ -93,7 +104,6 @@ static inline float rsqrt_f(float x) {
   y = y * (1.5f - 0.5f * x * y * y);
   y = y * (1.5f - 0.5f * x * y * y);
   y = y * (1.5f - 0.5f * x * y * y);
-  y = y * (1.5f - 0.5f * x * y * y);
   return y;
 }
 
@@ -102,7 +112,6 @@ static inline float rcp_f(float x) {
   if (x == 0.0f) return 0.0f;
   v.u = 0x7ef311c2u - v.u;
   float y = v.f;
-  y = y * (2.0f - x * y);
   y = y * (2.0f - x * y);
   y = y * (2.0f - x * y);
   return y;
@@ -169,8 +178,8 @@ struct run_state {
   float att[BONSAI_DIM];
   float ffn_up[BONSAI_FF_DIM];
   float ffn_gate[BONSAI_FF_DIM];
-  fp16_t kv_k[BONSAI_LAYERS][BONSAI_MAX_CONTEXT][BONSAI_KV_DIM];
-  fp16_t kv_v[BONSAI_LAYERS][BONSAI_MAX_CONTEXT][BONSAI_KV_DIM];
+  float kv_k[BONSAI_LAYERS][BONSAI_MAX_CONTEXT][BONSAI_KV_DIM];
+  float kv_v[BONSAI_LAYERS][BONSAI_MAX_CONTEXT][BONSAI_KV_DIM];
 };
 
 static struct model g_model;
@@ -179,6 +188,10 @@ static float g_logits[BONSAI_VOCAB];
 static float g_rope_cos[BONSAI_MAX_CONTEXT][BONSAI_HEAD_DIM / 2];
 static float g_rope_sin[BONSAI_MAX_CONTEXT][BONSAI_HEAD_DIM / 2];
 static uint64_t g_t_attn, g_t_ffn, g_t_norm, g_t_head;
+static uint64_t g_forward_count;
+static int g_profile;
+static int g_trace;
+static uint32_t g_parallel_rows = 16384u;
 
 static void fail(const char *message) {
   fprintf(stderr, "bonsai-lite: %s\n", message);
@@ -189,6 +202,16 @@ static uint64_t now_ns(void) {
   struct timespec t;
   clock_gettime(CLOCK_MONOTONIC, &t);
   return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+
+static void report_main_profile(void) {
+  if (!g_profile || g_forward_count == 0u) return;
+  fprintf(stderr,
+          "Bonsai CPU profile: forwards=%llu attention=%.3fms "
+          "feed_forward=%.3fms norms=%.3fms heads=%.3fms\n",
+          (unsigned long long)g_forward_count, (double)g_t_attn / 1e6,
+          (double)g_t_ffn / 1e6, (double)g_t_norm / 1e6,
+          (double)g_t_head / 1e6);
 }
 
 static float half_to_float(fp16_t h) {
@@ -253,6 +276,7 @@ static float stub_reference_row(const uint8_t *base, uint32_t columns,
 static const void *stub_weights;
 static uint32_t stub_columns;
 static const float *stub_input;
+static float stub_stored[BONSAI_VOCAB];
 
 int bonsai_accelerate_f32_matvec_submit(const void *weights, uint32_t columns,
                                         uint32_t rows, const float *input) {
@@ -271,6 +295,36 @@ void bonsai_accelerate_read_rows(float *output, uint32_t first,
 }
 
 void bonsai_accelerate_release(void) {}
+
+int bonsai_accelerate_f32_matvec_store(const void *weights, uint32_t columns,
+                                       uint32_t rows, const float *input,
+                                       uint32_t output_first) {
+  for (uint32_t row = 0; row < rows; ++row)
+    stub_stored[output_first + row] = stub_reference_row(
+        (const uint8_t *)weights, columns, input, row);
+  return 1;
+}
+
+void bonsai_accelerate_read_stored_rows(float *output, uint32_t source_first,
+                                        uint32_t count) {
+  memcpy(output, stub_stored + source_first, count * sizeof(*output));
+}
+
+void bonsai_accelerate_argmax_rows(uint32_t first, uint32_t count,
+                                   float *best_score, uint32_t *best_token) {
+  float score = -3.402823466e38f;
+  uint32_t token = first;
+  for (uint32_t row = first; row < first + count; ++row) {
+    float value = stub_reference_row((const uint8_t *)stub_weights,
+                                     stub_columns, stub_input, row);
+    if (value > score) {
+      score = value;
+      token = row;
+    }
+  }
+  *best_score = score;
+  *best_token = token;
+}
 
 void quantize_row_q8_0_unused_host(void);
 #endif
@@ -436,18 +490,15 @@ static void rope_cache_init(void) {
   }
 }
 
-static void rope(float *x, uint32_t heads, uint32_t position) {
+static void rope_head(float *v, uint32_t position) {
   const float *cs = g_rope_cos[position];
   const float *sn = g_rope_sin[position];
   const uint32_t half = BONSAI_HEAD_DIM / 2u;
-  for (uint32_t h = 0; h < heads; ++h) {
-    float *v = x + h * BONSAI_HEAD_DIM;
-    for (uint32_t i = 0; i < half; ++i) {
-      float a = v[i];
-      float b = v[i + half];
-      v[i] = a * cs[i] - b * sn[i];
-      v[i + half] = a * sn[i] + b * cs[i];
-    }
+  for (uint32_t i = 0; i < half; ++i) {
+    float a = v[i];
+    float b = v[i + half];
+    v[i] = a * cs[i] - b * sn[i];
+    v[i + half] = a * sn[i] + b * cs[i];
   }
 }
 
@@ -458,7 +509,15 @@ enum job_kind {
   JOB_NONE = 0,
   JOB_ATTN_HEADS,
   JOB_ARGMAX,
+  JOB_ACCEL_ARGMAX,
   JOB_READ_ROWS,
+  JOB_READ_STORED_ROWS,
+  JOB_QUANTIZE_Q8,
+  JOB_ATTN_PREP,
+  JOB_FFN_ACTIVATE,
+  JOB_VECTOR_ADD,
+  JOB_NORM_SUM,
+  JOB_NORM_APPLY,
 };
 
 struct worker_slot {
@@ -475,15 +534,27 @@ struct parallel_job {
   uint32_t position;
   const struct layer *layer;
   float *out;
+  const float *input;
+  const float *norm_weight;
+  float norm_scale;
+  const float *quantize_input;
+  volatile uint64_t *quantize_output;
   struct worker_slot slots[BONSAI_MAX_WORKERS];
 };
 
 static struct parallel_job g_job __attribute__((aligned(64)));
 static uint32_t g_worker_count = 1;
+static int g_spin_workers = 1;
 static pthread_t g_threads[BONSAI_MAX_WORKERS - 1];
 
 static void attention_head_range(uint32_t begin, uint32_t end,
                                  uint32_t position);
+static void quantize_q8_group_range(const float *input,
+                                    volatile uint64_t *output,
+                                    uint32_t begin, uint32_t end);
+static void attention_prep_head_range(uint32_t begin, uint32_t end,
+                                      uint32_t position,
+                                      const struct layer *layer);
 
 static void execute_job(uint32_t worker) {
   uint32_t begin = (uint32_t)(((uint64_t)g_job.rows * worker) / g_worker_count);
@@ -502,9 +573,44 @@ static void execute_job(uint32_t worker) {
     }
     g_job.slots[worker].score = best_score;
     g_job.slots[worker].token = best;
+  } else if (g_job.kind == JOB_ACCEL_ARGMAX) {
+    bonsai_accelerate_argmax_rows(begin, end - begin,
+                                  &g_job.slots[worker].score,
+                                  &g_job.slots[worker].token);
   } else if (g_job.kind == JOB_READ_ROWS) {
     if (begin < end)
       bonsai_accelerate_read_rows(g_job.out, begin, end - begin);
+  } else if (g_job.kind == JOB_READ_STORED_ROWS) {
+    if (begin < end)
+      bonsai_accelerate_read_stored_rows(g_job.out + begin, begin,
+                                         end - begin);
+  } else if (g_job.kind == JOB_QUANTIZE_Q8) {
+    if (begin < end)
+      quantize_q8_group_range(g_job.quantize_input, g_job.quantize_output,
+                              begin, end);
+  } else if (g_job.kind == JOB_ATTN_PREP) {
+    attention_prep_head_range(begin, end, g_job.position, g_job.layer);
+  } else if (g_job.kind == JOB_FFN_ACTIVATE) {
+    for (uint32_t i = begin; i < end; ++i) {
+      float gate = g_job.input[i];
+      g_job.out[i] *= gate * rcp_f(1.0f + exp_f(-gate));
+    }
+  } else if (g_job.kind == JOB_VECTOR_ADD) {
+    for (uint32_t i = begin; i < end; ++i) g_job.out[i] += g_job.input[i];
+  } else if (g_job.kind == JOB_NORM_SUM) {
+    float sum = 0.0f;
+    for (uint32_t i = begin; i < end; ++i) {
+      float value = g_job.out[i];
+      if (g_job.input != NULL) {
+        value += g_job.input[i];
+        g_job.out[i] = value;
+      }
+      sum += value * value;
+    }
+    g_job.slots[worker].score = sum;
+  } else if (g_job.kind == JOB_NORM_APPLY) {
+    for (uint32_t i = begin; i < end; ++i)
+      g_job.out[i] = g_job.input[i] * g_job.norm_scale * g_job.norm_weight[i];
   }
 }
 
@@ -515,7 +621,11 @@ static void *worker_start(void *argument) {
     uint32_t epoch;
     do {
       epoch = __atomic_load_n(&g_job.epoch, __ATOMIC_ACQUIRE);
-      if (epoch == seen) (void)sched_yield();
+      if (epoch == seen && !g_spin_workers)
+        (void)syscall(SYS_futex, &g_job.epoch, FUTEX_WAIT_PRIVATE, seen,
+                      NULL, NULL, 0);
+      else if (epoch == seen)
+        __asm__ volatile("nop");
     } while (epoch == seen);
     execute_job(worker);
     __atomic_store_n(&g_job.slots[worker].done, epoch, __ATOMIC_RELEASE);
@@ -541,6 +651,9 @@ static void run_job(uint32_t kind, uint32_t rows, uint32_t position) {
   uint32_t epoch = __atomic_load_n(&g_job.epoch, __ATOMIC_RELAXED) + 1u;
   if (epoch == 0u) epoch = 1u;
   __atomic_store_n(&g_job.epoch, epoch, __ATOMIC_RELEASE);
+  if (g_worker_count > 1u && !g_spin_workers)
+    (void)syscall(SYS_futex, &g_job.epoch, FUTEX_WAKE_PRIVATE,
+                  (int)(g_worker_count - 1u), NULL, NULL, 0);
   execute_job(0);
   __atomic_store_n(&g_job.slots[0].done, epoch, __ATOMIC_RELEASE);
   for (uint32_t worker = 1; worker < g_worker_count; ++worker)
@@ -580,16 +693,16 @@ static void matvec_accel(float *out, const struct tensor *weight,
   if (!bonsai_accelerate_f32_matvec_submit(weight->data, weight->ne0,
                                            weight->ne1, input))
     fail("accelerator declined matvec");
-  if (weight->ne1 >= 16384u) {
-    /* Only the huge lm_head readback benefits from worker fan-out; the
-       per-job wakeup cost exceeds the serial read for layer matvecs. */
+  if (weight->ne1 >= g_parallel_rows && g_worker_count > 1u) {
+    /* The threshold is tunable on target because the crossover depends on
+       uncached DDR latency and worker wakeup cost. */
     g_job.out = out;
     run_job(JOB_READ_ROWS, weight->ne1, 0);
   } else {
     bonsai_accelerate_read_rows(out, 0, weight->ne1);
   }
   bonsai_accelerate_release();
-  if (getenv("BONSAI_TRACE") != NULL) {
+  if (g_trace) {
     static int checked;
     if (!checked) {
       checked = 1;
@@ -623,25 +736,57 @@ static void embedding_row(float *out, const struct tensor *embedding,
   }
 }
 
-static void rms_norm(float *out, const float *x, const struct tensor *weight,
-                     uint32_t n) {
+static void rms_norm_add(float *out, float *x, const float *add,
+                         const struct tensor *weight, uint32_t n) {
   if (weight->type != GGUF_TYPE_F32 || weight->ne0 != n) fail("bad norm");
   const float *w = (const float *)weight->data;
+  g_job.out = x;
+  g_job.input = add;
+  run_job(JOB_NORM_SUM, n, 0u);
   float sum = 0.0f;
-  for (uint32_t i = 0; i < n; ++i) sum += x[i] * x[i];
+  for (uint32_t worker = 0; worker < g_worker_count; ++worker)
+    sum += g_job.slots[worker].score;
   float scale = rsqrt_f(sum * (1.0f / (float)BONSAI_DIM) + BONSAI_EPS);
-  for (uint32_t i = 0; i < n; ++i) out[i] = x[i] * scale * w[i];
+  g_job.out = out;
+  g_job.input = x;
+  g_job.norm_weight = w;
+  g_job.norm_scale = scale;
+  run_job(JOB_NORM_APPLY, n, 0u);
 }
 
-static void head_rms_norm(float *x, const struct tensor *weight,
-                          uint32_t heads) {
+static void rms_norm(float *out, float *x, const struct tensor *weight,
+                     uint32_t n) {
+  rms_norm_add(out, x, NULL, weight, n);
+}
+
+static void head_rms_norm_one(float *v, const struct tensor *weight) {
   const float *w = (const float *)weight->data;
-  for (uint32_t h = 0; h < heads; ++h) {
-    float *v = x + h * BONSAI_HEAD_DIM;
-    float sum = 0.0f;
-    for (uint32_t i = 0; i < BONSAI_HEAD_DIM; ++i) sum += v[i] * v[i];
-    float scale = rsqrt_f(sum * (1.0f / (float)BONSAI_HEAD_DIM) + BONSAI_EPS);
-    for (uint32_t i = 0; i < BONSAI_HEAD_DIM; ++i) v[i] *= scale * w[i];
+  float sum = 0.0f;
+  for (uint32_t i = 0; i < BONSAI_HEAD_DIM; ++i) sum += v[i] * v[i];
+  float scale = rsqrt_f(sum * (1.0f / (float)BONSAI_HEAD_DIM) + BONSAI_EPS);
+  for (uint32_t i = 0; i < BONSAI_HEAD_DIM; ++i) v[i] *= scale * w[i];
+}
+
+static void attention_prep_head_range(uint32_t begin, uint32_t end,
+                                      uint32_t position,
+                                      const struct layer *layer) {
+  uint32_t layer_index = (uint32_t)(layer - g_model.layers);
+  float *kc = g_state.kv_k[layer_index][position];
+  float *vc = g_state.kv_v[layer_index][position];
+  for (uint32_t h = begin; h < end; ++h) {
+    float *q = g_state.q + h * BONSAI_HEAD_DIM;
+    head_rms_norm_one(q, &layer->q_norm);
+    rope_head(q, position);
+    if (h < BONSAI_KV_HEADS) {
+      float *k = g_state.k + h * BONSAI_HEAD_DIM;
+      float *v = g_state.v + h * BONSAI_HEAD_DIM;
+      head_rms_norm_one(k, &layer->k_norm);
+      rope_head(k, position);
+      for (uint32_t i = 0; i < BONSAI_HEAD_DIM; ++i) {
+        kc[h * BONSAI_HEAD_DIM + i] = half_to_float(float_to_half(k[i]));
+        vc[h * BONSAI_HEAD_DIM + i] = half_to_float(float_to_half(v[i]));
+      }
+    }
   }
 }
 
@@ -657,10 +802,10 @@ static void attention_head_range(uint32_t begin, uint32_t end,
     uint32_t kvh = h / (BONSAI_HEADS / BONSAI_KV_HEADS);
     float max_score = -3.402823466e38f;
     for (uint32_t t = 0; t <= position; ++t) {
-      const fp16_t *key = g_state.kv_k[layer_index][t] + kvh * BONSAI_HEAD_DIM;
+      const float *key = g_state.kv_k[layer_index][t] + kvh * BONSAI_HEAD_DIM;
       float score = 0.0f;
       for (uint32_t j = 0; j < BONSAI_HEAD_DIM; ++j)
-        score += g_state.q[h * BONSAI_HEAD_DIM + j] * half_to_float(key[j]);
+        score += g_state.q[h * BONSAI_HEAD_DIM + j] * key[j];
       score *= inv_sqrt_head;
       scores[t] = score;
       if (score > max_score) max_score = score;
@@ -675,9 +820,9 @@ static void attention_head_range(uint32_t begin, uint32_t end,
     for (uint32_t j = 0; j < BONSAI_HEAD_DIM; ++j) {
       float sum = 0.0f;
       for (uint32_t t = 0; t <= position; ++t) {
-        const fp16_t *value =
+        const float *value =
             g_state.kv_v[layer_index][t] + kvh * BONSAI_HEAD_DIM;
-        sum += scores[t] * half_to_float(value[j]);
+        sum += scores[t] * value[j];
       }
       g_state.att[h * BONSAI_HEAD_DIM + j] = sum * inv_denom;
     }
@@ -686,36 +831,43 @@ static void attention_head_range(uint32_t begin, uint32_t end,
 
 static void attention(struct run_state *state, const struct layer *layer,
                       uint32_t position) {
-  matvec_accel(state->q, &layer->q, state->norm);
-  matvec_accel(state->k, &layer->k, state->norm);
-  matvec_accel(state->v, &layer->v, state->norm);
-  head_rms_norm(state->q, &layer->q_norm, BONSAI_HEADS);
-  head_rms_norm(state->k, &layer->k_norm, BONSAI_KV_HEADS);
-  rope(state->q, BONSAI_HEADS, position);
-  rope(state->k, BONSAI_KV_HEADS, position);
-  uint32_t layer_index = (uint32_t)(layer - g_model.layers);
-  fp16_t *kc = state->kv_k[layer_index][position];
-  fp16_t *vc = state->kv_v[layer_index][position];
-  for (uint32_t i = 0; i < BONSAI_KV_DIM; ++i) {
-    kc[i] = float_to_half(state->k[i]);
-    vc[i] = float_to_half(state->v[i]);
-  }
+  if (!bonsai_accelerate_f32_matvec_store(
+          layer->q.data, layer->q.ne0, layer->q.ne1, state->norm, 0u) ||
+      !bonsai_accelerate_f32_matvec_store(
+          layer->k.data, layer->k.ne0, layer->k.ne1, state->norm,
+          BONSAI_DIM) ||
+      !bonsai_accelerate_f32_matvec_store(
+          layer->v.data, layer->v.ne0, layer->v.ne1, state->norm,
+          BONSAI_DIM + BONSAI_KV_DIM))
+    fail("accelerator declined batched QKV matvec");
+  g_job.out = state->q;
+  run_job(JOB_READ_STORED_ROWS, BONSAI_DIM + 2u * BONSAI_KV_DIM, 0u);
+  g_job.layer = layer;
+  run_job(JOB_ATTN_PREP, BONSAI_HEADS, position);
   g_attn_layer = layer;
-  {
+  if (g_profile) {
     uint64_t th = now_ns();
     run_job(JOB_ATTN_HEADS, BONSAI_HEADS, position);
     g_t_head += now_ns() - th;
+  } else {
+    run_job(JOB_ATTN_HEADS, BONSAI_HEADS, position);
   }
   matvec_accel(state->op, &layer->attn_out, state->att);
 }
 
 static void feed_forward(struct run_state *state, const struct layer *layer) {
-  matvec_accel(state->ffn_up, &layer->ffn_up, state->norm);
-  matvec_accel(state->ffn_gate, &layer->ffn_gate, state->norm);
-  for (uint32_t i = 0; i < BONSAI_FF_DIM; ++i) {
-    float gate = state->ffn_gate[i];
-    state->ffn_up[i] *= gate * rcp_f(1.0f + exp_f(-gate));
-  }
+  if (!bonsai_accelerate_f32_matvec_store(
+          layer->ffn_up.data, layer->ffn_up.ne0, layer->ffn_up.ne1,
+          state->norm, 0u) ||
+      !bonsai_accelerate_f32_matvec_store(
+          layer->ffn_gate.data, layer->ffn_gate.ne0, layer->ffn_gate.ne1,
+          state->norm, BONSAI_FF_DIM))
+    fail("accelerator declined batched FFN matvec");
+  g_job.out = state->ffn_up;
+  run_job(JOB_READ_STORED_ROWS, 2u * BONSAI_FF_DIM, 0u);
+  g_job.out = state->ffn_up;
+  g_job.input = state->ffn_gate;
+  run_job(JOB_FFN_ACTIVATE, BONSAI_FF_DIM, 0u);
   matvec_accel(state->op, &layer->ffn_down, state->ffn_up);
 }
 
@@ -723,7 +875,7 @@ static uint32_t forward(struct model *model, struct run_state *state,
                         uint32_t token, uint32_t position) {
   if (position >= BONSAI_MAX_CONTEXT) fail("context full");
   embedding_row(state->x, &model->embedding, token);
-  if (position == 0 && getenv("BONSAI_TRACE") != NULL) {
+  if (position == 0 && g_trace) {
     const float *w = (const float *)model->layers[0].attn_norm.data;
     volatile float fa = 3.0f, fb = 2.0f;
     volatile float fdiv_test = fa / fb;
@@ -743,9 +895,13 @@ static uint32_t forward(struct model *model, struct run_state *state,
   }
   for (uint32_t il = 0; il < BONSAI_LAYERS; ++il) {
     struct layer *layer = &model->layers[il];
-    uint64_t t0 = now_ns();
-    rms_norm(state->norm, state->x, &layer->attn_norm, BONSAI_DIM);
-    if (il == 0 && position == 0 && getenv("BONSAI_TRACE") != NULL) {
+    uint64_t t0 = g_profile ? now_ns() : 0u;
+    if (il == 0u)
+      rms_norm(state->norm, state->x, &layer->attn_norm, BONSAI_DIM);
+    else
+      rms_norm_add(state->norm, state->x, state->op, &layer->attn_norm,
+                   BONSAI_DIM);
+    if (il == 0 && position == 0 && g_trace) {
       float sum = 0.0f;
       int bad = 0;
       for (uint32_t i = 0; i < BONSAI_DIM; ++i) {
@@ -758,16 +914,15 @@ static uint32_t forward(struct model *model, struct run_state *state,
               (double)state->norm[2], (double)sum, bad);
       fflush(stderr);
     }
-    uint64_t t1 = now_ns();
+    uint64_t t1 = g_profile ? now_ns() : 0u;
     attention(state, layer, position);
-    uint64_t t2 = now_ns();
-    for (uint32_t i = 0; i < BONSAI_DIM; ++i) state->x[i] += state->op[i];
-    rms_norm(state->norm, state->x, &layer->ffn_norm, BONSAI_DIM);
-    uint64_t t3 = now_ns();
+    uint64_t t2 = g_profile ? now_ns() : 0u;
+    rms_norm_add(state->norm, state->x, state->op, &layer->ffn_norm,
+                 BONSAI_DIM);
+    uint64_t t3 = g_profile ? now_ns() : 0u;
     feed_forward(state, layer);
-    uint64_t t4 = now_ns();
-    for (uint32_t i = 0; i < BONSAI_DIM; ++i) state->x[i] += state->op[i];
-    if (getenv("BONSAI_TRACE") != NULL) {
+    uint64_t t4 = g_profile ? now_ns() : 0u;
+    if (g_trace) {
       static int nan_reported;
       if (!nan_reported) {
         for (uint32_t i = 0; i < BONSAI_DIM; ++i) {
@@ -786,13 +941,25 @@ static uint32_t forward(struct model *model, struct run_state *state,
         }
       }
     }
-    g_t_norm += (t1 - t0) + (t3 - t2);
-    g_t_attn += t2 - t1;
-    g_t_ffn += t4 - t3;
+    if (g_profile) {
+      g_t_norm += (t1 - t0) + (t3 - t2);
+      g_t_attn += t2 - t1;
+      g_t_ffn += t4 - t3;
+    }
   }
-  rms_norm(state->norm, state->x, &model->output_norm, BONSAI_DIM);
-  matvec_accel(g_logits, &model->embedding, state->norm);
-  if (getenv("BONSAI_TRACE") != NULL) {
+  rms_norm_add(state->norm, state->x, state->op, &model->output_norm,
+               BONSAI_DIM);
+  if (g_trace) {
+    matvec_accel(g_logits, &model->embedding, state->norm);
+  } else {
+    if (!bonsai_accelerate_f32_matvec_submit(
+            model->embedding.data, model->embedding.ne0,
+            model->embedding.ne1, state->norm))
+      fail("accelerator declined output matvec");
+    run_job(JOB_ACCEL_ARGMAX, BONSAI_VOCAB, 0);
+    bonsai_accelerate_release();
+  }
+  if (g_trace) {
     float lo = 3.4e38f, hi = -3.4e38f;
     int nan_count = 0;
     for (uint32_t i = 0; i < 1000u; ++i) {
@@ -809,7 +976,7 @@ static uint32_t forward(struct model *model, struct run_state *state,
             (double)g_t_ffn / 1e9, (double)g_t_norm / 1e9,
             (double)g_t_head / 1e9);
   }
-  run_job(JOB_ARGMAX, BONSAI_VOCAB, 0);
+  if (g_trace) run_job(JOB_ARGMAX, BONSAI_VOCAB, 0);
   uint32_t best = 0;
   float best_score = -3.402823466e38f;
   for (uint32_t worker = 0; worker < g_worker_count; ++worker) {
@@ -818,6 +985,7 @@ static uint32_t forward(struct model *model, struct run_state *state,
       best = g_job.slots[worker].token;
     }
   }
+  ++g_forward_count;
   return best;
 }
 
@@ -844,6 +1012,58 @@ void quantize_row_q8_0(const float *x, void *vy, int64_t k) {
     y[i].d = float_to_half(d);
     for (int j = 0; j < 32; j++)
       y[i].qs[j] = (int8_t)round_f(x[i * 32 + j] * id);
+  }
+}
+
+/* Lite-runtime fast path: form the Q8_0 stream in registers and issue only
+   aligned 64-bit stores to the uncached accelerator scratch mapping. This
+   avoids writing and rereading a cacheless intermediate buffer. The caller
+   guarantees a multiple of 128 elements, so the 34-byte blocks end on an
+   eight-byte boundary in groups of four. */
+static void quantize_q8_group_range(const float *x,
+                                    volatile uint64_t *output,
+                                    uint32_t begin, uint32_t end) {
+  uint64_t word = 0u;
+  uint32_t bytes = 0u;
+  size_t word_index = (size_t)begin * 17u;
+  for (uint32_t block = begin * 4u; block < end * 4u; ++block) {
+    float amax = 0.0f;
+    for (int j = 0; j < 32; ++j) {
+      float value = x[block * 32 + j];
+      if (value < 0.0f) value = -value;
+      if (amax < value) amax = value;
+    }
+    const float d = amax * (1.0f / 127.0f);
+    const float id = rcp_f(d);
+    const fp16_t d16 = float_to_half(d);
+    for (int item = -2; item < 32; ++item) {
+      uint8_t byte;
+      if (item == -2)
+        byte = (uint8_t)d16;
+      else if (item == -1)
+        byte = (uint8_t)(d16 >> 8);
+      else
+        byte = (uint8_t)(int8_t)round_f(x[block * 32 + item] * id);
+      word |= (uint64_t)byte << (bytes * 8u);
+      if (++bytes == 8u) {
+        output[word_index++] = word;
+        word = 0u;
+        bytes = 0u;
+      }
+    }
+  }
+  if (bytes != 0u) output[word_index] = word;
+}
+
+void bonsai_quantize_q8_to_scratch(const float *x, volatile uint64_t *output,
+                                   int64_t k) {
+  uint32_t groups = (uint32_t)k / 128u;
+  if (g_worker_count > 1u && groups > 1u) {
+    g_job.quantize_input = x;
+    g_job.quantize_output = output;
+    run_job(JOB_QUANTIZE_Q8, groups, 0);
+  } else {
+    quantize_q8_group_range(x, output, 0u, groups);
   }
 }
 
@@ -935,6 +1155,18 @@ int main(int argc, char **argv) {
     }
   }
   size_t model_size;
+  g_trace = getenv("BONSAI_TRACE") != NULL;
+  g_profile = getenv("BONSAI_PROFILE") != NULL || g_trace;
+  if (g_profile) (void)atexit(report_main_profile);
+  const char *parallel_rows = getenv("BONSAI_PARALLEL_ROWS");
+  if (parallel_rows != NULL) {
+    unsigned long value = strtoul(parallel_rows, NULL, 10);
+    if (value > 0u && value <= UINT32_MAX)
+      g_parallel_rows = (uint32_t)value;
+  }
+  const char *spin_workers = getenv("BONSAI_SPIN_WORKERS");
+  if (spin_workers != NULL && strcmp(spin_workers, "0") == 0)
+    g_spin_workers = 0;
   const uint8_t *model_data = map_model(path, &model_size);
   model_init(&g_model, model_data, model_size);
   rope_cache_init();
