@@ -62,6 +62,7 @@ void bonsai_accelerate_read_stored_rows(float *output, uint32_t source_first,
 const volatile int64_t *bonsai_accelerate_stored_output(void);
 void bonsai_accelerate_argmax_rows(uint32_t first, uint32_t count,
                                    int64_t *best_raw, uint32_t *best_token);
+int bonsai_accelerator_prepare(void);
 #else
 int bonsai_accelerate_f32_matvec_submit(const void *weights, uint32_t columns,
                                         uint32_t rows, const float *input);
@@ -100,6 +101,11 @@ static inline float sqrt_f(float x) {
 #endif
 }
 
+#ifdef BONSAI_HOST_STUB
+static int bonsai_accelerator_prepare(void) {
+  return 1;
+}
+#endif
 
 /* This board's FPU divide path is unreliable (fdiv.s can return NaN), so
    every hot-path division goes through Newton iterations that need only
@@ -525,18 +531,34 @@ static void rope_cache_init(void) {
   const float theta_scale =
       powf(BONSAI_ROPE_BASE, -2.0f / (float)BONSAI_HEAD_DIM);
   const float mscale_base = 1.0f + 0.1f * logf(1.0f / freq_scale);
+  float step_cos[BONSAI_HEAD_DIM / 2u];
+  float step_sin[BONSAI_HEAD_DIM / 2u];
+  float current_cos[BONSAI_HEAD_DIM / 2u];
+  float current_sin[BONSAI_HEAD_DIM / 2u];
+  float theta_extrap = 1.0f;
+  for (uint32_t i = 0; i < BONSAI_HEAD_DIM / 2u; ++i) {
+    float span = corr_high - corr_low > 0.001f ? corr_high - corr_low
+                                                : 0.001f;
+    float y = ((float)i - corr_low) * rcp_f(span);
+    float ramp = 1.0f - (y < 0.0f ? 0.0f : (y > 1.0f ? 1.0f : y));
+    float angle = theta_extrap *
+                  (freq_scale * (1.0f - ramp) + ramp);
+    step_cos[i] = cosf(angle);
+    step_sin[i] = sinf(angle);
+    current_cos[i] = 1.0f;
+    current_sin[i] = 0.0f;
+    theta_extrap *= theta_scale;
+  }
+  /* RoPE angles are linear in position. Build all 256 rows with a complex
+     recurrence instead of calling sinf/cosf 32,768 times on the target. */
   for (uint32_t position = 0; position < BONSAI_MAX_CONTEXT; ++position) {
-    float theta_extrap = (float)position;
     for (uint32_t i = 0; i < BONSAI_HEAD_DIM / 2u; ++i) {
-      float span = corr_high - corr_low > 0.001f ? corr_high - corr_low
-                                                  : 0.001f;
-      float y = ((float)i - corr_low) * rcp_f(span);
-      float ramp = 1.0f - (y < 0.0f ? 0.0f : (y > 1.0f ? 1.0f : y));
-      float theta_interp = freq_scale * theta_extrap;
-      float theta = theta_interp * (1.0f - ramp) + theta_extrap * ramp;
-      g_rope_cos[position][i] = cosf(theta) * mscale_base;
-      g_rope_sin[position][i] = sinf(theta) * mscale_base;
-      theta_extrap *= theta_scale;
+      float c = current_cos[i];
+      float s = current_sin[i];
+      g_rope_cos[position][i] = c * mscale_base;
+      g_rope_sin[position][i] = s * mscale_base;
+      current_cos[i] = c * step_cos[i] - s * step_sin[i];
+      current_sin[i] = s * step_cos[i] + c * step_sin[i];
     }
   }
 }
@@ -1179,6 +1201,10 @@ static const uint8_t *map_model(const char *path, size_t *size_out) {
 
 static int run_server(void) {
   char line[1u << 20];
+  static uint32_t cached_tokens[BONSAI_MAX_CONTEXT];
+  static uint32_t requested_tokens[BONSAI_MAX_CONTEXT];
+  uint32_t cached_count = 0u;
+  uint32_t cached_next = 0u;
   printf("READY\n");
   fflush(stdout);
   while (fgets(line, sizeof(line), stdin) != NULL) {
@@ -1189,16 +1215,30 @@ static int run_server(void) {
     unsigned long max_tokens = strtoul(p, &p, 10);
     unsigned long count = strtoul(p, &p, 10);
     if (count == 0u || count > BONSAI_MAX_CONTEXT) fail("bad prompt length");
-    memset(&g_state, 0, sizeof(g_state));
-    uint32_t next = 0;
-    uint32_t position = 0;
-    uint64_t prompt_start = now_ns();
     for (unsigned long i = 0; i < count; ++i) {
       unsigned long id = strtoul(p, &p, 10);
       if (id >= BONSAI_VOCAB) fail("bad prompt token");
-      next = forward(&g_model, &g_state, (uint32_t)id, position++);
+      requested_tokens[i] = (uint32_t)id;
     }
-    printf("PROMPT %lu %llu\n", count,
+    uint32_t common = 0u;
+    while (common < (uint32_t)count && common < cached_count &&
+           requested_tokens[common] == cached_tokens[common])
+      ++common;
+    /* If a request truncates the previous one exactly at the common prefix,
+       recompute its last token because cached_next belongs to the longer
+       sequence. The KV entries before it remain valid. */
+    if (common == (uint32_t)count && common < cached_count && common > 0u)
+      --common;
+    uint32_t next = common == cached_count ? cached_next : 0u;
+    uint32_t position = common;
+    uint64_t prompt_start = now_ns();
+    for (uint32_t i = common; i < (uint32_t)count; ++i)
+      next = forward(&g_model, &g_state, requested_tokens[i], position++);
+    memcpy(cached_tokens, requested_tokens,
+           (size_t)count * sizeof(*cached_tokens));
+    cached_count = (uint32_t)count;
+    cached_next = next;
+    printf("PROMPT %u %u %llu\n", (uint32_t)count - common, common,
            (unsigned long long)(now_ns() - prompt_start));
     for (unsigned long i = 0;
          i < max_tokens && position < BONSAI_MAX_CONTEXT; ++i) {
@@ -1207,7 +1247,10 @@ static int run_server(void) {
       fflush(stdout);
       if (emitted == 151643u || emitted == 151645u) break;
       uint64_t start = now_ns();
+      cached_tokens[position] = emitted;
       next = forward(&g_model, &g_state, emitted, position++);
+      cached_count = position;
+      cached_next = next;
       printf("EVAL %llu\n", (unsigned long long)(now_ns() - start));
     }
     printf("DONE\n");
@@ -1242,6 +1285,7 @@ int main(int argc, char **argv) {
            "[-n COUNT] [--prompt-ids a,b,c]");
     }
   }
+  uint64_t startup_begin = now_ns();
   size_t model_size;
   g_trace = getenv("BONSAI_TRACE") != NULL;
   g_profile = getenv("BONSAI_PROFILE") != NULL || g_trace;
@@ -1257,10 +1301,26 @@ int main(int argc, char **argv) {
     g_spin_workers = 0;
   const uint8_t *model_data = map_model(path, &model_size);
   model_init(&g_model, model_data, model_size);
+  uint64_t model_ready = now_ns();
   rope_cache_init();
+  uint64_t rope_ready = now_ns();
   memset(&g_state, 0, sizeof(g_state));
   setenv("BONSAI_MODEL", path, 0);
   parallel_init(workers);
+  uint64_t workers_ready = now_ns();
+  if (!bonsai_accelerator_prepare())
+    fail("FPGA accelerator or staged model is unavailable");
+  if (getenv("BONSAI_STARTUP_PROFILE") != NULL) {
+    uint64_t accelerator_ready = now_ns();
+    fprintf(stderr,
+            "Bonsai startup profile: model=%.3fms rope=%.3fms workers=%.3fms "
+            "accelerator=%.3fms total=%.3fms\n",
+            (double)(model_ready - startup_begin) / 1e6,
+            (double)(rope_ready - model_ready) / 1e6,
+            (double)(workers_ready - rope_ready) / 1e6,
+            (double)(accelerator_ready - workers_ready) / 1e6,
+            (double)(accelerator_ready - startup_begin) / 1e6);
+  }
   if (server) return run_server();
 
   if (prompt_count == 0) {

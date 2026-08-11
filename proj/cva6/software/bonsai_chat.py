@@ -120,20 +120,24 @@ def load_tokenizer(path, progress=None):
     with path.open("rb") as stream:
         payload = pickle.load(stream)
     tokens = payload["tokens"]
-    token_to_id = {}
-    token_count = len(tokens)
-    for token_id, token in enumerate(tokens):
-        token_to_id[token] = token_id
-        if progress is not None and token_id % 8192 == 0:
-            progress.update(0.05 + 0.20 * token_id / token_count, "Indexing tokenizer tokens")
-    merge_rank = {}
-    merges = payload["merges"]
-    merge_count = len(merges)
-    for rank, merge in enumerate(merges):
-        left, right = merge.split(" ", 1)
-        merge_rank[(left, right)] = rank
-        if progress is not None and rank % 8192 == 0:
-            progress.update(0.25 + 0.20 * rank / merge_count, "Indexing tokenizer merges")
+    token_to_id = payload.get("token_to_id")
+    merge_rank = payload.get("merge_rank")
+    if token_to_id is None or merge_rank is None:
+        # Keep old SD-card tokenizer images usable.
+        token_count = len(tokens)
+        token_to_id = {}
+        for token_id, token in enumerate(tokens):
+            token_to_id[token] = token_id
+            if progress is not None and token_id % 8192 == 0:
+                progress.update(0.05 + 0.20 * token_id / token_count, "Indexing tokenizer tokens")
+        merge_rank = {}
+        merges = payload["merges"]
+        merge_count = len(merges)
+        for rank, merge in enumerate(merges):
+            left, right = merge.split(" ", 1)
+            merge_rank[(left, right)] = rank
+            if progress is not None and rank % 8192 == 0:
+                progress.update(0.25 + 0.20 * rank / merge_count, "Indexing tokenizer merges")
     if progress is not None:
         progress.update(0.45, "Tokenizer ready")
     return tokens, token_to_id, merge_rank
@@ -204,6 +208,8 @@ def render_prompt(messages):
     # immediately instead of spending generated tokens inside <think>.
     text = ""
     for role, content in messages:
+        if role == "assistant":
+            content = f"<think>\n\n</think>\n\n{content}"
         text += f"<|im_start|>{role}\n{content}<|im_end|>\n"
     return text + "<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
@@ -268,6 +274,7 @@ def run_chat(args, tokens, token_to_id, merge_rank, progress):
             assistant = bytearray()
             eval_ns = []
             prompt_tokens = 0
+            cached_tokens = 0
             prompt_ns = 0
             print("bonsai> ", end="", flush=True)
             while True:
@@ -276,7 +283,10 @@ def run_chat(args, tokens, token_to_id, merge_rank, progress):
                     break
                 kind, *fields = line.split()
                 if kind == "PROMPT":
-                    prompt_tokens, prompt_ns = map(int, fields)
+                    if len(fields) == 2:
+                        prompt_tokens, prompt_ns = map(int, fields)
+                    else:
+                        prompt_tokens, cached_tokens, prompt_ns = map(int, fields)
                 elif kind == "TOKEN":
                     token = int(fields[0])
                     if token not in EOS_TOKENS and token not in THINK_TOKENS:
@@ -289,7 +299,8 @@ def run_chat(args, tokens, token_to_id, merge_rank, progress):
             messages.append(("assistant", assistant.decode("utf-8", errors="replace")))
             prefill_tps = prompt_tokens * 1e9 / prompt_ns if prompt_ns else 0.0
             decode_tps = len(eval_ns) * 1e9 / sum(eval_ns) if eval_ns else 0.0
-            print(f"[{prefill_tps:.3f} prompt tok/s, {decode_tps:.3f} decode tok/s]")
+            cache_note = f", {cached_tokens} prompt tokens cached" if cached_tokens else ""
+            print(f"[{prefill_tps:.3f} prompt tok/s{cache_note}, {decode_tps:.3f} decode tok/s]")
     finally:
         if process.poll() is None:
             process.stdin.write("QUIT\n")
@@ -328,6 +339,17 @@ def main(argv=None):
                          198, 151667, 271, 151668, 271]
         if chat != expected_chat:
             raise SystemExit(f"chat tokenizer mismatch\nexpected: {expected_chat}\nactual:   {chat}")
+        continued = tokenize(
+            render_prompt([
+                ("user", "Hello"),
+                ("assistant", "Hi there"),
+                ("user", "Again"),
+            ]),
+            token_to_id,
+            merge_rank,
+        )
+        if continued[:len(chat)] != chat:
+            raise SystemExit("continued chat does not preserve the cached token prefix")
         progress.finish("Tokenizer ready")
         print(f"tokenizer self-test passed in {time.monotonic() - start:.3f} seconds")
         return

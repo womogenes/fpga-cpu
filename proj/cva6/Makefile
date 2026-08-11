@@ -47,6 +47,8 @@ init:
 
 sim:
 	mkdir -p build/sim/lfm build/sim/arbiter
+	$(CC) -O2 -Wall -Wextra -Werror -std=gnu11 -pthread -Isoftware software/mandelbrot.c sim/mandelbrot_video_stub.c -lm -o build/sim/mandelbrot_test
+	build/sim/mandelbrot_test
 	iverilog -g2012 -s terminal_buffer_tb -o build/sim/terminal_buffer_tb rtl/terminal_buffer.sv sim/terminal_buffer_tb.sv
 	cd $(CURDIR) && vvp build/sim/terminal_buffer_tb
 	iverilog -g2012 -s uart_rx_tb -o build/sim/uart_rx_tb rtl/uart_rx.sv sim/uart_rx_tb.sv

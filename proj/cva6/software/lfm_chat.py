@@ -113,20 +113,23 @@ def load_tokenizer(path, progress=None):
     with path.open("rb") as stream:
         payload = pickle.load(stream)
     tokens = payload["tokens"]
-    token_to_id = {}
-    token_count = len(tokens)
-    for token_id, token in enumerate(tokens):
-        token_to_id[token] = token_id
-        if progress is not None and token_id % 1024 == 0:
-            progress.update(0.05 + 0.20 * token_id / token_count, "Indexing tokenizer tokens")
-    merge_rank = {}
-    merges = payload["merges"]
-    merge_count = len(merges)
-    for rank, merge in enumerate(merges):
-        left, right = merge.split(" ", 1)
-        merge_rank[(left, right)] = rank
-        if progress is not None and rank % 1024 == 0:
-            progress.update(0.25 + 0.20 * rank / merge_count, "Indexing tokenizer merges")
+    token_to_id = payload.get("token_to_id")
+    merge_rank = payload.get("merge_rank")
+    if token_to_id is None or merge_rank is None:
+        token_count = len(tokens)
+        token_to_id = {}
+        for token_id, token in enumerate(tokens):
+            token_to_id[token] = token_id
+            if progress is not None and token_id % 1024 == 0:
+                progress.update(0.05 + 0.20 * token_id / token_count, "Indexing tokenizer tokens")
+        merge_rank = {}
+        merges = payload["merges"]
+        merge_count = len(merges)
+        for rank, merge in enumerate(merges):
+            left, right = merge.split(" ", 1)
+            merge_rank[(left, right)] = rank
+            if progress is not None and rank % 1024 == 0:
+                progress.update(0.25 + 0.20 * rank / merge_count, "Indexing tokenizer merges")
     if progress is not None:
         progress.update(0.45, "Tokenizer ready")
     return tokens, token_to_id, merge_rank

@@ -122,6 +122,27 @@ static int stamps_equal(const struct model_stage_stamp *a,
          a->mtime_nanoseconds == b->mtime_nanoseconds;
 }
 
+static int staged_model_matches(int source, const uint8_t *mapping,
+                                size_t size) {
+  enum { SAMPLE_BYTES = 64u * 1024u };
+  uint8_t *sample = malloc(SAMPLE_BYTES);
+  if (sample == NULL || size < SAMPLE_BYTES * 2u) {
+    free(sample);
+    return 0;
+  }
+  ssize_t first = pread(source, sample, SAMPLE_BYTES, 0);
+  int matches = first == (ssize_t)SAMPLE_BYTES &&
+                memcmp(sample, mapping, SAMPLE_BYTES) == 0;
+  if (matches) {
+    off_t offset = (off_t)(size - SAMPLE_BYTES);
+    ssize_t last = pread(source, sample, SAMPLE_BYTES, offset);
+    matches = last == (ssize_t)SAMPLE_BYTES &&
+              memcmp(sample, mapping + (size_t)offset, SAMPLE_BYTES) == 0;
+  }
+  free(sample);
+  return matches;
+}
+
 static int stage_model(int memory) {
   const char *path = getenv("BONSAI_MODEL");
   if (path == NULL || path[0] == '\0')
@@ -152,8 +173,11 @@ static int stage_model(int memory) {
     }
   }
   int lock = open("/run/fpga-model.lock", O_RDWR | O_CREAT, 0600);
-  if (lock < 0 || flock(lock, LOCK_EX) != 0) {
-    perror("Bonsai model lock");
+  if (lock < 0 || flock(lock, LOCK_EX | LOCK_NB) != 0) {
+    if (lock >= 0 && (errno == EWOULDBLOCK || errno == EAGAIN))
+      fprintf(stderr, "Bonsai model slot is in use; exit the other model runtime first\n");
+    else
+      perror("Bonsai model lock");
     if (source >= 0) (void)close(source);
     if (lock >= 0) (void)close(lock);
     return -1;
@@ -175,12 +199,18 @@ static int stage_model(int memory) {
       .mtime_seconds = (int64_t)st.st_mtim.tv_sec,
       .mtime_nanoseconds = (int64_t)st.st_mtim.tv_nsec,
   };
+  if (prestaged)
+    (void)unlink("/run/fpga-model.stamp");
   struct model_stage_stamp actual;
   int stamp = open("/run/fpga-model.stamp", O_RDONLY);
   ssize_t stamp_size = stamp >= 0 ? read(stamp, &actual, sizeof(actual)) : -1;
   if (stamp >= 0) (void)close(stamp);
-  if (!prestaged && (stamp_size != (ssize_t)sizeof(actual) ||
-                     !stamps_equal(&actual, &expected))) {
+  int staged = !prestaged && stamp_size == (ssize_t)sizeof(actual) &&
+               stamps_equal(&actual, &expected);
+  if (!prestaged && !staged)
+    staged = staged_model_matches(source, mapping,
+                                  (size_t)BONSAI_MODEL_FILE_SIZE);
+  if (!prestaged && !staged) {
     fprintf(stderr, "Staging Bonsai weights from SD:   0%%");
     size_t copied = 0;
     size_t next_report = 16u * 1024u * 1024u;
@@ -217,6 +247,17 @@ static int stage_model(int memory) {
     }
     (void)close(stamp);
     fprintf(stderr, "\n");
+  } else if (!prestaged &&
+             (stamp_size != (ssize_t)sizeof(actual) ||
+              !stamps_equal(&actual, &expected))) {
+    /* A stage-2 boot can preload the model before /run exists. Record the
+       verified contents so subsequent launches need no DDR sampling. */
+    stamp = open("/run/fpga-model.stamp",
+                 O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (stamp >= 0) {
+      (void)write(stamp, &expected, sizeof(expected));
+      (void)close(stamp);
+    }
   }
   const uint8_t *bytes = mapping;
   uint8_t header[4] = {bytes[0], bytes[1], bytes[2], bytes[3]};
@@ -271,6 +312,15 @@ static void initialize_accelerator(void) {
   }
   accelerator_toggle = accelerator_gpio[0] & 0x80000000u;
   accelerator_available = 1;
+}
+
+int bonsai_accelerator_prepare(void) {
+  lock_accelerator();
+  if (!accelerator_initialized)
+    initialize_accelerator();
+  int available = accelerator_available;
+  unlock_accelerator();
+  return available;
 }
 
 static int pointer_file_offset(const void *pointer, uint64_t *offset_out) {
