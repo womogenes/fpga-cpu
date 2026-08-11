@@ -1,11 +1,15 @@
 #include "video_hw.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <termios.h>
 #include <time.h>
+#include <unistd.h>
 
 #define MAX_ITERATIONS 48u
 #define RENDER_THREADS 4u
@@ -37,6 +41,16 @@ static struct worker_arg worker_args[RENDER_THREADS - 1u];
 static void request_stop(int signal_number) {
   (void)signal_number;
   stop_requested = 1;
+}
+
+static void poll_stop_key(void) {
+  unsigned char key;
+  ssize_t count;
+  while ((count = read(STDIN_FILENO, &key, 1)) == 1)
+    if (key == 'q' || key == 'Q' || key == 3u)
+      stop_requested = 1;
+  if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+    stop_requested = 1;
 }
 
 static uint8_t palette(unsigned iteration) {
@@ -162,6 +176,16 @@ int main(void) {
 
   signal(SIGINT, request_stop);
   signal(SIGTERM, request_stop);
+  struct termios saved_terminal;
+  int terminal_valid = tcgetattr(STDIN_FILENO, &saved_terminal) == 0;
+  int saved_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+  if (terminal_valid) {
+    struct termios raw = saved_terminal;
+    cfmakeraw(&raw);
+    (void)tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+  }
+  if (saved_flags >= 0)
+    (void)fcntl(STDIN_FILENO, F_SETFL, saved_flags | O_NONBLOCK);
   struct timespec started;
   clock_gettime(CLOCK_MONOTONIC, &started);
   unsigned frames = 0;
@@ -170,6 +194,9 @@ int main(void) {
 
   render_frame(&pool, span);
   while (!stop_requested) {
+    poll_stop_key();
+    if (stop_requested)
+      break;
     if (video_hw_submit(&video, frame) != 0) {
       status = 1;
       break;
@@ -186,6 +213,10 @@ int main(void) {
   render_pool_close(&pool);
   video_hw_terminal(&video);
   video_hw_close(&video);
+  if (saved_flags >= 0)
+    (void)fcntl(STDIN_FILENO, F_SETFL, saved_flags);
+  if (terminal_valid)
+    (void)tcsetattr(STDIN_FILENO, TCSANOW, &saved_terminal);
   free(frame);
   double seconds = elapsed_seconds(&started, &finished);
   if (seconds > 0.0)
