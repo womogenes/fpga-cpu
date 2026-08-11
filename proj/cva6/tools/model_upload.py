@@ -46,6 +46,24 @@ def read_exact(port: serial.Serial, count: int, timeout: float) -> bytes:
     return bytes(received)
 
 
+def read_ack(port: serial.Serial, timeout: float) -> None:
+    """Consume delayed console residue without losing post-ACK checksum bytes."""
+    deadline = time.monotonic() + timeout
+    residue = bytearray()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"timed out waiting for block acknowledgement; residue={bytes(residue)!r}")
+        byte = read_exact(port, 1, remaining)
+        if byte == b"A":
+            if residue:
+                print(f"Ignored delayed UART residue {bytes(residue)!r}.")
+            return
+        residue.extend(byte)
+        if len(residue) > 4096:
+            raise RuntimeError(f"excess UART residue before acknowledgement: {bytes(residue[:80])!r}")
+
+
 def fnv1a(data: bytes, value: int) -> int:
     for byte in data:
         value = ((value ^ byte) * 16777619) & 0xFFFFFFFF
@@ -106,10 +124,11 @@ def main() -> None:
             synchronize_shell(port, allow_login=True)
         command = f"model-receive {args.destination} {size}\n".encode()
         # Command traffic does not need bulk-transfer throughput. Sending one
-        # byte at a time avoids the first-character loss occasionally observed
-        # when Linux switches directly from an echoed shell prompt at 3 Mbaud.
+        # byte at a time avoids first-character loss at 3 Mbaud.
         write_paced(port, command, 200, 1)
         wait_for(port, b"MODEL_READY\n", 10.0)
+        time.sleep(0.1)
+        port.reset_input_buffer()
 
         checksum = 2166136261
         sent = 0
@@ -118,9 +137,7 @@ def main() -> None:
         with args.model.open("rb") as source:
             while block := source.read(4096):
                 write_paced(port, block, args.rate_kib * 1024, args.chunk_size)
-                acknowledgement = read_exact(port, 1, args.ack_timeout)
-                if acknowledgement != b"A":
-                    raise RuntimeError(f"model receiver returned {acknowledgement!r}")
+                read_ack(port, args.ack_timeout)
                 checksum = fnv1a(block, checksum)
                 sent += len(block)
                 if sent >= next_report or sent == size:

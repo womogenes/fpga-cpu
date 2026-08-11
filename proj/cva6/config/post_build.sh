@@ -20,6 +20,7 @@ mkdir -p "$programs" "$examples" "$media"
 "$compiler" "${cflags[@]}" "$software/videoctl.c" "$software/video_hw.c" -o "$programs/videoctl"
 "$compiler" "${cflags[@]}" "$software/video_bench.c" "$software/video_hw.c" -o "$programs/video-bench"
 "$compiler" "${cflags[@]}" "$software/mandelbrot.c" "$software/video_hw.c" -pthread -lm -o "$programs/mandelbrot"
+"$compiler" "${cflags[@]}" "$software/life.c" "$software/video_hw.c" -o "$programs/life"
 "$compiler" "${cflags[@]}" "$software/badapple.c" "$software/video_hw.c" -lz -o "$programs/badapple"
 "$compiler" "${cflags[@]}" "$software/snake.c" -o "$programs/snake"
 "$compiler" "${cflags[@]}" "$software/model_receive.c" -o "$programs/model-receive"
@@ -35,10 +36,10 @@ patch --quiet --forward "$lfm_build/main.c" <"$root/config/lfm_accelerator.patch
 "$compiler" -O3 -ffast-math "${target_arch[@]}" -Wall -Wextra -Werror -Wno-unused-function -Wshadow -Wconversion -std=gnu11 -pthread \
     -DLFM_HOST -DLFM_ACCELERATOR -DLFM_FAST_MATH -DLFM_DIRECT_MODEL_PHYS=0xaf000000ul -DLFM_MAX_CONTEXT=256 \
     -I"$software" -I"$lfm_main/generated" "$lfm_build/main.c" -lm -o "$programs/lfm"
-"$HOST_DIR/bin/riscv64-buildroot-linux-gnu-strip" "$programs/videoctl" "$programs/video-bench" "$programs/mandelbrot" "$programs/badapple" "$programs/snake" "$programs/model-receive" "$programs/model-export"
+"$HOST_DIR/bin/riscv64-buildroot-linux-gnu-strip" "$programs/videoctl" "$programs/video-bench" "$programs/mandelbrot" "$programs/life" "$programs/badapple" "$programs/snake" "$programs/model-receive" "$programs/model-export"
 "$HOST_DIR/bin/riscv64-buildroot-linux-gnu-strip" "$programs/lfm"
 
-install -m 0644 "$software/video_hw.h" "$software/video_hw.c" "$software/video_bench.c" "$software/mandelbrot.c" "$software/badapple.c" "$software/snake.c" "$examples/"
+install -m 0644 "$software/video_hw.h" "$software/video_hw.c" "$software/video_bench.c" "$software/mandelbrot.c" "$software/life.c" "$software/badapple.c" "$software/snake.c" "$examples/"
 install -m 0755 "$software/numpy_bench.py" "$programs/numpy-bench"
 install -m 0755 "$software/lfm_chat.py" "$programs/lfm-chat"
 install -m 0755 "$software/sd_install.sh" "$TARGET_DIR/usr/sbin/sd-install"

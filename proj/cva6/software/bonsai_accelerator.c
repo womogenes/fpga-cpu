@@ -205,11 +205,17 @@ static int stage_model(int memory) {
   int stamp = open("/run/fpga-model.stamp", O_RDONLY);
   ssize_t stamp_size = stamp >= 0 ? read(stamp, &actual, sizeof(actual)) : -1;
   if (stamp >= 0) (void)close(stamp);
+  const uint8_t *mapped_bytes = mapping;
+  int mapped_header_valid = mapped_bytes[0] == 'G' &&
+                            mapped_bytes[1] == 'G' &&
+                            mapped_bytes[2] == 'U' &&
+                            mapped_bytes[3] == 'F';
   int staged = !prestaged && stamp_size == (ssize_t)sizeof(actual) &&
-               stamps_equal(&actual, &expected);
+               stamps_equal(&actual, &expected) && mapped_header_valid;
   if (!prestaged && !staged)
     staged = staged_model_matches(source, mapping,
                                   (size_t)BONSAI_MODEL_FILE_SIZE);
+  int record_stamp = 0;
   if (!prestaged && !staged) {
     fprintf(stderr, "Staging Bonsai weights from SD:   0%%");
     size_t copied = 0;
@@ -235,34 +241,29 @@ static int stage_model(int memory) {
       }
     }
     accelerator_fence();
-    stamp = open("/run/fpga-model.stamp",
-                 O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (stamp < 0 || write(stamp, &expected, sizeof(expected)) !=
-                       (ssize_t)sizeof(expected)) {
-      perror("Bonsai model stamp");
-      (void)munmap(mapping, (size_t)BONSAI_MODEL_FILE_SIZE);
-      (void)close(source);
-      (void)close(lock);
-      return -1;
-    }
-    (void)close(stamp);
+    record_stamp = 1;
     fprintf(stderr, "\n");
   } else if (!prestaged &&
              (stamp_size != (ssize_t)sizeof(actual) ||
               !stamps_equal(&actual, &expected))) {
     /* A stage-2 boot can preload the model before /run exists. Record the
        verified contents so subsequent launches need no DDR sampling. */
-    stamp = open("/run/fpga-model.stamp",
-                 O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (stamp >= 0) {
-      (void)write(stamp, &expected, sizeof(expected));
-      (void)close(stamp);
-    }
+    record_stamp = 1;
   }
   const uint8_t *bytes = mapping;
   uint8_t header[4] = {bytes[0], bytes[1], bytes[2], bytes[3]};
   int valid = header[0] == 'G' && header[1] == 'G' && header[2] == 'U' &&
               header[3] == 'F';
+  if (valid && record_stamp) {
+    stamp = open("/run/fpga-model.stamp",
+                 O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (stamp >= 0) {
+      (void)write(stamp, &expected, sizeof(expected));
+      (void)close(stamp);
+    } else {
+      perror("Bonsai model stamp");
+    }
+  }
   (void)munmap(mapping, (size_t)BONSAI_MODEL_FILE_SIZE);
   if (source >= 0) (void)close(source);
   if (valid) {

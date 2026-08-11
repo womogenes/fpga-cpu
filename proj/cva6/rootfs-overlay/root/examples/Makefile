@@ -3,10 +3,13 @@ CFLAGS ?= -O2 -Wall -Wextra -std=gnu11
 
 .PHONY: all clean
 
-all: mandelbrot badapple snake hello
+all: mandelbrot life badapple snake hello
 
 mandelbrot: mandelbrot.c video_hw.c video_hw.h
 	$(CC) $(CFLAGS) -o $@ mandelbrot.c video_hw.c -lm
+
+life: life.c video_hw.c video_hw.h
+	$(CC) $(CFLAGS) -o $@ life.c video_hw.c
 
 badapple: badapple.c video_hw.c video_hw.h
 	$(CC) $(CFLAGS) -o $@ badapple.c video_hw.c -lz
@@ -18,4 +21,4 @@ hello: hello.c
 	$(CC) $(CFLAGS) -o $@ hello.c
 
 clean:
-	rm -f mandelbrot badapple snake hello
+	rm -f mandelbrot life badapple snake hello

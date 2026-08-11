@@ -99,7 +99,7 @@ The image boots to Bash in `/root` and provides both `python` and `python3`, Num
 
 Run `workstation-check` to verify the core tools, NumPy, the standalone LFM tokenizer, and a native C smoke test directly on CVA6.
 
-Games are available as `snake`, `tetris`, and `ascii-invaders`. Editable C examples live in `/root/examples`; `make -C /root/examples` rebuilds them on the FPGA without rebuilding Linux or gateware.
+Games are available as `snake`, `tetris`, `ascii-invaders`, and `life`. The Game of Life demo starts paused with an editable cursor: arrows or WASD move, Space toggles a cell, Enter runs or pauses, `n` advances one generation, `p` cycles through glider, acorn, pulsar, and Gosper-gun presets, `r` randomizes, `c` clears, `+`/`-` changes speed, and `q` quits. Editable C examples live in `/root/examples`; `make -C /root/examples` rebuilds them on the FPGA without rebuilding Linux or gateware.
 
 ## Standalone language model
 
@@ -133,7 +133,7 @@ videoctl bars
 
 Press Ctrl-C to finish the current frame and return to the terminal. `videoctl tty` also restores the terminal, and physical switch 7 forces the terminal immediately if a program crashes. A raw file passed to `videoctl` is interpreted as consecutive 14,400-byte RGB232 frames, with red in bits 6:5, green in bits 4:2, and blue in bits 1:0.
 
-`mandelbrot` renders every zoom frame coherently across four harts, uses exact cardioid and period-two-bulb rejection to skip interior work, and resets before float coordinate precision produces repeated columns. It reports its measured frame rate when interrupted. `badapple` streams the bundled delta-compressed animation from `/root/media/badapple.mvz`. `video-bench` measures the packed frame-submission path independently of rendering. All three are ordinary Linux programs, so their behavior can be changed without resynthesizing the FPGA.
+`mandelbrot` renders every zoom frame coherently across four harts, uses exact cardioid and period-two-bulb rejection to skip interior work, and resets before float coordinate precision produces repeated columns. It reports its measured frame rate when interrupted. `life` displays an interactive 80×45 Conway grid using 2×2 RGB232 cells and returns cleanly to the terminal on exit. `badapple` streams the bundled delta-compressed animation from `/root/media/badapple.mvz`. `video-bench` measures the packed frame-submission path independently of rendering. All four are ordinary Linux programs, so their behavior can be changed without resynthesizing the FPGA.
 
 ## Validated build
 
