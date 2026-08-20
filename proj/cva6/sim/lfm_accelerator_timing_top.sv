@@ -1,5 +1,6 @@
 module lfm_accelerator_timing_top (
     input  logic        clk_i,
+    input  logic        fp_clk_i,
     input  logic        rst_ni,
     input  logic [31:0] command_i,
     output logic [31:0] status_o,
@@ -109,7 +110,9 @@ module lfm_accelerator_timing_top (
         .ID_WIDTH(5)
     ) i_accelerator (
         .clk_i,
+        .fp_clk_i,
         .rst_ni,
+        .fp_rst_ni(rst_ni),
         .command_i,
         .status_o,
         .bus_request_o,

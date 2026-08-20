@@ -46,6 +46,7 @@ from pathlib import Path
 
 
 DEFAULT_MODEL = Path("/tmp/m.gguf")
+PACKED_MODEL = Path("/root/models/Bonsai-1.7B-packed.gguf")
 FALLBACK_MODEL = Path("/root/models/Bonsai-1.7B.gguf")
 DEFAULT_TOKENIZER = Path("/usr/share/bonsai/tokenizer.pickle")
 DEFAULT_DECODER = Path("/usr/bin/bonsai-lite")
@@ -209,9 +210,9 @@ def render_prompt(messages):
     text = ""
     for role, content in messages:
         if role == "assistant":
-            content = f"<think>\n\n</think>\n\n{content}"
+            content = f"<think></think>\n\n{content}"
         text += f"<|im_start|>{role}\n{content}<|im_end|>\n"
-    return text + "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    return text + "<|im_start|>assistant\n<think></think>\n\n"
 
 
 def wait_for_decoder(process, progress):
@@ -235,6 +236,10 @@ def wait_for_decoder(process, progress):
 
 def run_chat(args, tokens, token_to_id, merge_rank, progress):
     progress.update(0.50, "Starting model decoder")
+    runtime_env = os.environ.copy()
+    runtime_env.setdefault("BONSAI_MODEL", str(args.model))
+    if runtime_env.get("BONSAI_MODEL_PRESTAGED", "0") in ("", "0"):
+        runtime_env.setdefault("BONSAI_FAST_STAGE", "1")
     process = subprocess.Popen(
         [str(args.decoder), "--model", str(args.model), "--server",
          "--threads", str(args.threads)],
@@ -242,6 +247,7 @@ def run_chat(args, tokens, token_to_id, merge_rank, progress):
         stdout=subprocess.PIPE,
         text=True,
         bufsize=1,
+        env=runtime_env,
     )
     if process.stdin is None or process.stdout is None:
         raise RuntimeError("cannot open decoder pipes")
@@ -253,7 +259,9 @@ def run_chat(args, tokens, token_to_id, merge_rank, progress):
     print("FPGA-accelerated generation; measured prompt and decode rates are printed after each reply.")
     try:
         while True:
-            user = input("\nyou> ").strip()
+            user = input("\nyou> ")
+            turn_start = time.monotonic_ns()
+            user = user.strip()
             if user == "/quit":
                 break
             if user == "/clear":
@@ -264,6 +272,7 @@ def run_chat(args, tokens, token_to_id, merge_rank, progress):
                 continue
             messages.append(("user", user))
             ids = tokenize(render_prompt(messages), token_to_id, merge_rank)
+            tokenized_ns = time.monotonic_ns()
             if len(ids) + args.max_tokens >= MAX_CONTEXT:
                 messages.pop()
                 print("context limit reached; use /clear")
@@ -271,11 +280,16 @@ def run_chat(args, tokens, token_to_id, merge_rank, progress):
             request = f"RUN {args.max_tokens} {len(ids)} " + " ".join(map(str, ids)) + "\n"
             process.stdin.write(request)
             process.stdin.flush()
+            request_sent_ns = time.monotonic_ns()
             assistant = bytearray()
             eval_ns = []
+            output_tokens = 0
             prompt_tokens = 0
             cached_tokens = 0
             prompt_ns = 0
+            prompt_received_ns = 0
+            decode_end_received_ns = 0
+            first_token_received_ns = 0
             print("bonsai> ", end="", flush=True)
             while True:
                 line = process.stdout.readline().strip()
@@ -283,24 +297,45 @@ def run_chat(args, tokens, token_to_id, merge_rank, progress):
                     break
                 kind, *fields = line.split()
                 if kind == "PROMPT":
+                    prompt_received_ns = time.monotonic_ns()
                     if len(fields) == 2:
                         prompt_tokens, prompt_ns = map(int, fields)
                     else:
                         prompt_tokens, cached_tokens, prompt_ns = map(int, fields)
                 elif kind == "TOKEN":
+                    if first_token_received_ns == 0:
+                        first_token_received_ns = time.monotonic_ns()
                     token = int(fields[0])
                     if token not in EOS_TOKENS and token not in THINK_TOKENS:
+                        output_tokens += 1
                         data = decode_piece(tokens[token], decoder)
                         assistant.extend(data)
                         print(data.decode("utf-8", errors="replace"), end="", flush=True)
                 elif kind == "EVAL":
                     eval_ns.append(int(fields[0]))
+                elif kind == "DECODE_END":
+                    decode_end_received_ns = time.monotonic_ns()
+            turn_ns = time.monotonic_ns() - turn_start
             print()
             messages.append(("assistant", assistant.decode("utf-8", errors="replace")))
             prefill_tps = prompt_tokens * 1e9 / prompt_ns if prompt_ns else 0.0
             decode_tps = len(eval_ns) * 1e9 / sum(eval_ns) if eval_ns else 0.0
+            end_to_end_tps = output_tokens * 1e9 / turn_ns if turn_ns else 0.0
             cache_note = f", {cached_tokens} prompt tokens cached" if cached_tokens else ""
-            print(f"[{prefill_tps:.3f} prompt tok/s{cache_note}, {decode_tps:.3f} decode tok/s]")
+            print(f"[{prefill_tps:.3f} prompt tok/s{cache_note}, "
+                  f"{decode_tps:.3f} decode tok/s, "
+                  f"{end_to_end_tps:.3f} end-to-end tok/s "
+                  f"({output_tokens} tokens in {turn_ns / 1e9:.3f}s)]")
+            if os.environ.get("BONSAI_CHAT_TRACE"):
+                done_ns = time.monotonic_ns()
+                print(
+                    "[turn trace: "
+                    f"tokenize={(tokenized_ns - turn_start) / 1e9:.3f}s, "
+                    f"send={(request_sent_ns - tokenized_ns) / 1e9:.3f}s, "
+                    f"prompt={(prompt_received_ns - request_sent_ns) / 1e9:.3f}s, "
+                    f"decode={(decode_end_received_ns - prompt_received_ns) / 1e9:.3f}s, "
+                    f"result={(done_ns - decode_end_received_ns) / 1e9:.3f}s]"
+                )
     finally:
         if process.poll() is None:
             process.stdin.write("QUIT\n")
@@ -310,7 +345,20 @@ def run_chat(args, tokens, token_to_id, merge_rank, progress):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(prog="bonsai-chat", description="Chat with the standalone Bonsai-1.7B decoder")
-    default_model = DEFAULT_MODEL if DEFAULT_MODEL.exists() or not FALLBACK_MODEL.exists() else FALLBACK_MODEL
+    try:
+        packed_model_exists = PACKED_MODEL.exists()
+        default_model_exists = DEFAULT_MODEL.exists()
+    except OSError:
+        # A host-side serial client may not have permission to inspect the
+        # FPGA's absolute model paths. An explicit --model still works.
+        packed_model_exists = False
+        default_model_exists = False
+    if packed_model_exists:
+        default_model = PACKED_MODEL
+    elif default_model_exists:
+        default_model = DEFAULT_MODEL
+    else:
+        default_model = FALLBACK_MODEL
     parser.add_argument("--model", type=Path, default=default_model)
     parser.add_argument("--tokenizer", type=Path, default=DEFAULT_TOKENIZER)
     parser.add_argument("--decoder", type=Path, default=DEFAULT_DECODER)
@@ -336,7 +384,7 @@ def main(argv=None):
         prompt = render_prompt([("user", "Hello")])
         chat = tokenize(prompt, token_to_id, merge_rank)
         expected_chat = [151644, 872, 198, 9707, 151645, 198, 151644, 77091,
-                         198, 151667, 271, 151668, 271]
+                         198, 151667, 151668, 271]
         if chat != expected_chat:
             raise SystemExit(f"chat tokenizer mismatch\nexpected: {expected_chat}\nactual:   {chat}")
         continued = tokenize(

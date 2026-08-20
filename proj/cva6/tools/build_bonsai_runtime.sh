@@ -17,8 +17,10 @@ if [[ ! -x "$host/bin/riscv64-buildroot-linux-gnu-gcc" &&
 fi
 model="${BONSAI_MODEL_SOURCE:-$root/../../../Bonsai-1.7B.gguf}"
 manifest="$build/bonsai_model_manifest.h"
+rope_manifest="$build/bonsai_rope_manifest.h"
 accelerator_object="$build/bonsai_accelerator.o"
 matmul_object="$build/bonsai_matmul.o"
+attention_object="$build/bonsai_attention_cpu.o"
 host_python="${BONSAI_HOST_PYTHON:-/usr/bin/python3}"
 target_gcc="$host/bin/riscv64-buildroot-linux-gnu-gcc"
 target_gxx="$host/bin/riscv64-buildroot-linux-gnu-g++"
@@ -27,6 +29,10 @@ compiler_gxx="$root/tools/riscv64f-g++"
 target_march="${BONSAI_MARCH:-rv64imafc_zicsr_zifencei_zba_zbb_zbc_zbs_zicntr_zcb_zihpm}"
 target_mabi="${BONSAI_MABI:-lp64}"
 target_mtune="${BONSAI_MTUNE:-generic-ooo}"
+# FPNew's fused multiply-add path is not reliable in the current CVA6 FPGA
+# configuration. Keep the decoder on the validated standalone multiply and
+# add paths; placing this after -Ofast overrides its contraction default.
+lite_opt="${BONSAI_LITE_OPT:--Ofast -funroll-loops -ffp-contract=off}"
 
 if [[ ! -f "$llama_root/CMakeLists.txt" ]]; then
     echo "llama.cpp source is missing at $llama_root" >&2
@@ -44,8 +50,9 @@ fi
 mkdir -p "$build"
 PYTHONPATH="$llama_root/gguf-py" "$host_python" "$root/tools/build_bonsai_manifest.py" \
     "$model" "$manifest"
+"$host_python" "$root/tools/build_bonsai_rope.py" "$rope_manifest"
 "$target_gcc" \
-    -O3 -flto -Wall -Wextra -Werror -std=gnu11 -fPIC -pthread \
+    -O3 -ffp-contract=off -flto -Wall -Wextra -Werror -std=gnu11 -fPIC -pthread \
     "-march=$target_march" "-mabi=$target_mabi" "-mtune=$target_mtune" \
     -I"$build" -c "$root/software/bonsai_accelerator.c" \
     -o "$accelerator_object"
@@ -55,6 +62,10 @@ PYTHONPATH="$llama_root/gguf-py" "$host_python" "$root/tools/build_bonsai_manife
     -I"$llama_root/ggml/include" -I"$llama_root/ggml/src" \
     -I"$llama_root/ggml/src/ggml-cpu" \
     -c "$root/software/bonsai_matmul.c" -o "$matmul_object"
+"$target_gcc" \
+    -O3 -Wall -Wextra -Werror -std=gnu11 \
+    "-march=$target_march" "-mabi=$target_mabi" "-mtune=$target_mtune" \
+    -c "$root/software/bonsai_attention_cpu.c" -o "$attention_object"
 
 export CVA6_RISCV_GCC="$target_gcc"
 export CVA6_RISCV_GXX="$target_gxx"
@@ -98,9 +109,10 @@ install -m 0755 "$build/bin/llama-completion" "$target_dir/usr/bin/bonsai-runtim
 # Slim custom decoder: all Q1_0 matvecs through the whole-matrix accelerator
 # interface, everything else in tight scalar C with a small worker pool.
 "$target_gcc" \
-    -O3 -flto -Wall -Wextra -std=gnu11 -pthread \
+    $lite_opt -flto -Wall -Wextra -std=gnu11 -pthread \
     "-march=$target_march" "-mabi=$target_mabi" "-mtune=$target_mtune" \
     -I"$build" "$root/software/bonsai_main.c" "$accelerator_object" \
+    "$attention_object" \
     -lm -o "$build/bonsai-lite"
 install -m 0755 "$build/bonsai-lite" "$target_dir/usr/bin/bonsai-lite"
 "$host/bin/riscv64-buildroot-linux-gnu-strip" "$target_dir/usr/bin/bonsai-lite"

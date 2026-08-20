@@ -125,7 +125,11 @@ def upload_segment(port: serial.Serial, data: bytes, label: str, checksum: int) 
     started = time.monotonic()
     sent = 0
     next_report = 0
-    block_size = 4096
+    # Match loader/stage2.S. A 4 KiB ACK cadence paid the FTDI latency timer
+    # roughly sixty thousand times for a Bonsai restore and limited a 3 Mbaud
+    # link to about 126 KiB/s. The target still drains individual UART bytes;
+    # a larger logical block only reduces ACK round trips.
+    block_size = 16384
     while sent < len(data):
         block = data[sent : sent + block_size]
         port.write(block)

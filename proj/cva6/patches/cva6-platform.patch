@@ -165,7 +165,7 @@ index e45851138..01c91f7ce 100644
    localparam CVA6ConfigAxiAddrWidth = 64;
    localparam CVA6ConfigAxiDataWidth = 64;
    localparam CVA6ConfigFetchUserEn = 0;
-@@ -37,23 +39,31 @@ package cva6_config_pkg;
+@@ -37,23 +39,30 @@ package cva6_config_pkg;
    localparam CVA6ConfigDataUserEn = 0;
    localparam CVA6ConfigDataUserWidth = CVA6ConfigXlen;
  
@@ -182,10 +182,9 @@ index e45851138..01c91f7ce 100644
 +  localparam CVA6ConfigDcacheSetAssoc = 2;
    localparam CVA6ConfigDcacheLineWidth = 128;
  
-+  // Accelerator scratch and output memory is mapped uncached, while SMP stores
-+  // are broadcast to every private D$. A normal fence only needs to order the
-+  // write-through path; flushing the whole cache on every matvec would discard
-+  // hot model state hundreds of times per generated token.
++  // Accelerator outputs use an uncached mapping, while input stores pass
++  // through the write-through cache. FENCE must drain ordering state but must
++  // not walk and invalidate the entire D$ for every activation publication.
    localparam CVA6ConfigDcacheFlushOnFence = 1'b0;
    localparam CVA6ConfigDcacheFlushOnFenceI = 1'b0;
 -  localparam CVA6ConfigDcacheInvalidateOnFlush = 1'b0;
@@ -233,8 +232,7 @@ index e45851138..01c91f7ce 100644
        TechnoCut: bit'(0),
        SuperscalarEn: bit'(0),
        ALUBypass: bit'(0),
--      NrCommitPorts: unsigned'(2),
-+      NrCommitPorts: unsigned'(1),
+       NrCommitPorts: unsigned'(2),
        AxiAddrWidth: unsigned'(CVA6ConfigAxiAddrWidth),
        AxiDataWidth: unsigned'(CVA6ConfigAxiDataWidth),
        AxiIdWidth: unsigned'(CVA6ConfigAxiIdWidth),
@@ -347,7 +345,7 @@ index 3d6db4f3c..fb78db6d4 100644
 -# set for RuntimeOptimized implementation
 -set_property "steps.place_design.args.directive" "RuntimeOptimized" [get_runs impl_1]
 -set_property "steps.route_design.args.directive" "RuntimeOptimized" [get_runs impl_1]
-+# This design targets 100 MHz on the CVA6 clock and 200 MHz on the native DDR
++# This design targets 84 MHz on the CVA6 clock and 200 MHz on the native DDR
 +# interface, so favor timing closure and include post-route physical synthesis.
 +set_property strategy Performance_ExplorePostRoutePhysOpt [get_runs impl_1]
 +# Accelerator multicycle exceptions must be applied against the linked
@@ -714,7 +712,7 @@ index d1ec621e3..697986d3a 100644
  `ifdef PROTOCOL_CHECKER
  logic pc_status;
  
-@@ -1345,6 +1479,90 @@ xlnx_axi_clock_converter i_xlnx_axi_clock_converter_ddr (
+@@ -1345,6 +1479,91 @@ xlnx_axi_clock_converter i_xlnx_axi_clock_converter_ddr (
    .m_axi_rready   ( s_axi_rready     )
  );
  
@@ -771,6 +769,7 @@ index d1ec621e3..697986d3a 100644
 +    .ID_WIDTH(AxiIdWidthSlaves)
 +) i_lfm_matvec_accelerator (
 +    .clk_i         ( ddr_clock_out ),
++    .fp_clk_i      ( clk           ),
 +    .rst_ni        ( ndmreset_n    ),
 +    .command_i     ( led           ),
 +    .status_o      ( lfm_status_ddr),
@@ -810,7 +809,7 @@ index d1ec621e3..697986d3a 100644
  
  xlnx_clk_gen i_xlnx_clk_gen (
 -  .clk_out1 ( clk           ), // 50 MHz
-+  .clk_out1 ( clk           ), // 100 MHz
++  .clk_out1 ( clk           ), // 84 MHz
    .clk_out2 ( phy_tx_clk    ), // 125 MHz (for RGMII PHY)
    .clk_out3 ( eth_clk       ), // 125 MHz quadrature (90 deg phase shift)
    .clk_out4 ( sd_clk_sys    ), // 50 MHz clock
@@ -905,8 +904,8 @@ index e1fa839ae..dc1a39d1d 100644
  DRAM_SIZE_32 ?= 0x08000000 #128MB
 -CLOCK_FREQUENCY ?= 50000000 #50MHz
 -HALF_CLOCK_FREQUENCY ?= 25000000 #25MHz
-+CLOCK_FREQUENCY ?= 100000000 #100MHz
-+HALF_CLOCK_FREQUENCY ?= 50000000 #50MHz
++CLOCK_FREQUENCY ?= 84000000 #84MHz
++HALF_CLOCK_FREQUENCY ?= 42000000 #42MHz
  UART_BITRATE ?= 115200
  HAS_ETHERNET ?= 1
  endif
@@ -1195,7 +1194,7 @@ index 2754a49ff..febd6825e 100644
                          CONFIG.CLKOUT3_USED {true} \
                          CONFIG.CLKOUT4_USED {true} \
 -                        CONFIG.CLKOUT1_REQUESTED_OUT_FREQ {50} \
-+                        CONFIG.CLKOUT1_REQUESTED_OUT_FREQ {100} \
++                        CONFIG.CLKOUT1_REQUESTED_OUT_FREQ {84} \
                          CONFIG.CLKOUT2_REQUESTED_OUT_FREQ {125} \
                          CONFIG.CLKOUT3_REQUESTED_OUT_FREQ {125} \
                          CONFIG.CLKOUT3_REQUESTED_PHASE {90.000} \

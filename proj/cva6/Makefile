@@ -46,7 +46,7 @@ init:
 	./tools/apply_patches.sh
 
 sim:
-	mkdir -p build/sim/lfm build/sim/arbiter
+	mkdir -p build/sim/lfm build/sim/reader build/sim/arbiter build/sim/attention build/sim/residual
 	$(CC) -O2 -Wall -Wextra -Werror -std=gnu11 -pthread -Isoftware software/mandelbrot.c sim/mandelbrot_video_stub.c -lm -o build/sim/mandelbrot_test
 	build/sim/mandelbrot_test
 	$(CC) -O2 -Wall -Wextra -Werror -std=gnu11 -Isoftware software/life.c sim/mandelbrot_video_stub.c -o build/sim/life_test
@@ -57,8 +57,14 @@ sim:
 	cd $(CURDIR) && vvp build/sim/uart_rx_tb
 	iverilog -g2012 -s software_video_plane_tb -o build/sim/software_video_plane_tb rtl/software_video_plane.sv sim/software_video_plane_tb.sv
 	cd $(CURDIR) && vvp build/sim/software_video_plane_tb
-	verilator --binary --timing -Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-DECLFILENAME -Wno-TIMESCALEMOD -Ihardware/vendor/pulp-platform/axi/include --top-module lfm_matvec_accelerator_tb --Mdir build/sim/lfm/obj hardware/vendor/pulp-platform/axi/src/axi_pkg.sv hardware/vendor/pulp-platform/axi/src/axi_intf.sv rtl/lfm_axi_byte_reader.sv rtl/lfm_matvec_accelerator.sv sim/lfm_matvec_accelerator_tb.sv
+	verilator --binary --timing -Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-DECLFILENAME -Wno-TIMESCALEMOD -Ihardware/vendor/pulp-platform/common_cells/include -Ihardware/core/cvfpu/src --top-module bonsai_attention_tb --Mdir build/sim/attention/obj hardware/core/cvfpu/src/fpnew_pkg.sv hardware/vendor/pulp-platform/common_cells/src/cf_math_pkg.sv hardware/vendor/pulp-platform/common_cells/src/lzc.sv hardware/core/cvfpu/src/fpnew_classifier.sv hardware/core/cvfpu/src/fpnew_rounding.sv hardware/core/cvfpu/src/fpnew_fma.sv rtl/bonsai_fp32_pipe.sv rtl/bonsai_ffn_packer.sv rtl/bonsai_attention.sv sim/bonsai_attention_tb.sv
+	build/sim/attention/obj/Vbonsai_attention_tb
+	verilator --binary --timing -Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-DECLFILENAME -Wno-TIMESCALEMOD -Ihardware/vendor/pulp-platform/common_cells/include -Ihardware/core/cvfpu/src --top-module bonsai_residual_tb --Mdir build/sim/residual/obj hardware/core/cvfpu/src/fpnew_pkg.sv hardware/vendor/pulp-platform/common_cells/src/cf_math_pkg.sv hardware/vendor/pulp-platform/common_cells/src/lzc.sv hardware/core/cvfpu/src/fpnew_classifier.sv hardware/core/cvfpu/src/fpnew_rounding.sv hardware/core/cvfpu/src/fpnew_fma.sv rtl/bonsai_fp32_pipe.sv rtl/bonsai_fp32_alu.sv rtl/bonsai_residual.sv sim/bonsai_residual_tb.sv
+	build/sim/residual/obj/Vbonsai_residual_tb
+	verilator --binary --timing -Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-DECLFILENAME -Wno-TIMESCALEMOD -Ihardware/vendor/pulp-platform/axi/include -Ihardware/vendor/pulp-platform/common_cells/include -Ihardware/core/cvfpu/src --top-module lfm_matvec_accelerator_tb --Mdir build/sim/lfm/obj hardware/vendor/pulp-platform/axi/src/axi_pkg.sv hardware/vendor/pulp-platform/axi/src/axi_intf.sv hardware/core/cvfpu/src/fpnew_pkg.sv hardware/vendor/pulp-platform/common_cells/src/cf_math_pkg.sv hardware/vendor/pulp-platform/common_cells/src/lzc.sv hardware/core/cvfpu/src/fpnew_classifier.sv hardware/core/cvfpu/src/fpnew_rounding.sv hardware/core/cvfpu/src/fpnew_fma.sv rtl/bonsai_fp32_pipe.sv rtl/bonsai_fp32_alu.sv rtl/bonsai_fp32_cdc.sv rtl/bonsai_ffn_packer.sv rtl/bonsai_residual.sv rtl/bonsai_attention.sv rtl/lfm_axi_byte_reader.sv rtl/lfm_matvec_accelerator.sv sim/lfm_matvec_accelerator_tb.sv
 	build/sim/lfm/obj/Vlfm_matvec_accelerator_tb
+	verilator --binary --timing -Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNUSEDSIGNAL --top-module lfm_axi_byte_reader_tb --Mdir build/sim/reader/obj rtl/lfm_axi_byte_reader.sv sim/lfm_axi_byte_reader_tb.sv
+	build/sim/reader/obj/Vlfm_axi_byte_reader_tb
 	verilator --binary --timing -Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-DECLFILENAME -Wno-TIMESCALEMOD -Ihardware/vendor/pulp-platform/axi/include --top-module lfm_axi_arbiter_tb --Mdir build/sim/arbiter/obj hardware/vendor/pulp-platform/axi/src/axi_pkg.sv hardware/vendor/pulp-platform/axi/src/axi_intf.sv rtl/lfm_axi_arbiter.sv sim/lfm_axi_arbiter_tb.sv
 	build/sim/arbiter/obj/Vlfm_axi_arbiter_tb
 
@@ -79,6 +85,10 @@ smp-smoke:
 smp-cache-stress:
 	mkdir -p build/diagnostics
 	build/buildroot/host/bin/riscv64-buildroot-linux-gnu-gcc -O3 -Wall -Wextra -Werror -std=gnu11 -pthread -march=rv64imafc_zicsr_zifencei -mabi=lp64 diagnostics/smp_cache_stress.c -o build/diagnostics/smp_cache_stress
+
+accelerator-probe:
+	mkdir -p build/diagnostics
+	build/buildroot/host/bin/riscv64-buildroot-linux-gnu-gcc -O2 -Wall -Wextra -Werror -std=gnu11 -march=rv64imafc_zicsr_zifencei -mabi=lp64 diagnostics/bonsai_accelerator_probe.c -o build/diagnostics/bonsai-accelerator-probe
 
 monitor:
 	SERIAL=$(SERIAL) UART_BAUD=$(UART_BAUD) ./tools/monitor.sh

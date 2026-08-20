@@ -6,6 +6,87 @@
 // toggles DONE, and releases the bus so the CPU resumes.
 module lfm_system_integration_tb;
 
+    function automatic logic [32:0] round_integer_to_fp32_precision(
+        input logic [31:0] magnitude);
+        logic [32:0] significand;
+        logic [31:0] low_mask;
+        integer msb;
+        integer shift;
+        integer bit_index;
+        begin
+            msb = 0;
+            for (bit_index = 0; bit_index < 32; bit_index = bit_index + 1)
+                if (magnitude[bit_index]) msb = bit_index;
+            if (magnitude == 0 || msb <= 23) begin
+                round_integer_to_fp32_precision = {1'b0, magnitude};
+            end else begin
+                shift = msb - 23;
+                significand = {1'b0, magnitude >> shift};
+                low_mask = shift > 1 ?
+                    ((32'd1 << (shift - 1)) - 32'd1) : 32'd0;
+                if (magnitude[shift - 1] &&
+                    (|(magnitude & low_mask) || significand[0]))
+                    significand = significand + 33'd1;
+                round_integer_to_fp32_precision = significand << shift;
+            end
+        end
+    endfunction
+
+    function automatic logic [31:0] q30_float_reference(
+        input logic signed [63:0] value);
+        logic sign;
+        logic [64:0] magnitude;
+        logic [65:0] significand;
+        logic [64:0] low_mask;
+        logic signed [32:0] rounded_high;
+        logic [32:0] rounded_low;
+        logic signed [64:0] split_value;
+        integer msb;
+        integer shift;
+        integer exponent;
+        integer bit_index;
+        begin
+            rounded_high = value[63] ?
+                -$signed(round_integer_to_fp32_precision(
+                    ~value[63:32] + 32'd1)) :
+                 $signed(round_integer_to_fp32_precision(value[63:32]));
+            rounded_low = round_integer_to_fp32_precision(value[31:0]);
+            split_value =
+                ($signed({{32{rounded_high[32]}}, rounded_high}) <<< 32) +
+                $signed({32'b0, rounded_low});
+            if (split_value == 0) begin
+                q30_float_reference = 32'b0;
+            end else begin
+                sign = split_value[64];
+                magnitude = sign ? (~$unsigned(split_value) + 65'd1) :
+                                   $unsigned(split_value);
+                msb = 0;
+                for (bit_index = 0; bit_index < 65;
+                     bit_index = bit_index + 1)
+                    if (magnitude[bit_index]) msb = bit_index;
+                exponent = msb + 97;
+                significand = '0;
+                if (msb <= 23) begin
+                    significand = {1'b0, magnitude} << (23 - msb);
+                end else begin
+                    shift = msb - 23;
+                    significand = {1'b0, magnitude >> shift};
+                    low_mask = shift > 1 ?
+                        ((65'd1 << (shift - 1)) - 65'd1) : 65'd0;
+                    if (magnitude[shift - 1] &&
+                        (|(magnitude & low_mask) || significand[0]))
+                        significand = significand + 66'd1;
+                    if (significand[24]) begin
+                        significand = significand >> 1;
+                        exponent = exponent + 1;
+                    end
+                end
+                q30_float_reference =
+                    {sign, exponent[7:0], significand[22:0]};
+            end
+        end
+    endfunction
+
     localparam logic [29:0] MODEL_BASE = 30'h2f00_0000;
     localparam integer MEMORY_BYTES = 4 * 1024 * 1024;
     localparam integer INPUT_OFFSET = 32'h0000_0000;
@@ -42,7 +123,9 @@ module lfm_system_integration_tb;
 
     lfm_matvec_accelerator #(.ID_WIDTH(5)) dut (
         .clk_i(clk),
+        .fp_clk_i(clk),
         .rst_ni(rst_n),
+        .fp_rst_ni(rst_n),
         .command_i(command),
         .status_o(status),
         .bus_request_o(request),
@@ -408,9 +491,12 @@ module lfm_system_integration_tb;
                 actual = 0;
                 for (j = 0; j < 8; j = j + 1)
                     actual[j*8 +: 8] = memory[OUTPUT_OFFSET + row * 8 + j];
-                if (actual !== expected)
-                    $fatal(1, "integration Q1 %0dx%0d row %0d mismatch: got %0d expected %0d",
-                           ne0, ne1, row, actual, expected);
+                if (actual[63:32] !== 32'b0 ||
+                    actual[31:0] !== q30_float_reference(expected))
+                    $fatal(1,
+                           "integration Q1 %0dx%0d row %0d mismatch: got %h expected %h",
+                           ne0, ne1, row, actual[31:0],
+                           q30_float_reference(expected));
             end
             if (request || grant)
                 $fatal(1, "bus not released after completion");

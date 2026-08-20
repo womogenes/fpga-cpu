@@ -96,8 +96,11 @@ int main(int argc, char **argv) {
     fail("atexit");
   struct termios raw = saved_termios;
   cfmakeraw(&raw);
-  raw.c_cc[VMIN] = 0;
-  raw.c_cc[VTIME] = 50;
+  /* A tty read with VMIN=0 reports a timeout as a zero-length read.  That is
+     not EOF, but read_all() quite reasonably treated it as such and aborted
+     a live upload between blocks.  Block for at least one byte instead. */
+  raw.c_cc[VMIN] = 1;
+  raw.c_cc[VTIME] = 0;
   if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0)
     fail("tcsetattr raw");
   restore_pending = 1;

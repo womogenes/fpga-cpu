@@ -1,0 +1,9 @@
+#!/bin/sh
+
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /mnt
+mount -t ext4 /dev/mmcblk0p3 /mnt || exec sh
+cp /recovery/libc.so.6 /mnt/lib/libc.so.6 || exec sh
+sync
+echo RECOVERY_OK
+exec sh

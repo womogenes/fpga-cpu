@@ -7,7 +7,7 @@ output="$root/build/gateware"
 bitstream="$output/cva6_genesys2_hdmi.bit"
 hash_file="$output/inputs.sha256"
 uart_baud="${UART_BAUD:-3000000}"
-cpu_frequency=100000000
+cpu_frequency=84000000
 uart_reference_frequency=96000000
 
 mkdir -p "$output"

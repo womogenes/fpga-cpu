@@ -20,6 +20,8 @@ def drain(port: serial.Serial, duration: float) -> bytes:
         chunk = port.read(4096)
         if chunk:
             data.extend(chunk)
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
             deadline = time.monotonic() + duration
     return bytes(data)
 
@@ -43,8 +45,14 @@ def main() -> None:
     parser.add_argument("--interrupt", action="store_true",
                         help="send Ctrl-C first to clear a stuck foreground "
                              "process")
+    parser.add_argument("--cancel-ymodem", action="store_true",
+                        help="send the double-CAN sequence that aborts a U-Boot YMODEM receive")
     parser.add_argument("--script", type=argparse.FileType("r"),
                         help="file with one command per line")
+    parser.add_argument("--listen-only", action="store_true",
+                        help="only capture output; do not send the initial carriage return")
+    parser.add_argument("--no-wake", action="store_true",
+                        help="send commands without a leading carriage return (useful at U-Boot)")
     args = parser.parse_args()
 
     commands = list(args.cmd)
@@ -55,6 +63,10 @@ def main() -> None:
                 commands.append(line)
 
     with serial.Serial(args.serial, args.baud, timeout=0.1) as port:
+        if args.cancel_ymodem:
+            port.write(b"\x18\x18")
+            port.flush()
+            time.sleep(0.5)
         if args.interrupt:
             port.write(b"\x03")
             port.flush()
@@ -62,13 +74,15 @@ def main() -> None:
             port.write(b"\x03")
             port.flush()
             time.sleep(0.5)
-        send_paced(port, "\r", args.char_delay_us / 1_000_000)
-        sys.stdout.write(drain(port, 1.0).decode(errors="replace"))
+        if args.listen_only:
+            drain(port, args.idle_timeout)
+            return
+        if not args.no_wake:
+            send_paced(port, "\r", args.char_delay_us / 1_000_000)
+            drain(port, 1.0)
         for command in commands:
             send_paced(port, command + "\r", args.char_delay_us / 1_000_000)
-            output = drain(port, args.idle_timeout)
-            sys.stdout.write(output.decode(errors="replace"))
-            sys.stdout.flush()
+            drain(port, args.idle_timeout)
 
 
 if __name__ == "__main__":

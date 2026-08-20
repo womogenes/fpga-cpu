@@ -18,7 +18,10 @@
     .equ SMP_RELEASE,     0x534d504c
     .equ MAX_IMAGE_SIZE,  0x2f000000
     .equ MAX_MODEL_SIZE,  0x0f000000
-    .equ BLOCK_SIZE,      4096
+    /* Amortize the FTDI USB latency timer over a larger acknowledged burst.
+       The receiver still polls the UART byte-by-byte, so this changes only
+       ACK frequency and does not increase the FPGA FIFO requirement. */
+    .equ BLOCK_SIZE,      16384
 
 _start:
     mv      s11, a1

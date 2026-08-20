@@ -88,12 +88,12 @@ def synchronize_shell(port: serial.Serial, allow_login: bool) -> None:
     port.reset_input_buffer()
     port.write(b"\n")
     port.flush()
-    state = wait_for_any(port, (b"buildroot login:", b"# "), 600.0)
+    state = wait_for_any(port, (b"buildroot login:", b"# ", b"$ "), 600.0)
     if state == b"buildroot login:":
         if not allow_login:
             raise RuntimeError("Linux is at the login prompt; omit --already-logged-in")
         write_paced(port, b"root\n", 200, 1)
-        wait_for(port, b"# ", 30.0)
+        wait_for_any(port, (b"# ", b"$ "), 30.0)
 
 
 def main() -> None:

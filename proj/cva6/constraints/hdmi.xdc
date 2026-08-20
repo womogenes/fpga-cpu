@@ -33,6 +33,11 @@ set_clock_groups -asynchronous \
 # stretch this crossing.
 set_max_delay -datapath_only 5.0 -to [get_pins {i_soc/i_lfm_matvec_accelerator/command_meta_reg[*]/D}]
 
+# The FFN controller state is sampled only for watchdog diagnostics. It crosses
+# from the CPU/FP clock into the DDR UI clock through ffn_debug_state_meta_reg;
+# as with the UART synchronizer above, only this first stage is asynchronous.
+set_false_path -to [get_pins {i_soc/i_lfm_matvec_accelerator/ffn_debug_state_meta_reg[*]/D}]
+
 # The accelerator and its AXI register slice deassert their asynchronous reset
 # through the main reset synchronizer while the DDR domain is quiescent, so
 # recovery/removal timing on the released edge is not functional.
