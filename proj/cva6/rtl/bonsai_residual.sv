@@ -67,9 +67,9 @@ module bonsai_residual #(
     logic [31:0] fp_result;
     logic fp_result_valid;
     logic fp_waiting;
-    logic [1:0] fp_operation_hold;
-    logic [31:0] fp_a_hold;
-    logic [31:0] fp_b_hold;
+    (* dont_touch = "yes" *) logic [1:0] fp_operation_hold;
+    (* dont_touch = "yes" *) logic [31:0] fp_a_hold;
+    (* dont_touch = "yes" *) logic [31:0] fp_b_hold;
     logic [3:0] fp_latency_count;
     logic fp_active;
 

@@ -345,7 +345,7 @@ index 3d6db4f3c..fb78db6d4 100644
 -# set for RuntimeOptimized implementation
 -set_property "steps.place_design.args.directive" "RuntimeOptimized" [get_runs impl_1]
 -set_property "steps.route_design.args.directive" "RuntimeOptimized" [get_runs impl_1]
-+# This design targets 84 MHz on the CVA6 clock and 200 MHz on the native DDR
++# This design targets 94 MHz on the CVA6 clock and 200 MHz on the native DDR
 +# interface, so favor timing closure and include post-route physical synthesis.
 +set_property strategy Performance_ExplorePostRoutePhysOpt [get_runs impl_1]
 +# Accelerator multicycle exceptions must be applied against the linked
@@ -809,7 +809,7 @@ index d1ec621e3..697986d3a 100644
  
  xlnx_clk_gen i_xlnx_clk_gen (
 -  .clk_out1 ( clk           ), // 50 MHz
-+  .clk_out1 ( clk           ), // 84 MHz
++  .clk_out1 ( clk           ), // 94 MHz
    .clk_out2 ( phy_tx_clk    ), // 125 MHz (for RGMII PHY)
    .clk_out3 ( eth_clk       ), // 125 MHz quadrature (90 deg phase shift)
    .clk_out4 ( sd_clk_sys    ), // 50 MHz clock
@@ -904,14 +904,14 @@ index e1fa839ae..dc1a39d1d 100644
  DRAM_SIZE_32 ?= 0x08000000 #128MB
 -CLOCK_FREQUENCY ?= 50000000 #50MHz
 -HALF_CLOCK_FREQUENCY ?= 25000000 #25MHz
-+CLOCK_FREQUENCY ?= 84000000 #84MHz
-+HALF_CLOCK_FREQUENCY ?= 42000000 #42MHz
++CLOCK_FREQUENCY ?= 94000000 #94MHz
++HALF_CLOCK_FREQUENCY ?= 47000000 #47MHz
  UART_BITRATE ?= 115200
  HAS_ETHERNET ?= 1
  endif
  
 +UART_CLOCK_FREQUENCY ?= $(CLOCK_FREQUENCY)
-+NUM_CORES ?= 4
++NUM_CORES ?= 2
 +
  ifeq ($(CC),cc)
    CC = $(RISCV)/bin/${CROSSCOMPILE}gcc
@@ -971,7 +971,7 @@ index 6f0095ae2..7b483d730 100644
 +      clock-frequency = <CLOCK_FREQUENCY>;
 +      device_type = "cpu";
 +      reg = <2>;
-+      status = "okay";
++      status = "disabled";
 +      compatible = "eth, ariane", "riscv";
 +      riscv,isa = "rv64imafc";
 +      mmu-type = "riscv,sv39";
@@ -986,7 +986,7 @@ index 6f0095ae2..7b483d730 100644
 +      clock-frequency = <CLOCK_FREQUENCY>;
 +      device_type = "cpu";
 +      reg = <3>;
-+      status = "okay";
++      status = "disabled";
 +      compatible = "eth, ariane", "riscv";
 +      riscv,isa = "rv64imafc";
 +      mmu-type = "riscv,sv39";
@@ -1194,7 +1194,7 @@ index 2754a49ff..febd6825e 100644
                          CONFIG.CLKOUT3_USED {true} \
                          CONFIG.CLKOUT4_USED {true} \
 -                        CONFIG.CLKOUT1_REQUESTED_OUT_FREQ {50} \
-+                        CONFIG.CLKOUT1_REQUESTED_OUT_FREQ {84} \
++                        CONFIG.CLKOUT1_REQUESTED_OUT_FREQ {94} \
                          CONFIG.CLKOUT2_REQUESTED_OUT_FREQ {125} \
                          CONFIG.CLKOUT3_REQUESTED_OUT_FREQ {125} \
                          CONFIG.CLKOUT3_REQUESTED_PHASE {90.000} \
@@ -1258,9 +1258,9 @@ index 778548531..ae66fc17b 100644
  // Author: Florian Zaruba, ETH Zurich
  // Description: Contains SoC information as constants
  package ariane_soc;
-+  // Four RV64IMAFC harts use the XC7K325T efficiently without carrying the
-+  // much larger double-precision, crypto, trace, and per-core debug logic.
-+  localparam int unsigned NumCores = 4;
++  // Bonsai uses two worker threads. Keep exactly two RV64IMAFC harts so the
++  // router can place the CPUs and accelerator tightly enough for 94 MHz.
++  localparam int unsigned NumCores = 2;
    // M-Mode Hart, S-Mode Hart
 -  localparam int unsigned NumTargets = 2;
 +  localparam int unsigned NumTargets = 2 * NumCores;
