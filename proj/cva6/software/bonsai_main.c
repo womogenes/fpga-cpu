@@ -3038,6 +3038,7 @@ static int run_server(void) {
   uint32_t cached_count = 0u;
   uint32_t cached_next = 0u;
   const int stream_phases = getenv("BONSAI_STREAM_PHASES") != NULL;
+  const int stream_tokens = getenv("BONSAI_STREAM_TOKENS") != NULL;
   /* stdout is a UART tty, so libc otherwise flushes every newline. A normal
      48-token reply contains about 100 protocol lines; buffer each logical
      phase and retain the explicit flushes below to collapse those writes. */
@@ -3088,17 +3089,27 @@ static int run_server(void) {
       uint32_t emitted = next;
       generated_tokens[generated_count] = emitted;
       ++generated_count;
+      if (stream_tokens) {
+        printf("TOKEN %u\n", emitted);
+        fflush(stdout);
+      }
       if (emitted == 151643u || emitted == 151645u) break;
       /* The final requested token is already known. Do not evaluate it only
          to compute a next token that this response will never emit. If a
          later chat turn includes it in the history, ordinary prefix replay
          evaluates it then. */
       if (i + 1u == max_tokens) break;
+      uint64_t eval_start = stream_tokens ? now_ns() : 0u;
       cached_tokens[position] = emitted;
       next = forward(&g_model, &g_state, emitted, position++);
       cached_count = position;
       cached_next = next;
       ++evaluated_count;
+      if (stream_tokens) {
+        printf("EVAL %llu\n",
+               (unsigned long long)(now_ns() - eval_start));
+        fflush(stdout);
+      }
     }
     uint64_t decode_elapsed = now_ns() - decode_start;
     printf("DECODE_END\n");
@@ -3106,11 +3117,14 @@ static int run_server(void) {
     /* Keep the UART record compact. The host serial bridge expands this back
        into TOKEN/EVAL/DONE records for existing clients. All evaluated tokens
        precede the one final token whose next-token evaluation is skipped. */
-    printf("RESULT %u %u %llu", generated_count, evaluated_count,
-           (unsigned long long)decode_elapsed);
-    for (uint32_t i = 0u; i < generated_count; ++i)
-      printf(" %u", generated_tokens[i]);
-    printf("\nDONE\n");
+    if (!stream_tokens) {
+      printf("RESULT %u %u %llu", generated_count, evaluated_count,
+             (unsigned long long)decode_elapsed);
+      for (uint32_t i = 0u; i < generated_count; ++i)
+        printf(" %u", generated_tokens[i]);
+      printf("\n");
+    }
+    printf("DONE\n");
     fflush(stdout);
   }
   return 0;
