@@ -47,7 +47,7 @@
       clock-frequency = <CLOCK_FREQUENCY>;
       device_type = "cpu";
       reg = <2>;
-      status = "okay";
+      status = "disabled";
       compatible = "eth, ariane", "riscv";
       riscv,isa = "rv64imafc";
       mmu-type = "riscv,sv39";
@@ -62,7 +62,7 @@
       clock-frequency = <CLOCK_FREQUENCY>;
       device_type = "cpu";
       reg = <3>;
-      status = "okay";
+      status = "disabled";
       compatible = "eth, ariane", "riscv";
       riscv,isa = "rv64imafc";
       mmu-type = "riscv,sv39";

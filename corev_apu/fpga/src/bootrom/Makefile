@@ -25,7 +25,7 @@ HAS_ETHERNET ?= 1
 endif
 
 UART_CLOCK_FREQUENCY ?= $(CLOCK_FREQUENCY)
-NUM_CORES ?= 4
+NUM_CORES ?= 2
 
 ifeq ($(CC),cc)
   CC = $(RISCV)/bin/${CROSSCOMPILE}gcc

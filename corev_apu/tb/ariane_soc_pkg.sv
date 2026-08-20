@@ -11,9 +11,10 @@
 // Author: Florian Zaruba, ETH Zurich
 // Description: Contains SoC information as constants
 package ariane_soc;
-  // Four RV64IMAFC harts use the XC7K325T efficiently without carrying the
-  // much larger double-precision, crypto, trace, and per-core debug logic.
-  localparam int unsigned NumCores = 4;
+  // Bonsai uses two worker threads.  Keep exactly two RV64IMAFC harts so the
+  // router can place the CPUs and accelerator tightly enough for a higher
+  // clock instead of spending fabric and routing on two idle cores.
+  localparam int unsigned NumCores = 2;
   // M-Mode Hart, S-Mode Hart
   localparam int unsigned NumTargets = 2 * NumCores;
   // Uart, SPI, Ethernet, reserved
