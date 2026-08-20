@@ -18,7 +18,10 @@ ips := xlnx_axi_clock_converter.xci  \
 ips := $(addprefix $(work-dir)/, $(ips))
 ips-target := $(join $(addsuffix /ip/, $(addprefix $(ip-dir)/, $(basename $(ips)))), $(ips))
 
-all: $(mcs)
+# The deployment flow programs SRAM over JTAG and never consumes the flash
+# image. Stop after the bitstream so the second Vivado invocation does not
+# recreate the project and discard the routed checkpoints and reports.
+all: $(bit)
 
 # Generate mcs from bitstream
 $(mcs): $(bit)

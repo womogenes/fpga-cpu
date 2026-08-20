@@ -48,10 +48,9 @@ package cva6_config_pkg;
   localparam CVA6ConfigDcacheSetAssoc = 2;
   localparam CVA6ConfigDcacheLineWidth = 128;
 
-  // Accelerator scratch and output memory is mapped uncached, while SMP stores
-  // are broadcast to every private D$. A normal fence only needs to order the
-  // write-through path; flushing the whole cache on every matvec would discard
-  // hot model state hundreds of times per generated token.
+  // Accelerator outputs use an uncached mapping, while input stores pass
+  // through the write-through cache. FENCE must drain ordering state but must
+  // not walk and invalidate the entire D$ for every activation publication.
   localparam CVA6ConfigDcacheFlushOnFence = 1'b0;
   localparam CVA6ConfigDcacheFlushOnFenceI = 1'b0;
   localparam CVA6ConfigDcacheInvalidateOnFlush = 1'b1;
@@ -96,7 +95,7 @@ package cva6_config_pkg;
       TechnoCut: bit'(0),
       SuperscalarEn: bit'(0),
       ALUBypass: bit'(0),
-      NrCommitPorts: unsigned'(1),
+      NrCommitPorts: unsigned'(2),
       AxiAddrWidth: unsigned'(CVA6ConfigAxiAddrWidth),
       AxiDataWidth: unsigned'(CVA6ConfigAxiDataWidth),
       AxiIdWidth: unsigned'(CVA6ConfigAxiIdWidth),

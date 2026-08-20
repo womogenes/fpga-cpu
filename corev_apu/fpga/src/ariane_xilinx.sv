@@ -291,6 +291,10 @@ logic sd_clk_sys;
 
 logic ddr_sync_reset;
 logic ddr_clock_out;
+(* async_reg = "true" *) logic [3:0] lfm_ddr_reset_sync;
+logic lfm_ddr_reset_n;
+(* async_reg = "true" *) logic [3:0] lfm_fp_reset_sync;
+logic lfm_fp_reset_n;
 
 logic rst_n, rst;
 logic rtc;
@@ -316,6 +320,33 @@ logic pll_locked;
 logic [31:0] lfm_status_ddr;
 logic [23:0] lfm_status_meta;
 logic [23:0] lfm_status_sync;
+
+// Assert both accelerator resets asynchronously, then release each only in
+// its consuming clock domain. Global buffers keep recovery skew bounded even
+// though the CVFPU pipeline and DDR engine each have a large reset fanout.
+always_ff @(posedge ddr_clock_out or negedge ndmreset_n) begin
+  if (!ndmreset_n)
+    lfm_ddr_reset_sync <= '0;
+  else
+    lfm_ddr_reset_sync <= {lfm_ddr_reset_sync[2:0], 1'b1};
+end
+
+always_ff @(posedge clk or negedge ndmreset_n) begin
+  if (!ndmreset_n)
+    lfm_fp_reset_sync <= '0;
+  else
+    lfm_fp_reset_sync <= {lfm_fp_reset_sync[2:0], 1'b1};
+end
+
+BUFG i_lfm_ddr_reset_buf (
+  .I ( lfm_ddr_reset_sync[3] ),
+  .O ( lfm_ddr_reset_n       )
+);
+
+BUFG i_lfm_fp_reset_buf (
+  .I ( lfm_fp_reset_sync[3] ),
+  .O ( lfm_fp_reset_n       )
+);
 
 always_ff @(posedge clk or negedge ndmreset_n) begin
   if (!ndmreset_n) begin
@@ -1437,7 +1468,7 @@ xlnx_axi_clock_converter i_xlnx_axi_clock_converter_ddr (
   .s_axi_rready   ( dram.r_ready     ),
   // to size converter
   .m_axi_aclk     ( ddr_clock_out    ),
-  .m_axi_aresetn  ( ndmreset_n       ),
+  .m_axi_aresetn  ( lfm_ddr_reset_n  ),
   .m_axi_awid     ( s_axi_awid       ),
   .m_axi_awaddr   ( s_axi_awaddr     ),
   .m_axi_awlen    ( s_axi_awlen      ),
@@ -1532,7 +1563,9 @@ lfm_matvec_accelerator #(
     .ID_WIDTH(AxiIdWidthSlaves)
 ) i_lfm_matvec_accelerator (
     .clk_i         ( ddr_clock_out ),
-    .rst_ni        ( ndmreset_n    ),
+    .fp_clk_i      ( clk           ),
+    .rst_ni        ( lfm_ddr_reset_n ),
+    .fp_rst_ni     ( lfm_fp_reset_n ),
     .command_i     ( led           ),
     .status_o      ( lfm_status_ddr),
     .bus_request_o ( lfm_bus_request ),
@@ -1548,14 +1581,14 @@ axi_cut_intf #(
     .USER_WIDTH ( AxiUserWidth     )
 ) i_lfm_axi_cut (
     .clk_i  ( ddr_clock_out ),
-    .rst_ni ( ndmreset_n    ),
+    .rst_ni ( lfm_ddr_reset_n ),
     .in     ( lfm_ddr_ui    ),
     .out    ( lfm_ddr_cut   )
 );
 
 lfm_axi_arbiter i_lfm_axi_arbiter (
     .clk_i                 ( ddr_clock_out  ),
-    .rst_ni                ( ndmreset_n     ),
+    .rst_ni                ( lfm_ddr_reset_n ),
     .accelerator_request_i ( lfm_bus_request),
     .accelerator_grant_o   ( lfm_bus_grant  ),
     .cpu                    ( cpu_ddr_ui      ),
@@ -1578,7 +1611,7 @@ xlnx_clk_gen i_xlnx_clk_gen (
 `else
 
 xlnx_clk_gen i_xlnx_clk_gen (
-  .clk_out1 ( clk           ), // 100 MHz
+  .clk_out1 ( clk           ), // 84 MHz
   .clk_out2 ( phy_tx_clk    ), // 125 MHz (for RGMII PHY)
   .clk_out3 ( eth_clk       ), // 125 MHz quadrature (90 deg phase shift)
   .clk_out4 ( sd_clk_sys    ), // 50 MHz clock

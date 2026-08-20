@@ -90,7 +90,10 @@ module fpu_wrap
         },  // CONV
         UnitTypes: '{
             '{default: fpnew_pkg::PARALLEL},  // ADDMUL
-            '{default: fpnew_pkg::MERGED},  // DIVSQRT
+            // The FPGA build deliberately omits DIVSQRT. The vendor unit's
+            // FP32 divide path is unreliable on this target, and hot software
+            // uses multiply-only Newton iterations instead.
+            '{default: fpnew_pkg::DISABLED},  // DIVSQRT
             '{default: fpnew_pkg::PARALLEL},  // NONCOMP
             '{default: fpnew_pkg::MERGED}
         },  // CONV

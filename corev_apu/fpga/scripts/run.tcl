@@ -101,7 +101,7 @@ report_utilization -hierarchical                                        -file re
 report_cdc                                                              -file reports/$project.cdc.rpt
 report_clock_interaction                                                -file reports/$project.clock_interaction.rpt
 
-# This design targets 100 MHz on the CVA6 clock and 200 MHz on the native DDR
+# This design targets 90 MHz on the CVA6 clock and 200 MHz on the native DDR
 # interface, so favor timing closure and include post-route physical synthesis.
 set_property strategy Performance_ExplorePostRoutePhysOpt [get_runs impl_1]
 # Accelerator multicycle exceptions must be applied against the linked
