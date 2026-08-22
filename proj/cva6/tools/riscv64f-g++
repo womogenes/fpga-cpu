@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+compiler="${CVA6_RISCV_GXX:?CVA6_RISCV_GXX is not set}"
+march="${CVA6_RISCV_MARCH:-rv64imafc_zicsr_zifencei_zbc_zicntr_zcb_zihpm}"
+mabi="${CVA6_RISCV_MABI:-lp64}"
+arguments=()
+
+for argument in "$@"; do
+    case "$argument" in
+        -march=*|-mabi=*) ;;
+        *) arguments+=("$argument") ;;
+    esac
+done
+
+exec "$compiler" "${arguments[@]}" "-march=$march" "-mabi=$mabi"

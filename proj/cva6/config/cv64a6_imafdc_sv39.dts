@@ -11,21 +11,78 @@
   cpus {
     #address-cells = <1>;
     #size-cells = <0>;
-    timebase-frequency = <50000000>;
+    timebase-frequency = <47000000>;
     CPU0: cpu@0 {
-      clock-frequency = <100000000>;
+      clock-frequency = <94000000>;
       device_type = "cpu";
       reg = <0>;
       status = "okay";
       compatible = "eth, cva6", "riscv";
-      riscv,base = "rv64i";
-      riscv,isa-extensions = "i", "m", "a", "f", "d", "c", "b",
+      riscv,isa-base = "rv64i";
+      riscv,isa-extensions = "i", "m", "a", "f", "c", "b",
                              "zifencei", "zicsr",
                              "zicntr", "zihpm",
-                             "zbc", "zcb", "zkn";
+                             "zbc", "zcb";
       mmu-type = "riscv,sv39";
       tlb-split;
       CPU0_intc: interrupt-controller {
+        #interrupt-cells = <1>;
+        interrupt-controller;
+        compatible = "riscv,cpu-intc";
+      };
+    };
+    CPU1: cpu@1 {
+      clock-frequency = <94000000>;
+      device_type = "cpu";
+      reg = <1>;
+      status = "okay";
+      compatible = "eth, cva6", "riscv";
+      riscv,isa-base = "rv64i";
+      riscv,isa-extensions = "i", "m", "a", "f", "c", "b",
+                             "zifencei", "zicsr",
+                             "zicntr", "zihpm",
+                             "zbc", "zcb";
+      mmu-type = "riscv,sv39";
+      tlb-split;
+      CPU1_intc: interrupt-controller {
+        #interrupt-cells = <1>;
+        interrupt-controller;
+        compatible = "riscv,cpu-intc";
+      };
+    };
+    CPU2: cpu@2 {
+      clock-frequency = <94000000>;
+      device_type = "cpu";
+      reg = <2>;
+      status = "disabled";
+      compatible = "eth, cva6", "riscv";
+      riscv,isa-base = "rv64i";
+      riscv,isa-extensions = "i", "m", "a", "f", "c", "b",
+                             "zifencei", "zicsr",
+                             "zicntr", "zihpm",
+                             "zbc", "zcb";
+      mmu-type = "riscv,sv39";
+      tlb-split;
+      CPU2_intc: interrupt-controller {
+        #interrupt-cells = <1>;
+        interrupt-controller;
+        compatible = "riscv,cpu-intc";
+      };
+    };
+    CPU3: cpu@3 {
+      clock-frequency = <94000000>;
+      device_type = "cpu";
+      reg = <3>;
+      status = "disabled";
+      compatible = "eth, cva6", "riscv";
+      riscv,isa-base = "rv64i";
+      riscv,isa-extensions = "i", "m", "a", "f", "c", "b",
+                             "zifencei", "zicsr",
+                             "zicntr", "zihpm",
+                             "zbc", "zcb";
+      mmu-type = "riscv,sv39";
+      tlb-split;
+      CPU3_intc: interrupt-controller {
         #interrupt-cells = <1>;
         interrupt-controller;
         compatible = "riscv,cpu-intc";
@@ -36,6 +93,18 @@
     device_type = "memory";
     reg = <0x0 0x80000000 0x0 0x40000000>;
   };
+  reserved-memory {
+    #address-cells = <2>;
+    #size-cells = <2>;
+    ranges;
+    model@af000000 {
+      reg = <0x0 0xaf000000 0x0 0x0f000000>;
+      no-map;
+    };
+    scratch@be000000 {
+      reg = <0x0 0xbe000000 0x0 0x02000000>;
+    };
+  };
   soc {
     #address-cells = <2>;
     #size-cells = <2>;
@@ -43,7 +112,10 @@
     ranges;
     clint@2000000 {
       compatible = "riscv,clint0";
-      interrupts-extended = <&CPU0_intc 3 &CPU0_intc 7>;
+      interrupts-extended = <&CPU0_intc 3 &CPU0_intc 7
+                             &CPU1_intc 3 &CPU1_intc 7
+                             &CPU2_intc 3 &CPU2_intc 7
+                             &CPU3_intc 3 &CPU3_intc 7>;
       reg = <0x0 0x2000000 0x0 0xc0000>;
       reg-names = "control";
     };
@@ -52,7 +124,10 @@
       #interrupt-cells = <1>;
       compatible = "riscv,plic0";
       interrupt-controller;
-      interrupts-extended = <&CPU0_intc 11 &CPU0_intc 9>;
+      interrupts-extended = <&CPU0_intc 11 &CPU0_intc 9
+                             &CPU1_intc 11 &CPU1_intc 9
+                             &CPU2_intc 11 &CPU2_intc 9
+                             &CPU3_intc 11 &CPU3_intc 9>;
       reg = <0x0 0xc000000 0x0 0x4000000>;
       riscv,max-priority = <7>;
       riscv,ndev = <30>;
@@ -90,7 +165,10 @@
       mmc@0 {
         compatible = "mmc-spi-slot";
         reg = <0>;
-        spi-max-frequency = <12500000>;
+        /* The AXI Quad SPI core runs from 100 MHz with C_SCK_RATIO=4. SD
+           cards support 25 MHz in default-speed SPI mode, so do not
+           artificially halve the controller's synthesized SCK. */
+        spi-max-frequency = <25000000>;
         voltage-ranges = <3300 3300>;
         disable-wp;
       };

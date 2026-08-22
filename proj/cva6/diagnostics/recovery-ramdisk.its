@@ -1,0 +1,29 @@
+/dts-v1/;
+
+/ {
+	description = "CVA6 libc recovery ramdisk";
+	#address-cells = <1>;
+
+	images {
+		ramdisk-1 {
+			description = "CVA6 libc recovery initramfs";
+			data = /incbin/("/tmp/cva6-static-recovery.cpio.gz");
+			type = "ramdisk";
+			arch = "riscv";
+			os = "linux";
+			compression = "gzip";
+
+			hash-1 {
+				algo = "sha256";
+			};
+		};
+	};
+
+	configurations {
+		default = "standard";
+
+		standard {
+			ramdisk = "ramdisk-1";
+		};
+	};
+};

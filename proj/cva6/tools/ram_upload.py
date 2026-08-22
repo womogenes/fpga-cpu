@@ -77,11 +77,11 @@ def read_exact(port: serial.Serial, count: int, timeout: float) -> bytes:
     return bytes(received)
 
 
-def upload_bootrom(port: serial.Serial, image: bytes, rate: int, chunk_size: int) -> None:
+def upload_bootrom(port: serial.Serial, image: bytes, rate: int, chunk_size: int, boot_wait: float) -> None:
     # The FTDI bridge can transmit while the FPGA is still resetting, so an
     # eager key can disappear before the boot ROM enables its receiver. Wait
     # until the ROM has printed the prompt, then answer inside its countdown.
-    wait_for(port, b"Hit any key to enter update mode ", 15.0)
+    wait_for(port, b"Hit any key to enter update mode ", boot_wait)
     port.write(b"U")
     port.flush()
     wait_for(port, b"size: ", 15.0)
@@ -125,7 +125,11 @@ def upload_segment(port: serial.Serial, data: bytes, label: str, checksum: int) 
     started = time.monotonic()
     sent = 0
     next_report = 0
-    block_size = 4096
+    # Match loader/stage2.S. A 4 KiB ACK cadence paid the FTDI latency timer
+    # roughly sixty thousand times for a Bonsai restore and limited a 3 Mbaud
+    # link to about 126 KiB/s. The target still drains individual UART bytes;
+    # a larger logical block only reduces ACK round trips.
+    block_size = 16384
     while sent < len(data):
         block = data[sent : sent + block_size]
         port.write(block)
@@ -192,11 +196,13 @@ def main() -> None:
     parser.add_argument("--baud", type=int, default=None)
     parser.add_argument("--rate-kib", type=int, default=None, help="paced boot-ROM upload rate in KiB/s")
     parser.add_argument("--chunk-size", type=int, default=None, help="drained host write size in bytes")
+    parser.add_argument("--boot-wait", type=float, default=15.0, help="seconds to wait for a freshly programmed FPGA boot-ROM prompt")
     parser.add_argument("--stage2", type=Path, default=None, help="flow-controlled stage-2 loader binary")
-    parser.add_argument("--model", type=Path, default=None, help="optional model copied to reserved DDR at 0xb0000000")
+    parser.add_argument("--model", type=Path, default=None, help="optional model copied to reserved DDR at 0xaf000000")
     parser.add_argument("--resume-stage2", action="store_true", help="resume at the post-upload checksum gate")
     parser.add_argument("--no-console", action="store_true")
     parser.add_argument("--console-char-delay-us", type=float, default=None, help="delay pasted console input between bytes")
+    parser.add_argument("--stop-autoboot", action="store_true", help="send a key after stage-2 launch to stop U-Boot autoboot")
     args = parser.parse_args()
 
     import os
@@ -212,27 +218,35 @@ def main() -> None:
         raise SystemExit("upload rate must be positive")
     if chunk_size <= 0:
         raise SystemExit("upload chunk size must be positive")
+    if args.boot_wait <= 0:
+        raise SystemExit("boot wait must be positive")
     if console_char_delay_us < 0:
         raise SystemExit("console character delay must not be negative")
     image = args.image.read_bytes()
     model = args.model.read_bytes() if args.model is not None else b""
     if len(image) >= 2**32:
         raise SystemExit("image is too large for the boot ROM protocol")
-    if len(model) > 224 * 1024 * 1024:
-        raise SystemExit("model is too large for the 224 MiB reserved DDR region")
+    if len(model) > 240 * 1024 * 1024:
+        raise SystemExit("model is too large for the 240 MiB reserved DDR model region")
 
     with serial.Serial(device, baudrate=baud, timeout=0.1, write_timeout=10) as port:
         if args.resume_stage2:
             resume_stage2(port, image, model)
         elif args.stage2 is None:
             print(f"Uploading {len(image) / 1024 / 1024:.1f} MiB to {device} at {baud} baud, paced to {rate_kib} KiB/s")
-            upload_bootrom(port, image, rate_kib * 1024, chunk_size)
+            upload_bootrom(port, image, rate_kib * 1024, chunk_size, args.boot_wait)
         else:
             loader = args.stage2.read_bytes()
             print(f"Uploading {len(loader)}-byte stage-2 loader through the boot ROM...")
-            upload_bootrom(port, loader, rate_kib * 1024, chunk_size)
+            upload_bootrom(port, loader, rate_kib * 1024, chunk_size, args.boot_wait)
             print(f"Uploading {len(image) / 1024 / 1024:.1f} MiB Linux and {len(model) / 1024 / 1024:.1f} MiB model with block acknowledgements...")
             upload_stage2(port, image, model)
+        if args.stop_autoboot:
+            # Let OpenSBI hand the UART to U-Boot, then inject the key directly
+            # through the already-open port before the countdown can expire.
+            time.sleep(1.5)
+            port.write(b" ")
+            port.flush()
         if args.no_console:
             return
         print("Entering console; press Ctrl-] to exit.")

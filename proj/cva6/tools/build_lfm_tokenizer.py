@@ -94,14 +94,22 @@ def main():
     parser.add_argument("output", type=Path)
     args = parser.parse_args()
     metadata = tokenizer_metadata(args.model)
+    tokens = metadata["tokenizer.ggml.tokens"]
+    merges = metadata["tokenizer.ggml.merges"]
     payload = {
-        "tokens": metadata["tokenizer.ggml.tokens"],
-        "merges": metadata["tokenizer.ggml.merges"],
+        "tokens": tokens,
+        "merges": merges,
+        # Building these dictionaries in Python on the 100 MHz target is much
+        # slower than unpickling them. Pickle memoizes the shared strings.
+        "token_to_id": {token: token_id for token_id, token in enumerate(tokens)},
+        "merge_rank": {
+            tuple(merge.split(" ", 1)): rank for rank, merge in enumerate(merges)
+        },
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("wb") as stream:
         pickle.dump(payload, stream, protocol=4)
-    print(f"wrote {len(payload['tokens'])} tokens and {len(payload['merges'])} merges to {args.output}")
+    print(f"wrote {len(tokens)} pre-indexed tokens and {len(merges)} merges to {args.output}")
 
 
 if __name__ == "__main__":

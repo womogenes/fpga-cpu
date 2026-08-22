@@ -1,20 +1,439 @@
 --- main.c
 +++ main.c
-@@ -731,6 +731,7 @@
+@@ -54,8 +54,11 @@
+ #include <sched.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <linux/futex.h>
++#include <sys/file.h>
+ #include <sys/mman.h>
+ #include <sys/stat.h>
++#include <sys/syscall.h>
+ #include <time.h>
+ #include <unistd.h>
+ #else
+@@ -160,8 +162,11 @@
+   JOB_NONE = 0,
+   JOB_Q4_MATVEC = 1,
+   JOB_Q6_ARGMAX = 2,
++  JOB_RANGE = 3,
+ };
+
++typedef void (*range_job_fn)(uint32_t begin, uint32_t end);
++
+ struct worker_slot {
+   volatile uint32_t done;
+   float score;
+@@ -179,10 +184,12 @@
+   const struct block_q6_k *q6;
+   const int8_t *q6_expanded;
+   const struct block_q8_k *q8k;
++  range_job_fn range;
+   struct worker_slot slots[LFM_MAX_HARTS];
+ };
+
+ static struct parallel_job g_job __attribute__((aligned(64)));
++static void parallel_range(range_job_fn range, uint32_t items);
+ #ifdef LFM_HOST
+ static uint32_t g_worker_count = 1;
+ static pthread_t g_threads[LFM_MAX_HARTS - 1];
+@@ -284,7 +291,7 @@
+ }
+
+ static float exp_f(float x) {
+-#ifdef LFM_HOST
++#if defined(LFM_HOST) && !defined(LFM_FAST_MATH)
+   return expf(x);
+ #else
+   if (x < -20.0f) return 0.0f;
+@@ -304,7 +311,7 @@
+ }
+
+ static void sincos_f(float x, float *s, float *c) {
+-#ifdef LFM_HOST
++#if defined(LFM_HOST) && !defined(LFM_FAST_MATH)
+   *s = sinf(x);
+   *c = cosf(x);
+ #else
+@@ -472,8 +479,18 @@
+   if (ai != LFM_ATTN_LAYERS || ci != LFM_CONV_LAYERS) fail("bad layer map");
+ }
+
+-static void quantize_q8_0(const float *x, struct block_q8_0 *y, uint32_t n) {
+-  for (uint32_t ib = 0; ib < n / 32u; ++ib) {
++static const float *g_quantize_q8_input;
++static struct block_q8_0 *g_quantize_q8_output;
++static uint32_t g_q8_revision;
++#if defined(LFM_ACCELERATOR) && !defined(LFM_ACCELERATOR_VERIFY)
++static void lfm_accel_quantize_q8_0(const float *x, uint32_t n,
++                                    uint32_t revision);
++#endif
++
++static void quantize_q8_0_range(uint32_t begin, uint32_t end) {
++  const float *x = g_quantize_q8_input;
++  struct block_q8_0 *y = g_quantize_q8_output;
++  for (uint32_t ib = begin; ib < end; ++ib) {
+     float amax = 0.0f;
+     for (uint32_t j = 0; j < 32u; ++j) {
+       float a = abs_f(x[ib * 32u + j]);
+@@ -494,6 +511,19 @@
+   }
+ }
+
++static void quantize_q8_0(const float *x, struct block_q8_0 *y, uint32_t n) {
++#if defined(LFM_ACCELERATOR) && !defined(LFM_ACCELERATOR_VERIFY)
++  (void)y;
++  ++g_q8_revision;
++  lfm_accel_quantize_q8_0(x, n, g_q8_revision);
++#else
++  g_quantize_q8_input = x;
++  g_quantize_q8_output = y;
++  parallel_range(quantize_q8_0_range, n / 32u);
++  ++g_q8_revision;
++#endif
++}
++
+ static float dot_q4_q8(const struct block_q4_0 *x, const struct block_q8_0 *y, uint32_t n) {
+   float sum = 0.0f;
+   for (uint32_t ib = 0; ib < n / 32u; ++ib) {
+@@ -671,6 +691,8 @@
+     }
+     g_job.slots[worker].score = best_score;
+     g_job.slots[worker].token = best;
++  } else if (g_job.kind == JOB_RANGE) {
++    g_job.range(begin, end);
+   }
+ }
+
+@@ -681,7 +703,9 @@
+     do {
+       epoch = worker_poll(&g_job.epoch);
+ #ifdef LFM_HOST
+-      if (epoch == seen) (void)sched_yield();
++      if (epoch == seen)
++        (void)syscall(SYS_futex, &g_job.epoch, FUTEX_WAIT_PRIVATE, seen,
++                      NULL, NULL, 0);
+ #endif
+     } while (epoch == seen);
+     worker_acquire();
+@@ -722,6 +746,11 @@
+   uint32_t epoch = worker_poll(&g_job.epoch) + 1u;
+   if (epoch == 0u) epoch = 1u;
+   worker_store(&g_job.epoch, epoch);
++#ifdef LFM_HOST
++  if (g_worker_count > 1u)
++    (void)syscall(SYS_futex, &g_job.epoch, FUTEX_WAKE_PRIVATE,
++                  g_worker_count - 1u, NULL, NULL, 0);
++#endif
+   execute_job(0);
+   worker_store(&g_job.slots[0].done, epoch);
+   for (uint32_t worker = 1; worker < g_worker_count; ++worker) {
+@@ -731,6 +760,12 @@
    return epoch;
  }
- 
+
++static void parallel_range(range_job_fn range, uint32_t items) {
++  g_job.range = range;
++  (void)begin_job(JOB_RANGE, items);
++}
++
 +#ifndef LFM_ACCELERATOR
  static void parallel_q4(float *out, const struct tensor *weight,
                          const struct block_q8_0 *input) {
    g_job.out = out;
-@@ -762,6 +763,9 @@
+@@ -757,6 +792,9 @@
    }
    return best;
  }
 +#else
 +#include "lfm_accelerator_backend.inc"
 +#endif
- 
+
  static void embedding_row(float *out, const struct tensor *embedding, uint32_t token) {
    if (embedding->type != LFM_Q6_K || token >= embedding->ne1 || embedding->ne0 != LFM_DIM)
+@@ -818,12 +856,19 @@
+     0.00001334f, 0.00000866f, 0.00000562f, 0.00000365f, 0.00000237f,
+     0.00000154f
+   };
+-  for (uint32_t h = 0; h < heads; ++h) {
+-    float *v = x + h * LFM_HEAD_DIM;
+-    for (uint32_t i = 0; i < 32u; ++i) {
+-      float s;
+-      float c;
+-      sincos_f((float)position * freq[i], &s, &c);
++  static uint32_t cached_position = UINT32_MAX;
++  static float cached_sin[32];
++  static float cached_cos[32];
++  if (cached_position != position) {
++    for (uint32_t i = 0; i < 32u; ++i)
++      sincos_f((float)position * freq[i], &cached_sin[i], &cached_cos[i]);
++    cached_position = position;
++  }
++  for (uint32_t i = 0; i < 32u; ++i) {
++    float s = cached_sin[i];
++    float c = cached_cos[i];
++    for (uint32_t h = 0; h < heads; ++h) {
++      float *v = x + h * LFM_HEAD_DIM;
+       float a = v[i];
+       float b = v[i + 32u];
+       v[i] = a * c - b * s;
+       v[i + 32u] = a * s + b * c;
+     }
+   }
+ }
+
+@@ -832,15 +870,20 @@
+   }
+ }
+
+-static void shortconv(struct run_state *state, const struct layer *layer) {
+-  matvec_q4(state->op, &layer->conv_in, state->norm);
+-  float *b = state->op;
+-  float *c = state->op + LFM_DIM;
+-  float *x = state->op + 2 * LFM_DIM;
++static struct run_state *g_range_state;
++static const struct layer *g_range_layer;
++static uint32_t g_range_position;
++
++static void shortconv_range(uint32_t begin, uint32_t end) {
++  struct run_state *state = g_range_state;
++  const struct layer *layer = g_range_layer;
++  const float *b = state->op;
++  const float *c = state->op + LFM_DIM;
++  const float *x = state->op + 2 * LFM_DIM;
+   float *hist0 = state->conv_state[layer->state_index][0];
+   float *hist1 = state->conv_state[layer->state_index][1];
+   const float *kernel = (const float *)layer->conv.data;
+-  for (uint32_t i = 0; i < LFM_DIM; ++i) {
++  for (uint32_t i = begin; i < end; ++i) {
+     float bx = b[i] * x[i];
+     float conv = hist0[i] * kernel[i * 3u] + hist1[i] * kernel[i * 3u + 1u]
+                + bx * kernel[i * 3u + 2u];
+@@ -848,26 +891,24 @@
+     hist1[i] = bx;
+     state->att[i] = c[i] * conv;
+   }
++}
++
++static void shortconv(struct run_state *state, const struct layer *layer) {
++  matvec_q4(state->op, &layer->conv_in, state->norm);
++  g_range_state = state;
++  g_range_layer = layer;
++  parallel_range(shortconv_range, LFM_DIM);
+   matvec_q4(state->op, &layer->conv_out, state->att);
+ }
+
+-static void attention(struct run_state *state, const struct layer *layer, uint32_t position) {
+-  matvec_q4(state->q, &layer->q, state->norm);
+-  matvec_q4(state->k, &layer->k, state->norm);
+-  matvec_q4(state->v, &layer->v, state->norm);
+-  head_rms_norm(state->q, &layer->q_norm, LFM_HEADS);
+-  head_rms_norm(state->k, &layer->k_norm, LFM_KV_HEADS);
+-  rope(state->q, LFM_HEADS, position);
+-  rope(state->k, LFM_KV_HEADS, position);
+-  fp16_t *kc = state->kv_k[layer->state_index][position];
+-  fp16_t *vc = state->kv_v[layer->state_index][position];
+-  for (uint32_t i = 0; i < LFM_KV_DIM; ++i) {
+-    kc[i] = float_to_half(state->k[i]);
+-    vc[i] = float_to_half(state->v[i]);
+-  }
++static void attention_heads_range(uint32_t begin, uint32_t end) {
++  struct run_state *state = g_range_state;
++  const struct layer *layer = g_range_layer;
++  uint32_t position = g_range_position;
+   const float inv_sqrt_head = 0.125f;
+-  for (uint32_t h = 0; h < LFM_HEADS; ++h) {
++  for (uint32_t h = begin; h < end; ++h) {
+     uint32_t kvh = h / 2u;
++    float *scores = state->ffn_gate + h * LFM_MAX_CONTEXT;
+     float max_score = -3.402823466e38f;
+     for (uint32_t t = 0; t <= position; ++t) {
+       float score = 0.0f;
+@@ -875,35 +916,62 @@
+       for (uint32_t j = 0; j < LFM_HEAD_DIM; ++j)
+         score += state->q[h * LFM_HEAD_DIM + j] * half_to_float(key[j]);
+       score *= inv_sqrt_head;
+-      state->ffn_gate[t] = score;
++      scores[t] = score;
+       if (score > max_score) max_score = score;
+     }
+     float denom = 0.0f;
+     for (uint32_t t = 0; t <= position; ++t) {
+-      float e = exp_f(state->ffn_gate[t] - max_score);
+-      state->ffn_gate[t] = e;
++      float e = exp_f(scores[t] - max_score);
++      scores[t] = e;
+       denom += e;
+     }
+     for (uint32_t j = 0; j < LFM_HEAD_DIM; ++j) {
+       float sum = 0.0f;
+       for (uint32_t t = 0; t <= position; ++t) {
+         const fp16_t *value = state->kv_v[layer->state_index][t] + kvh * LFM_HEAD_DIM;
+-        sum += state->ffn_gate[t] * half_to_float(value[j]);
++        sum += scores[t] * half_to_float(value[j]);
+       }
+       state->att[h * LFM_HEAD_DIM + j] = sum / denom;
+     }
+   }
++}
++
++static void attention(struct run_state *state, const struct layer *layer, uint32_t position) {
++  quantize_q8_0(state->norm, state->q8, LFM_DIM);
++  matvec_q4_quantized(state->q, &layer->q, state->q8);
++  matvec_q4_quantized(state->k, &layer->k, state->q8);
++  matvec_q4_quantized(state->v, &layer->v, state->q8);
++  head_rms_norm(state->q, &layer->q_norm, LFM_HEADS);
++  head_rms_norm(state->k, &layer->k_norm, LFM_KV_HEADS);
++  rope(state->q, LFM_HEADS, position);
++  rope(state->k, LFM_KV_HEADS, position);
++  fp16_t *kc = state->kv_k[layer->state_index][position];
++  fp16_t *vc = state->kv_v[layer->state_index][position];
++  for (uint32_t i = 0; i < LFM_KV_DIM; ++i) {
++    kc[i] = float_to_half(state->k[i]);
++    vc[i] = float_to_half(state->v[i]);
++  }
++  g_range_state = state;
++  g_range_layer = layer;
++  g_range_position = position;
++  parallel_range(attention_heads_range, LFM_HEADS);
+   matvec_q4(state->op, &layer->attn_out, state->att);
+ }
+
++static void feed_forward_range(uint32_t begin, uint32_t end) {
++  struct run_state *state = g_range_state;
++  for (uint32_t i = begin; i < end; ++i) {
++    float gate = state->ffn_gate[i];
++    state->ffn_up[i] *= gate / (1.0f + exp_f(-gate));
++  }
++}
++
+ static void feed_forward(struct run_state *state, const struct layer *layer) {
+   quantize_q8_0(state->norm, state->q8, LFM_DIM);
+   matvec_q4_quantized(state->ffn_up, &layer->ffn_up, state->q8);
+   matvec_q4_quantized(state->ffn_gate, &layer->ffn_gate, state->q8);
+-  for (uint32_t i = 0; i < LFM_FF_DIM; ++i) {
+-    float gate = state->ffn_gate[i];
+-    state->ffn_up[i] *= gate / (1.0f + exp_f(-gate));
+-  }
++  g_range_state = state;
++  parallel_range(feed_forward_range, LFM_FF_DIM);
+   matvec_q4(state->op, &layer->ffn_down, state->ffn_up);
+ }
+
+@@ -928,6 +996,93 @@
+
+ #ifdef LFM_HOST
+-static const uint8_t *map_model(const char *path, size_t *size_out) {
++static const uint8_t *map_model(const char *path, size_t *size_out,
++                                int report_progress) {
++  (void)report_progress;
++#ifdef LFM_DIRECT_MODEL_PHYS
++  struct model_stage_stamp {
++    uint64_t device;
++    uint64_t inode;
++    uint64_t size;
++    int64_t mtime_seconds;
++    int64_t mtime_nanoseconds;
++  };
++  struct stat source_stat;
++  int source = open(path, O_RDONLY);
++  int stage_from_file = source >= 0 && fstat(source, &source_stat) == 0 &&
++                        S_ISREG(source_stat.st_mode);
++  if (source >= 0 && !stage_from_file) {
++    (void)close(source);
++    source = -1;
++  }
++  if (stage_from_file && source_stat.st_size != (off_t)LFM_MODEL_FILE_SIZE)
++    fail("model file size does not match manifest");
++
++  int lock = open("/run/fpga-model.lock", O_RDWR | O_CREAT, 0600);
++  if (lock < 0 || flock(lock, LOCK_EX | LOCK_NB) != 0)
++    fail("reserved model memory is busy; exit the other model runtime first");
++  int memory = open("/dev/mem", O_RDWR | O_SYNC);
++  if (memory < 0) fail("cannot open reserved model memory");
++  void *data = mmap(NULL, (size_t)LFM_MODEL_FILE_SIZE,
++                    PROT_READ | PROT_WRITE, MAP_SHARED, memory,
++                    (off_t)LFM_DIRECT_MODEL_PHYS);
++  (void)close(memory);
++  if (data == MAP_FAILED) fail("cannot map reserved model memory");
++  uint8_t *bytes = (uint8_t *)data;
++
++  if (stage_from_file) {
++    struct model_stage_stamp expected = {
++      .device = (uint64_t)source_stat.st_dev,
++      .inode = (uint64_t)source_stat.st_ino,
++      .size = (uint64_t)source_stat.st_size,
++      .mtime_seconds = (int64_t)source_stat.st_mtim.tv_sec,
++      .mtime_nanoseconds = (int64_t)source_stat.st_mtim.tv_nsec,
++    };
++    struct model_stage_stamp actual;
++    int stamp = open("/run/fpga-model.stamp", O_RDONLY);
++    ssize_t stamp_bytes = stamp >= 0 ? read(stamp, &actual, sizeof(actual)) : -1;
++    if (stamp >= 0) (void)close(stamp);
++    int staged = stamp_bytes == (ssize_t)sizeof(actual) &&
++                 actual.device == expected.device &&
++                 actual.inode == expected.inode &&
++                 actual.size == expected.size &&
++                 actual.mtime_seconds == expected.mtime_seconds &&
++                 actual.mtime_nanoseconds == expected.mtime_nanoseconds;
++    if (!staged) {
++      size_t copied = 0;
++      while (copied < (size_t)LFM_MODEL_FILE_SIZE) {
++        size_t remaining = (size_t)LFM_MODEL_FILE_SIZE - copied;
++        size_t request = remaining < 1024u * 1024u ? remaining :
++                         1024u * 1024u;
++        ssize_t received = read(source, bytes + copied, request);
++        if (received <= 0) fail("cannot stage model from persistent storage");
++        copied += (size_t)received;
++        if (report_progress != 0) {
++          console_puts("LOAD ");
++          console_u64(copied);
++          console_putc(' ');
++          console_u64((uint64_t)LFM_MODEL_FILE_SIZE);
++          console_putc('\n');
++          (void)fflush(stdout);
++        }
++      }
++      __sync_synchronize();
++      stamp = open("/run/fpga-model.stamp", O_WRONLY | O_CREAT | O_TRUNC, 0600);
++      if (stamp < 0 || write(stamp, &expected, sizeof(expected)) !=
++                       (ssize_t)sizeof(expected))
++        fail("cannot record staged model");
++      (void)close(stamp);
++    }
++    (void)close(source);
++  }
++  if (bytes[0] != 'G' || bytes[1] != 'G' || bytes[2] != 'U' || bytes[3] != 'F')
++    fail("no GGUF model is staged in reserved memory");
++  /* Keep the shared slot locked for this process's lifetime. Another model
++     runtime must not replace the reserved DDR contents while inference is
++     still reading them. The kernel releases this deliberately retained file
++     descriptor on exit. */
++  *size_out = (size_t)LFM_MODEL_FILE_SIZE;
++  return (const uint8_t *)bytes;
++#else
+   int fd = open(path, O_RDONLY);
+   if (fd < 0) fail("cannot open model");
+   struct stat st;
+@@ -937,6 +1031,7 @@
+   if (data == MAP_FAILED) fail("cannot map model");
+   *size_out = (size_t)st.st_size;
+   return (const uint8_t *)data;
++#endif
+ }
+
+ static int run_server(void) {
+@@ -1007,6 +1103,10 @@
+     } else {
+       generated = (unsigned int)strtoul(argv[i], NULL, 10);
+     }
+   }
++  if (workers == 1u) {
++    const unsigned long affinity = 2ul;
++    (void)syscall(SYS_sched_setaffinity, 0, sizeof(affinity), &affinity);
++  }
+   model_data = map_model(path, &model_size);
+ #else
+@@ -1011,1 +1111,1 @@
+-  model_data = map_model(path, &model_size);
++  model_data = map_model(path, &model_size, server);

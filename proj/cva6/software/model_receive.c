@@ -70,7 +70,23 @@ int main(int argc, char **argv) {
     return EXIT_FAILURE;
   }
 
-  int output = open(argv[1], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  int physical = argv[1][0] == '@';
+  int output;
+  if (physical != 0) {
+    char *address_end = NULL;
+    errno = 0;
+    unsigned long long address = strtoull(argv[1] + 1, &address_end, 0);
+    if (errno != 0 || address_end == argv[1] + 1 || *address_end != '\0' ||
+        address > (unsigned long long)INT64_MAX) {
+      fprintf(stderr, "model-receive: invalid physical address: %s\n", argv[1]);
+      return EXIT_FAILURE;
+    }
+    output = open("/dev/mem", O_WRONLY | O_SYNC);
+    if (output >= 0 && lseek(output, (off_t)address, SEEK_SET) < 0)
+      fail("seek reserved model memory");
+  } else {
+    output = open(argv[1], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  }
   if (output < 0)
     fail("open output");
 
@@ -80,8 +96,11 @@ int main(int argc, char **argv) {
     fail("atexit");
   struct termios raw = saved_termios;
   cfmakeraw(&raw);
-  raw.c_cc[VMIN] = 0;
-  raw.c_cc[VTIME] = 50;
+  /* A tty read with VMIN=0 reports a timeout as a zero-length read.  That is
+     not EOF, but read_all() quite reasonably treated it as such and aborted
+     a live upload between blocks.  Block for at least one byte instead. */
+  raw.c_cc[VMIN] = 1;
+  raw.c_cc[VTIME] = 0;
   if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0)
     fail("tcsetattr raw");
   restore_pending = 1;
@@ -100,7 +119,7 @@ int main(int argc, char **argv) {
     write_all(STDOUT_FILENO, "A", 1);
   }
 
-  if (fsync(output) != 0 || close(output) != 0)
+  if ((physical == 0 && fsync(output) != 0) || close(output) != 0)
     fail("finish output");
   write_all(STDOUT_FILENO, &checksum, sizeof(checksum));
   if (tcsetattr(STDIN_FILENO, TCSANOW, &saved_termios) != 0)

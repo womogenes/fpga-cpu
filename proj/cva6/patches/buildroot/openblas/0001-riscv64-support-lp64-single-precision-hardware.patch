@@ -1,0 +1,42 @@
+From 3b9ac897623237099933a208cd4fba96b8092ead Mon Sep 17 00:00:00 2001
+From: Bonsai FPGA CPU project <noreply@example.com>
+Date: Wed, 5 Aug 2026 12:00:00 -0700
+Subject: [PATCH] riscv64: support LP64 with single-precision hardware
+
+The CVA6 configuration implements F but deliberately omits D. Buildroot's
+glibc toolchain therefore exposes the LP64 ABI, while OpenBLAS hard-codes the
+LP64D ABI for its generic RISC-V target. Keep the generic kernels and compile
+them for the exact RV64IMAFC/LP64 ISA and ABI used by the system image.
+
+---
+ Makefile.prebuild | 2 +-
+ Makefile.riscv64  | 4 ++--
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/Makefile.prebuild b/Makefile.prebuild
+index ef10e5ec..9ba4426d 100644
+--- a/Makefile.prebuild
++++ b/Makefile.prebuild
+@@ -72,7 +72,7 @@ TARGET_FLAGS = -march=rv64imafdcv -mabi=lp64d
+ endif
+ 
+ ifeq ($(TARGET), RISCV64_GENERIC)
+-TARGET_FLAGS = -march=rv64imafdc -mabi=lp64d
++TARGET_FLAGS = -march=rv64imafc_zicsr_zifencei_zbc_zicntr_zcb_zihpm -mabi=lp64
+ endif
+ 
+ all: getarch_2nd
+diff --git a/Makefile.riscv64 b/Makefile.riscv64
+index 166e2806..1aa3b8d3 100644
+--- a/Makefile.riscv64
++++ b/Makefile.riscv64
+@@ -15,5 +15,5 @@ FCOMMON_OPT += -march=rv64imafdcv -mabi=lp64d
+ endif
+ ifeq ($(CORE), RISCV64_GENERIC)
+-CCOMMON_OPT += -march=rv64imafdc -mabi=lp64d
+-FCOMMON_OPT += -march=rv64imafdc -mabi=lp64d
++CCOMMON_OPT += -march=rv64imafc_zicsr_zifencei_zbc_zicntr_zcb_zihpm -mabi=lp64
++FCOMMON_OPT += -march=rv64imafc_zicsr_zifencei_zbc_zicntr_zcb_zihpm -mabi=lp64
+ endif
+-- 
+2.51.0

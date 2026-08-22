@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+session="bonsai-fpga"
+runtime_dir="${BONSAI_FPGA_DIR:-$HOME/fpga/fpga-cpu}"
+detach=0
+case "${1:-}" in
+    "") ;;
+    --detach) detach=1 ;;
+    --status)
+        if tmux has-session -t "$session" 2>/dev/null; then
+            echo "Bonsai is running."
+        else
+            echo "Bonsai is stopped."
+            exit 1
+        fi
+        exit 0
+        ;;
+    -h|--help)
+        echo "usage: bonsai-fpga [--detach|--status]"
+        exit 0
+        ;;
+    *)
+        echo "unknown option: $1" >&2
+        exit 2
+        ;;
+esac
+
+if ! tmux has-session -t "$session" 2>/dev/null; then
+    tmux new-session -d -s "$session" -x 120 -y 40 \
+        "cd '$runtime_dir' && exec python3 ./bonsai_chat.py \
+        --tokenizer '$runtime_dir/tokenizer.pickle' \
+        --decoder '$runtime_dir/serial_bonsai_decoder.py' \
+        --model /dev/null --threads 2 --no-progress"
+    printf 'Starting Bonsai'
+    ready=0
+    for attempt in $(seq 1 1200); do
+        if ! tmux has-session -t "$session" 2>/dev/null; then
+            printf '\nBonsai exited during startup.\n' >&2
+            exit 1
+        fi
+        if tmux capture-pane -pt "$session" -S -40 | grep -q 'you>'; then
+            printf ' ready.\n'
+            ready=1
+            break
+        fi
+        if (( attempt % 10 == 0 )); then
+            printf '.'
+        fi
+        sleep 0.1
+    done
+    if [[ "$ready" -ne 1 ]]; then
+        printf '\nBonsai did not reach the prompt within 120 seconds.\n' >&2
+        exit 1
+    fi
+fi
+
+if [[ "$detach" -eq 1 ]]; then
+    exit 0
+fi
+exec tmux attach-session -t "$session"

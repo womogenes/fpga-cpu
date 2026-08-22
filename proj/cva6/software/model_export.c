@@ -11,8 +11,8 @@
 #include <unistd.h>
 
 enum {
-  MODEL_PHYS = 0xb0000000u,
-  MAX_MODEL_SIZE = 224u * 1024u * 1024u,
+  MODEL_PHYS = 0xaf000000u,
+  MAX_MODEL_SIZE = 240u * 1024u * 1024u,
   COPY_CHUNK = 1024u * 1024u,
 };
 
@@ -32,6 +32,19 @@ static void write_all(int fd, const uint8_t *data, size_t size) {
     data += (size_t)written;
     size -= (size_t)written;
   }
+}
+
+static void show_progress(size_t copied, size_t size) {
+  enum { BAR_WIDTH = 30 };
+  unsigned int percent = (unsigned int)((copied * 100u) / size);
+  unsigned int filled = (unsigned int)((copied * BAR_WIDTH) / size);
+  fputs("\rExporting model [", stderr);
+  for (unsigned int i = 0; i < BAR_WIDTH; ++i)
+    fputc(i < filled ? '=' : ' ', stderr);
+  fprintf(stderr, "] %3u%%", percent);
+  if (copied == size)
+    fputc('\n', stderr);
+  fflush(stderr);
 }
 
 int main(int argc, char **argv) {
@@ -64,16 +77,30 @@ int main(int argc, char **argv) {
   int output = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (output < 0)
     fail("open output");
+  /* Allocate one contiguous extent up front. Ext4 otherwise has to grow a
+     200+ MiB file a megabyte at a time over the relatively slow SPI link. */
+  fputs("Preallocating model storage...\n", stderr);
+  fflush(stderr);
+  int allocation = posix_fallocate(output, 0, (off_t)size);
+  if (allocation != 0) {
+    errno = allocation;
+    fail("preallocate output");
+  }
   size_t copied = 0;
+  show_progress(copied, size);
   while (copied < size) {
     size_t count = size - copied;
     if (count > COPY_CHUNK)
       count = COPY_CHUNK;
     write_all(output, model + copied, count);
     copied += count;
+    show_progress(copied, size);
   }
+  fputs("Syncing model to storage...\n", stderr);
+  fflush(stderr);
   if (fsync(output) != 0 || close(output) != 0)
     fail("finish output");
+  fputs("Model storage sync complete.\n", stderr);
   if (munmap((void *)model, size) != 0 || close(memory) != 0)
     fail("unmap reserved model memory");
   printf("Exported %zu bytes from reserved DDR to %s\n", size, path);
