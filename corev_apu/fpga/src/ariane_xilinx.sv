@@ -174,10 +174,20 @@ module ariane_xilinx (
   output logic         fan_pwm     ,
   input  logic         trst_n      ,
 `endif
-  // SPI
+  // SPI, or native SD CMD/DAT0/DAT3 when NATIVE_SD is selected.
+`ifdef NATIVE_SD
+  inout  wire         spi_mosi    ,
+  inout  wire         spi_miso    ,
+  inout  wire         spi_ss      ,
+  inout  wire         sd_dat1     ,
+  inout  wire         sd_dat2     ,
+  output logic        sd_reset    ,
+  input  logic        sd_cd       ,
+`else
   output logic        spi_mosi    ,
   input  logic        spi_miso    ,
   output logic        spi_ss      ,
+`endif
   output logic        spi_clk_o   ,
   // common part
  // input logic         trst_n      ,
@@ -228,7 +238,13 @@ localparam type rvfi_probes_t = struct packed {
 localparam NumWords = (24 * 1024 * 1024) / 8;
   
 localparam NumCores = ariane_soc::NumCores;
-localparam NBSlave = ariane_soc::NrSlaves; // hart 0, debug, then remaining harts
+// Native SD contributes one DMA initiator. Keep the package and the default
+// SPI build unchanged so rollback bitstreams retain their exact topology.
+`ifdef NATIVE_SD
+localparam NBSlave = ariane_soc::NrSlaves + 1;
+`else
+localparam NBSlave = ariane_soc::NrSlaves;
+`endif
 localparam AxiAddrWidth = 64;
 localparam AxiDataWidth = 64;
 localparam AxiIdWidthMaster = CVA6Cfg.AxiIdWidth;
@@ -266,6 +282,15 @@ AXI_BUS #(
     .AXI_USER_WIDTH ( AxiUserWidth     )
 ) master_to_dm[0:0]();
 
+`ifdef NATIVE_SD
+AXI_BUS #(
+    .AXI_ADDR_WIDTH ( AxiAddrWidth     ),
+    .AXI_DATA_WIDTH ( AxiDataWidth     ),
+    .AXI_ID_WIDTH   ( AxiIdWidthMaster ),
+    .AXI_USER_WIDTH ( AxiUserWidth     )
+) native_sd_dma();
+`endif
+
 // disable test-enable
 logic test_en;
 logic ndmreset;
@@ -277,17 +302,23 @@ logic [NumCores-1:0] smp_inval_valid;
 logic [NumCores-1:0] smp_inval_ready;
 logic [CVA6Cfg.PLEN-1:0] smp_inval_addr;
 logic [CVA6Cfg.PLEN-1:0] smp_write_addr_q;
+logic [CVA6Cfg.PLEN-1:0] smp_write_end_q;
 logic [SmpSourceWidth-1:0] smp_write_source_q;
 logic [NumCores-1:0] smp_inval_pending_q;
 logic [NumCores-1:0] smp_peer_mask;
 logic smp_inval_active_q;
 logic smp_inval_done;
+localparam int unsigned DcacheLineBytes = CVA6Cfg.DCACHE_LINE_WIDTH / 8;
 
 logic clk;
 logic eth_clk;
 logic spi_clk_i;
 logic phy_tx_clk;
 logic sd_clk_sys;
+logic native_sd_irq;
+logic unused_spi_clk;
+logic unused_spi_mosi;
+logic unused_spi_ss;
 
 logic ddr_sync_reset;
 logic ddr_clock_out;
@@ -410,7 +441,7 @@ assign addr_map = '{
 };
 
 localparam axi_pkg::xbar_cfg_t AXI_XBAR_CFG = '{
-  NoSlvPorts:         ariane_soc::NrSlaves,
+  NoSlvPorts:         NBSlave,
   NoMstPorts:         ariane_soc::NB_PERIPHERALS,
   MaxMstTrans:        1, // Probably requires update
   MaxSlvTrans:        1, // Probably requires update
@@ -1147,7 +1178,10 @@ ariane_peripherals #(
     .AxiUserWidth ( AxiUserWidth     ),
     .InclUART     ( 1'b1             ),
     .InclGPIO     ( 1'b1             ),
-    `ifdef KINTEX7
+    `ifdef NATIVE_SD
+    .InclSPI      ( 1'b0         ),
+    .InclEthernet ( 1'b1         )
+    `elsif KINTEX7
     .InclSPI      ( 1'b1         ),
     .InclEthernet ( 1'b1         )
     `elsif KC705
@@ -1188,10 +1222,18 @@ ariane_peripherals #(
     .eth_mdc,
     .phy_tx_clk_i   ( phy_tx_clk                  ),
     .sd_clk_i       ( sd_clk_sys                  ),
+    .native_sd_irq_i( native_sd_irq               ),
+`ifdef NATIVE_SD
+    .spi_clk_o      ( unused_spi_clk              ),
+    .spi_mosi       ( unused_spi_mosi             ),
+    .spi_miso       ( 1'b0                        ),
+    .spi_ss         ( unused_spi_ss               ),
+`else
     .spi_clk_o      ( spi_clk_o                   ),
     .spi_mosi       ( spi_mosi                    ),
     .spi_miso       ( spi_miso                    ),
     .spi_ss         ( spi_ss                      ),
+`endif
     `ifdef GENESYSII
       .leds_o         ( led                       ),
       .dip_switches_i ( {lfm_status_sync, sw}     )
@@ -1203,6 +1245,36 @@ ariane_peripherals #(
       .dip_switches_i ( {24'b0, sw}               )
     `endif
 );
+
+`ifdef NATIVE_SD
+// Port 0 is hart 0, port 1 is debug, and port 2 is hart 1. Native SD is the
+// fourth and final initiator. The width converter preserves two-bit local IDs.
+localparam int unsigned NativeSdDmaPort = NumCores + 1;
+
+bonsai_native_sdio #(
+    .AxiAddrWidth(AxiAddrWidth),
+    .RegAxiIdWidth(AxiIdWidthSlaves),
+    .DmaAxiIdWidth(AxiIdWidthMaster),
+    .RegAxiDataWidth(AxiDataWidth),
+    .DmaAddrWidth(32),
+    .FifoAddrBits(7)
+) i_native_sdio (
+    .clk_i(clk),
+    .rst_ni(ndmreset_n),
+    .regs(master[ariane_soc::SPI]),
+    .dma(native_sd_dma),
+    .sd_cmd(spi_mosi),
+    .sd_dat({spi_ss, sd_dat2, sd_dat1, spi_miso}),
+    .sd_clk(spi_clk_o),
+    .sd_reset,
+    .sd_cd,
+    .irq_o(native_sd_irq)
+);
+
+`AXI_ASSIGN(slave[NativeSdDmaPort], native_sd_dma)
+`else
+assign native_sd_irq = 1'b0;
+`endif
 
 
 // ---------------------
@@ -1326,7 +1398,12 @@ axi_riscv_atomics_wrap #(
 assign dram_cpu.b_id = dram.b_id;
 assign dram_cpu.b_resp = dram.b_resp;
 assign dram_cpu.b_user = dram.b_user;
+// A device DMA write can span many cache lines. Delay its B response until
+// every line touched by the complete AXI burst has been invalidated in every
+// private L1. CPU caches are write-through, so device reads only need normal
+// AXI/MMIO ordering; device writes need this range invalidation.
 assign smp_inval_done = smp_inval_active_q &&
+    (smp_write_addr_q >= smp_write_end_q) &&
     ((smp_inval_pending_q & ~smp_inval_ready) == '0);
 assign dram_cpu.b_valid = dram.b_valid && smp_inval_done;
 assign dram.b_ready = dram_cpu.b_ready && smp_inval_done;
@@ -1341,12 +1418,17 @@ end
 always_ff @(posedge clk or negedge ndmreset_n) begin
   if (!ndmreset_n) begin
     smp_write_addr_q <= '0;
+    smp_write_end_q <= '0;
     smp_write_source_q <= '0;
     smp_inval_pending_q <= '0;
     smp_inval_active_q <= 1'b0;
   end else begin
     if (dram_cpu.aw_valid && dram_cpu.aw_ready) begin
-      smp_write_addr_q <= dram_cpu.aw_addr[CVA6Cfg.PLEN-1:0];
+      smp_write_addr_q <= dram_cpu.aw_addr[CVA6Cfg.PLEN-1:0] &
+          ~(CVA6Cfg.PLEN'(DcacheLineBytes - 1));
+      smp_write_end_q <= (dram_cpu.aw_addr[CVA6Cfg.PLEN-1:0] +
+          ((CVA6Cfg.PLEN'(dram_cpu.aw_len) + 1) << dram_cpu.aw_size) - 1) &
+          ~(CVA6Cfg.PLEN'(DcacheLineBytes - 1));
       smp_write_source_q <=
           dram_cpu.aw_id[AxiIdWidthMaster +: SmpSourceWidth];
     end
@@ -1356,7 +1438,11 @@ always_ff @(posedge clk or negedge ndmreset_n) begin
       smp_inval_active_q <= 1'b1;
     end else if (smp_inval_active_q) begin
       smp_inval_pending_q <= smp_inval_pending_q & ~smp_inval_ready;
-      if (dram.b_valid && dram.b_ready) begin
+      if (((smp_inval_pending_q & ~smp_inval_ready) == '0) &&
+          (smp_write_addr_q < smp_write_end_q)) begin
+        smp_write_addr_q <= smp_write_addr_q + DcacheLineBytes;
+        smp_inval_pending_q <= smp_peer_mask;
+      end else if (dram.b_valid && dram.b_ready) begin
         smp_inval_pending_q <= '0;
         smp_inval_active_q <= 1'b0;
       end

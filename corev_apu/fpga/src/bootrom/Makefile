@@ -45,7 +45,11 @@ LDFLAGS = -nostdlib -nodefaultlibs -nostartfiles
 
 INCLUDES = -I./ -I./src
 
+ifeq ($(NATIVE_SD),1)
+SRCS_C = src/main.c src/uart.c src/native_sd.c src/gpt.c
+else
 SRCS_C = src/main.c src/uart.c src/spi.c src/sd.c src/gpt.c src/dw_mmc.c src/bouncebuf.c
+endif
 SRCS_ASM = startup.S
 OBJS_C = $(SRCS_C:.c=.o)
 OBJS_S = $(SRCS_ASM:.S=.o)

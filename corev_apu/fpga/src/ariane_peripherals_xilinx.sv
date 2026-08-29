@@ -57,6 +57,7 @@ module ariane_peripherals #(
     output logic       spi_ss          ,
     // SD Card
     input  logic       sd_clk_i        ,
+    input  logic       native_sd_irq_i ,
     output logic [31:0] leds_o         ,
     input  logic [31:0] dip_switches_i
 );
@@ -483,6 +484,11 @@ module ariane_peripherals #(
             .ip2intc_irpt   ( irq_sources[1]         )
         );
     end else begin
+`ifdef NATIVE_SD
+        // The native controller is instantiated beside the crossbar because
+        // its DMA port is an initiator. It owns this register target and IRQ.
+        assign irq_sources[1] = native_sd_irq_i;
+`else
         assign spi_clk_o = 1'b0;
         assign spi_mosi = 1'b0;
         assign spi_ss = 1'b0;
@@ -501,6 +507,7 @@ module ariane_peripherals #(
         assign spi.r_resp = axi_pkg::RESP_SLVERR;
         assign spi.r_data = 'hdeadbeef;
         assign spi.r_last = 1'b1;
+`endif
     end
 
 
