@@ -1,0 +1,202 @@
+/dts-v1/;
+
+/ {
+  #address-cells = <2>;
+  #size-cells = <2>;
+  compatible = "eth,cva6-bare-dev";
+  model = "eth,cva6-bare";
+  chosen {
+    stdout-path = "/soc/uart@10000000:3000000";
+  };
+  cpus {
+    #address-cells = <1>;
+    #size-cells = <0>;
+    timebase-frequency = <47000000>;
+    CPU0: cpu@0 {
+      clock-frequency = <94000000>;
+      device_type = "cpu";
+      reg = <0>;
+      status = "okay";
+      compatible = "eth, cva6", "riscv";
+      riscv,isa-base = "rv64i";
+      riscv,isa-extensions = "i", "m", "a", "f", "c", "b",
+                             "zifencei", "zicsr",
+                             "zicntr", "zihpm",
+                             "zbc", "zcb";
+      mmu-type = "riscv,sv39";
+      tlb-split;
+      CPU0_intc: interrupt-controller {
+        #interrupt-cells = <1>;
+        interrupt-controller;
+        compatible = "riscv,cpu-intc";
+      };
+    };
+    CPU1: cpu@1 {
+      clock-frequency = <94000000>;
+      device_type = "cpu";
+      reg = <1>;
+      status = "okay";
+      compatible = "eth, cva6", "riscv";
+      riscv,isa-base = "rv64i";
+      riscv,isa-extensions = "i", "m", "a", "f", "c", "b",
+                             "zifencei", "zicsr",
+                             "zicntr", "zihpm",
+                             "zbc", "zcb";
+      mmu-type = "riscv,sv39";
+      tlb-split;
+      CPU1_intc: interrupt-controller {
+        #interrupt-cells = <1>;
+        interrupt-controller;
+        compatible = "riscv,cpu-intc";
+      };
+    };
+    CPU2: cpu@2 {
+      clock-frequency = <94000000>;
+      device_type = "cpu";
+      reg = <2>;
+      status = "disabled";
+      compatible = "eth, cva6", "riscv";
+      riscv,isa-base = "rv64i";
+      riscv,isa-extensions = "i", "m", "a", "f", "c", "b",
+                             "zifencei", "zicsr",
+                             "zicntr", "zihpm",
+                             "zbc", "zcb";
+      mmu-type = "riscv,sv39";
+      tlb-split;
+      CPU2_intc: interrupt-controller {
+        #interrupt-cells = <1>;
+        interrupt-controller;
+        compatible = "riscv,cpu-intc";
+      };
+    };
+    CPU3: cpu@3 {
+      clock-frequency = <94000000>;
+      device_type = "cpu";
+      reg = <3>;
+      status = "disabled";
+      compatible = "eth, cva6", "riscv";
+      riscv,isa-base = "rv64i";
+      riscv,isa-extensions = "i", "m", "a", "f", "c", "b",
+                             "zifencei", "zicsr",
+                             "zicntr", "zihpm",
+                             "zbc", "zcb";
+      mmu-type = "riscv,sv39";
+      tlb-split;
+      CPU3_intc: interrupt-controller {
+        #interrupt-cells = <1>;
+        interrupt-controller;
+        compatible = "riscv,cpu-intc";
+      };
+    };
+  };
+  memory@80000000 {
+    device_type = "memory";
+    reg = <0x0 0x80000000 0x0 0x40000000>;
+  };
+  reserved-memory {
+    #address-cells = <2>;
+    #size-cells = <2>;
+    ranges;
+    model@af000000 {
+      reg = <0x0 0xaf000000 0x0 0x0f000000>;
+      no-map;
+    };
+    attention-kv@a0000000 {
+      reg = <0x0 0xa0000000 0x0 0x0e000000>;
+      no-map;
+    };
+    scratch@be000000 {
+      reg = <0x0 0xbe000000 0x0 0x02000000>;
+    };
+  };
+  soc {
+    #address-cells = <2>;
+    #size-cells = <2>;
+    compatible = "eth,cva6-bare-soc", "simple-bus";
+    ranges;
+    clint@2000000 {
+      compatible = "riscv,clint0";
+      interrupts-extended = <&CPU0_intc 3 &CPU0_intc 7
+                             &CPU1_intc 3 &CPU1_intc 7
+                             &CPU2_intc 3 &CPU2_intc 7
+                             &CPU3_intc 3 &CPU3_intc 7>;
+      reg = <0x0 0x2000000 0x0 0xc0000>;
+      reg-names = "control";
+    };
+    PLIC0: interrupt-controller@c000000 {
+      #address-cells = <0>;
+      #interrupt-cells = <1>;
+      compatible = "riscv,plic0";
+      interrupt-controller;
+      interrupts-extended = <&CPU0_intc 11 &CPU0_intc 9
+                             &CPU1_intc 11 &CPU1_intc 9
+                             &CPU2_intc 11 &CPU2_intc 9
+                             &CPU3_intc 11 &CPU3_intc 9>;
+      reg = <0x0 0xc000000 0x0 0x4000000>;
+      riscv,max-priority = <7>;
+      riscv,ndev = <30>;
+    };
+    uart@10000000 {
+      compatible = "ns16750", "ns16550";
+      reg = <0x0 0x10000000 0x0 0x1000>;
+      clock-frequency = <96000000>;
+      current-speed = <3000000>;
+      interrupt-parent = <&PLIC0>;
+      interrupts = <1>;
+      reg-shift = <2>;
+      reg-io-width = <4>;
+    };
+    timer@18000000 {
+      compatible = "pulp,apb_timer";
+      interrupts = <0x00000004 0x00000005 0x00000006 0x00000007>;
+      reg = <0x00000000 0x18000000 0x00000000 0x00001000>;
+      interrupt-parent = <&PLIC0>;
+      reg-names = "control";
+    };
+    mmc@20000000 {
+      compatible = "riscv,axi-sd-card-1.0";
+      reg = <0x0 0x20000000 0x0 0x10000>;
+      interrupt-parent = <&PLIC0>;
+      interrupts = <2>;
+      clock = <94000000>;
+      bus-width = <4>;
+      fifo-depth = <128>;
+      max-frequency = <47000000>;
+      cap-sd-highspeed;
+      no-sdio;
+      disable-wp;
+    };
+    mdio {
+      #address-cells = <1>;
+      #size-cells = <0>;
+      ethernet_phy: ethernet-phy@0 {
+        reg = <0>;
+      };
+    };
+    eth: lowrisc-eth@30000000 {
+      compatible = "lowrisc-eth";
+      device_type = "network";
+      interrupt-parent = <&PLIC0>;
+      interrupts = <3 0>;
+      local-mac-address = [00 18 3e 02 e3 7f];
+      reg = <0x0 0x30000000 0x0 0x8000>;
+      phy-handle = <&ethernet_phy>;
+    };
+    xlnx_gpio: gpio@40000000 {
+      #gpio-cells = <2>;
+      compatible = "xlnx,xps-gpio-1.00.a";
+      gpio-controller;
+      reg = <0x0 0x40000000 0x0 0x10000>;
+      xlnx,all-inputs = <0x0>;
+      xlnx,all-inputs-2 = <0x1>;
+      xlnx,dout-default = <0x0>;
+      xlnx,dout-default-2 = <0x0>;
+      xlnx,gpio-width = <0x20>;
+      xlnx,gpio2-width = <0x20>;
+      xlnx,interrupt-present = <0x0>;
+      xlnx,is-dual = <0x1>;
+      xlnx,tri-default = <0xffffffff>;
+      xlnx,tri-default-2 = <0xffffffff>;
+    };
+  };
+};

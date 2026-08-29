@@ -32,9 +32,19 @@ module cva6_genesys2_hdmi #(
     input  logic [7:0]  sw,
     output logic        fan_pwm,
     input  logic        trst_n,
+`ifdef NATIVE_SD
+    inout  wire         spi_mosi,
+    inout  wire         spi_miso,
+    inout  wire         spi_ss,
+    inout  wire         sd_dat1,
+    inout  wire         sd_dat2,
+    output logic        sd_reset,
+    input  logic        sd_cd,
+`else
     output logic        spi_mosi,
     input  logic        spi_miso,
     output logic        spi_ss,
+`endif
     output logic        spi_clk_o,
     input  logic        tck,
     input  logic        tms,
@@ -100,6 +110,12 @@ module cva6_genesys2_hdmi #(
         .spi_miso,
         .spi_ss,
         .spi_clk_o,
+`ifdef NATIVE_SD
+        .sd_dat1,
+        .sd_dat2,
+        .sd_reset,
+        .sd_cd,
+`endif
         .tck,
         .tms,
         .tdi,

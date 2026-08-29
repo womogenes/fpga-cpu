@@ -4,11 +4,23 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 hardware="$root/hardware"
 output="$root/build/gateware"
-bitstream="$output/cva6_genesys2_hdmi.bit"
-hash_file="$output/inputs.sha256"
 uart_baud="${UART_BAUD:-3000000}"
 cpu_frequency=94000000
 uart_reference_frequency=96000000
+native_sd="${NATIVE_SD:-0}"
+
+if [[ "$native_sd" != 0 && "$native_sd" != 1 ]]; then
+    echo "NATIVE_SD must be 0 or 1" >&2
+    exit 1
+fi
+
+if [[ "$native_sd" == 1 ]]; then
+    bitstream="$output/cva6_genesys2_hdmi_native_sdio.bit"
+    hash_file="$output/native_sdio_inputs.sha256"
+else
+    bitstream="$output/cva6_genesys2_hdmi.bit"
+    hash_file="$output/inputs.sha256"
+fi
 
 mkdir -p "$output"
 if [[ "${SKIP_PATCHES:-0}" != 1 ]]; then
@@ -44,6 +56,7 @@ make -C "$hardware/corev_apu/fpga/src/bootrom" \
     HALF_CLOCK_FREQUENCY="$((cpu_frequency / 2))" \
     UART_CLOCK_FREQUENCY="$uart_reference_frequency" \
     UART_BITRATE="$uart_baud" \
+    NATIVE_SD="$native_sd" \
     CFLAGS="$bootrom_cflags" \
     bootrom_64.sv
 
@@ -53,11 +66,16 @@ input_hash="$({
     git -C "$hardware" rev-parse HEAD
     git -C "$hardware" submodule status --recursive
     git -C "$hardware" diff --binary HEAD
+    # corev_apu is itself a submodule. The parent diff records only a dirty
+    # marker, not the changed MIG/SoC bytes, so hash its tracked modifications
+    # explicitly to prevent reusing a bitstream with stale DDR address mapping.
+    git -C "$hardware/corev_apu" diff --binary HEAD
     sha256sum \
         "$hardware/corev_apu/fpga/src/apb_uart/src/vhdl_orig/apb_uart.vhd" \
         "$hardware/corev_apu/fpga/src/apb_uart/src/vhdl_orig/uart_baudgen.vhd" \
         "$hardware/corev_apu/fpga/src/bootrom/src/main.c"
     printf 'UART_BAUD=%s\n' "$uart_baud"
+    printf 'NATIVE_SD=%s\n' "$native_sd"
     find "$root/rtl" "$root/constraints" "$root/scripts" -type f -print0 | sort -z | xargs -0 sha256sum
 } | sha256sum | cut -d' ' -f1)"
 
@@ -78,6 +96,8 @@ fi
 
 export CVA6_HDMI_ROOT="$root"
 export CVA6_UART_BAUD="$uart_baud"
+export CVA6_NATIVE_SD="$native_sd"
+export CVA6_LOW_MEMORY="$native_sd"
 export RISCV
 export CROSSCOMPILE
 export VIVADOFLAGS="-nojournal -mode batch -source scripts/prologue.tcl -source $root/scripts/hdmi_hook.tcl"

@@ -1,4 +1,4 @@
-.PHONY: help init sim lint timing-accelerator gateware smp-smoke smp-cache-stress image ram-image stage2-loader upload-ram upload-ram-model upload-sd-model upload-model monitor deploy-remote remote-boot remote-boot-model remote-boot-sd-model deploy-model-remote remote-model status
+.PHONY: help init sim lint timing-accelerator gateware native-sd-gateware smp-smoke smp-cache-stress image native-sd-image ram-image stage2-loader upload-ram upload-ram-model upload-sd-model upload-model monitor deploy-remote remote-boot remote-boot-model remote-boot-sd-model deploy-model-remote remote-model status
 
 ROOT := $(abspath ../..)
 OUTPUT := $(CURDIR)/build/sdk
@@ -24,9 +24,11 @@ help:
 	@echo "make lint      Elaborate the HDMI terminal RTL with Vivado"
 	@echo "make timing-accelerator Route only the LFM accelerator at its 200 MHz clock"
 	@echo "make gateware Build the CVA6 Genesys 2 HDMI bitstream"
+	@echo "make native-sd-gateware Build the separate native 4-bit SD candidate"
 	@echo "make smp-smoke Build the four-hart bare-metal smoke test"
 	@echo "make smp-cache-stress Build the Linux D-cache coherence stress test"
 	@echo "make image    Build the 64-bit Linux userspace and SD-card image"
+	@echo "make native-sd-image Build Linux/U-Boot with the native-SD device tree"
 	@echo "make ram-image Build Linux with the root filesystem embedded in DRAM firmware"
 	@echo "make stage2-loader Build the flow-controlled fast RAM loader"
 	@echo "make upload-ram Upload the existing DRAM Linux firmware over UART"
@@ -77,6 +79,9 @@ timing-accelerator:
 gateware:
 	UART_BAUD=$(UART_BAUD) ./tools/build_gateware.sh
 
+native-sd-gateware:
+	NATIVE_SD=1 UART_BAUD=$(UART_BAUD) ./tools/build_gateware.sh
+
 smp-smoke:
 	mkdir -p build/diagnostics
 	$$(command -v riscv64-elf-gcc || command -v riscv64-unknown-elf-gcc) -march=rv64ima_zicsr -mabi=lp64 -mcmodel=medany -nostdlib -nostartfiles -T diagnostics/smp_smoke.ld -o build/diagnostics/smp_smoke.elf diagnostics/smp_smoke.S
@@ -110,6 +115,12 @@ image: $(HOST_TOOLS)/bin/bc
 	PATH="$(HOST_TOOLS)/bin:$(PATH)" $(MAKE) -C $(BUILDROOT) O="$(BUILDROOT_OUTPUT)" BR2_EXTERNAL="$(BUILDROOT_EXTERNAL)" BINARIES_DIR=$(OUTPUT) HOSTCXX=$(CURDIR)/tools/host-gxx uboot-rebuild
 	PATH="$(HOST_TOOLS)/bin:$(PATH)" $(MAKE) -C $(BUILDROOT) O="$(BUILDROOT_OUTPUT)" BR2_EXTERNAL="$(BUILDROOT_EXTERNAL)" BINARIES_DIR=$(OUTPUT) HOSTCXX=$(CURDIR)/tools/host-gxx opensbi-rebuild
 	PATH="$(HOST_TOOLS)/bin:$(PATH)" $(MAKE) -j$$(nproc) -C $(BUILDROOT) O="$(BUILDROOT_OUTPUT)" BR2_EXTERNAL="$(BUILDROOT_EXTERNAL)" BINARIES_DIR=$(OUTPUT) HOSTCXX=$(CURDIR)/tools/host-gxx
+
+native-sd-image:
+	$(MAKE) image \
+		BUILDROOT_DEFCONFIG=$(CURDIR)/config/buildroot64_native_sd_defconfig \
+		BUILDROOT_OUTPUT=$(CURDIR)/build/buildroot-native-sd \
+		OUTPUT=$(CURDIR)/build/sdk-native-sd
 
 ram-image: image
 	./tools/build_ram_image.sh

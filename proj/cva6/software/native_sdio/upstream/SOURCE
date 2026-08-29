@@ -1,0 +1,5 @@
+Repository: https://github.com/eugene-tarassov/vivado-risc-v
+Commit: 3264579e8286b0946c49aa44680738cc98cdd6f3
+Imported: 2026-08-28
+Paths: patches/fpga-axi-sdc.c,
+  patches/u-boot/vivado_riscv64/sdc.c

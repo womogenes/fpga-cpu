@@ -1,6 +1,6 @@
 [submodule "cva6-hardware"]
 	path = proj/cva6/hardware
-	url = https://github.com/openhwgroup/cva6.git
+	url = https://github.com/womogenes/fpga-cpu.git
 [submodule "cva6-sdk"]
 	path = proj/cva6/sdk
-	url = https://github.com/openhwgroup/cva6-sdk.git
+	url = https://github.com/womogenes/fpga-cpu.git
