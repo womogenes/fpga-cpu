@@ -2,6 +2,24 @@
 
 This is a standalone Genesys 2 image whose only job is to decode Bonsai-1.7B (Qwen3, Q1_0 weights) as fast as the board allows. There is no CVA6, no Linux, and no HDMI terminal. A small integer-only controller sequences the existing exact accelerator, and a host PC does tokenization over the UART.
 
+## Status (2026-11-18)
+
+First board result, bitstream `build/bonsai_solo_ddr1600.bit` (SHA-256 `ac1f5928…`, WNS +0.020 ns at 200 MHz):
+
+| Measurement                         | Result                                     |
+|-------------------------------------|--------------------------------------------|
+| Exactness gate, "Once upon a time"  | 11,1052,572,264,3908,3743,6941,444,… exact |
+| Decode time per token (positions 4–19) | 95.7–100.2 ms (≈10.2 tok/s)              |
+| 28 layers                           | 77.8–82.3 ms                               |
+| LM head argmax                      | 7.35 ms                                    |
+| 56 norm packs + embedding           | ≈10.5 ms                                   |
+| CVA6 image, same gate               | ≈210 ms (4.75 tok/s)                       |
+| DDR3-1600 memtest                   | 1 GiB, 0 errors                            |
+
+The firmware drives the validated eight-command layer path; the one-command layer sequencer is unused because its retained-QKV attention writes zero K/V. Two attention cores (four did not route at 200 MHz).
+
+Bring-up procedure: flash with `openFPGALoader -b genesys2 --freq 1000000 build/bonsai_solo_ddr1600.bit`, then `host/solo_host.py load --images DIR` (DIR from `host/trace/make_images.sh` plus `sum_table.bin` from `host/sum_table.c`; ≈15 min at 3 Mbaud, skipped when resident), then `host/solo_host.py run --prompt-ids 12522,5193,264,882 -n 16`.
+
 ## Why a separate build
 
 The CVA6 image peaked at about 4.75 tok/s (≈210 ms/token). Simulated arithmetic for the same work is 75–110 ms/token, and the DDR weight-streaming floor is about 41 ms/token. The gap is control overhead: ~200 MMIO command/poll round trips per token through a GPIO and two clock crossings, an exclusive bus arbiter shared with four CPUs, CPU-side embedding/norm work on D-cache-less harts, and 5,376 uncached table stores per token.

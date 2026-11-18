@@ -112,7 +112,7 @@ class Board:
 
     def crc(self, address: int, length: int) -> int:
         self.serial.write(b"C" + struct.pack("<II", address, length))
-        self.expect_ack(timeout=30 + length / 20_000_000)
+        self.expect_ack(timeout=30 + length / 1_000_000)
         return self.u32()
 
     def memtest(self, address: int, length: int, seed: int) -> int:
