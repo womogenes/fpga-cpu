@@ -65,11 +65,20 @@ source $root/scripts/timing_hook.tcl
 report_utilization -file $out/utilization_synth.rpt
 write_checkpoint -force $out/post_synth.dcp
 
+# SOLO_IMPL=explore mirrors the CVA6 build's Performance_ExplorePostRoutePhysOpt.
+set impl [expr {[info exists ::env(SOLO_IMPL)] ? $::env(SOLO_IMPL) : "aggressive"}]
 opt_design -directive Explore
-place_design -directive ExtraTimingOpt
-phys_opt_design -directive AggressiveExplore
-route_design -directive AggressiveExplore
-phys_opt_design -directive AggressiveExplore
+if {$impl eq "explore"} {
+    place_design -directive Explore
+    phys_opt_design -directive Explore
+    route_design -directive Explore
+    phys_opt_design -directive Explore
+} else {
+    place_design -directive ExtraTimingOpt
+    phys_opt_design -directive AggressiveExplore
+    route_design -directive AggressiveExplore
+    phys_opt_design -directive AggressiveExplore
+}
 write_checkpoint -force $out/post_route.dcp
 
 report_timing_summary -max_paths 20 -file $out/timing.rpt

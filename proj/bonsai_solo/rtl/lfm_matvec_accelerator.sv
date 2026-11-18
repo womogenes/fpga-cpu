@@ -1629,7 +1629,7 @@ module lfm_matvec_accelerator #(
     bonsai_attention_quad #(
         .ID_WIDTH(ID_WIDTH),
         .DATA_WIDTH(DATA_WIDTH),
-        .CORE_COUNT(4)
+        .CORE_COUNT(2)
     ) i_attention (
         .clk_i,
         .rst_ni,

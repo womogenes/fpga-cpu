@@ -284,6 +284,10 @@ module bonsai_attention #(
     // A second preserved boundary isolates half-to-Q16 conversion from the
     // DSP input registers.  Both stages accept a group every clock.
     (* keep = "true", dont_touch = "true" *) logic stream_convert_valid;
+    // Replicas of stream_convert_valid for the ~800 operand/pipeline loads
+    // below; a single dont_touch register cannot be replicated by Vivado
+    // and its routing alone exceeded the 5 ns period.
+    (* keep = "true" *) logic [11:0] stream_convert_sel;
     (* keep = "true", dont_touch = "true" *) logic stream_convert_last;
     (* keep = "true", dont_touch = "true" *) logic [4:0] stream_convert_tag;
     (* keep = "true", dont_touch = "true" *) logic signed [31:0]
@@ -836,12 +840,14 @@ module bonsai_attention #(
             mul_stream_tag <= 0;
             stream_input_valid <= 0;
             stream_convert_valid <= 0;
+            stream_convert_sel <= 0;
         end else begin
             // Capture the asynchronous memory outputs first.  Metadata and
             // accumulator values travel with the same group so the extra
             // stage cannot skew weighted-sum writes.
             stream_input_valid <= stream_mul_kick;
             stream_convert_valid <= stream_input_valid;
+            stream_convert_sel <= {12{stream_input_valid}};
             mul_valid_pipe <= {mul_valid_pipe[3:0],
                 mul_kick || exp_mul_kick || stream_convert_valid};
             mul_last_pipe <= {mul_last_pipe[3:0],
@@ -861,50 +867,66 @@ module bonsai_attention #(
             pair_mul_base3 <= pair_mul_base3_pipe[3];
             mul_active <= |mul_valid_pipe;
 
-            if (mul_kick || exp_mul_kick || stream_convert_valid) begin
-                mul_operand_a[0] <= stream_convert_valid ? stream_converted_a[0] :
-                                      mul_selected_a0;
-                mul_operand_a[1] <= stream_convert_valid ? stream_converted_a[1] :
-                                      mul_selected_a1;
-                mul_operand_a[2] <= stream_convert_valid ? stream_converted_a[2] :
-                                      mul_selected_a2;
-                mul_operand_a[3] <= stream_convert_valid ? stream_converted_a[3] :
-                                      mul_selected_a3;
-                mul_operand_b[0] <= stream_convert_valid ? stream_converted_b[0] :
-                                      mul_selected_b0;
-                mul_operand_b[1] <= stream_convert_valid ? stream_converted_b[1] :
-                                      mul_selected_b1;
-                mul_operand_b[2] <= stream_convert_valid ? stream_converted_b[2] :
-                                      mul_selected_b2;
-                mul_operand_b[3] <= stream_convert_valid ? stream_converted_b[3] :
-                                      mul_selected_b3;
-                if (DUAL_QUERY) begin
-                    pair_mul_operand_a[0] <= pair_stream_converted_a[0];
-                    pair_mul_operand_a[1] <= pair_stream_converted_a[1];
-                    pair_mul_operand_a[2] <= pair_stream_converted_a[2];
-                    pair_mul_operand_a[3] <= pair_stream_converted_a[3];
-                    pair_mul_operand_b[0] <= pair_stream_converted_b[0];
-                    pair_mul_operand_b[1] <= pair_stream_converted_b[1];
-                    pair_mul_operand_b[2] <= pair_stream_converted_b[2];
-                    pair_mul_operand_b[3] <= pair_stream_converted_b[3];
-                end
-                mul_tag_pipe[0] <= stream_convert_valid ? stream_convert_tag :
-                                                            index[4:0];
-                mul_base0_pipe[0] <= stream_convert_valid ? stream_convert_base0 :
-                                                            sum_accum0;
-                mul_base1_pipe[0] <= stream_convert_valid ? stream_convert_base1 :
-                                                            sum_accum1;
-                mul_base2_pipe[0] <= stream_convert_valid ? stream_convert_base2 :
-                                                            sum_accum2;
-                mul_base3_pipe[0] <= stream_convert_valid ? stream_convert_base3 :
-                                                            sum_accum3;
-                pair_mul_base0_pipe[0] <= stream_convert_valid ?
+            if (mul_kick || exp_mul_kick || stream_convert_sel[0])
+                mul_operand_a[0] <= stream_convert_sel[0] ?
+                    stream_converted_a[0] : mul_selected_a0;
+            if (mul_kick || exp_mul_kick || stream_convert_sel[1])
+                mul_operand_a[1] <= stream_convert_sel[1] ?
+                    stream_converted_a[1] : mul_selected_a1;
+            if (mul_kick || exp_mul_kick || stream_convert_sel[2])
+                mul_operand_a[2] <= stream_convert_sel[2] ?
+                    stream_converted_a[2] : mul_selected_a2;
+            if (mul_kick || exp_mul_kick || stream_convert_sel[3])
+                mul_operand_a[3] <= stream_convert_sel[3] ?
+                    stream_converted_a[3] : mul_selected_a3;
+            if (mul_kick || exp_mul_kick || stream_convert_sel[4]) begin
+                mul_operand_b[0] <= stream_convert_sel[4] ?
+                    stream_converted_b[0] : mul_selected_b0;
+                mul_operand_b[1] <= stream_convert_sel[4] ?
+                    stream_converted_b[1] : mul_selected_b1;
+            end
+            if (mul_kick || exp_mul_kick || stream_convert_sel[5]) begin
+                mul_operand_b[2] <= stream_convert_sel[5] ?
+                    stream_converted_b[2] : mul_selected_b2;
+                mul_operand_b[3] <= stream_convert_sel[5] ?
+                    stream_converted_b[3] : mul_selected_b3;
+            end
+            if (DUAL_QUERY &&
+                (mul_kick || exp_mul_kick || stream_convert_sel[6])) begin
+                pair_mul_operand_a[0] <= pair_stream_converted_a[0];
+                pair_mul_operand_a[1] <= pair_stream_converted_a[1];
+                pair_mul_operand_a[2] <= pair_stream_converted_a[2];
+                pair_mul_operand_a[3] <= pair_stream_converted_a[3];
+                pair_mul_operand_b[0] <= pair_stream_converted_b[0];
+                pair_mul_operand_b[1] <= pair_stream_converted_b[1];
+                pair_mul_operand_b[2] <= pair_stream_converted_b[2];
+                pair_mul_operand_b[3] <= pair_stream_converted_b[3];
+            end
+            if (mul_kick || exp_mul_kick || stream_convert_sel[7]) begin
+                mul_tag_pipe[0] <= stream_convert_sel[7] ? stream_convert_tag :
+                                                           index[4:0];
+                mul_base0_pipe[0] <= stream_convert_sel[7] ?
+                    stream_convert_base0 : sum_accum0;
+            end
+            if (mul_kick || exp_mul_kick || stream_convert_sel[8]) begin
+                mul_base1_pipe[0] <= stream_convert_sel[8] ?
+                    stream_convert_base1 : sum_accum1;
+                mul_base2_pipe[0] <= stream_convert_sel[8] ?
+                    stream_convert_base2 : sum_accum2;
+            end
+            if (mul_kick || exp_mul_kick || stream_convert_sel[9])
+                mul_base3_pipe[0] <= stream_convert_sel[9] ?
+                    stream_convert_base3 : sum_accum3;
+            if (mul_kick || exp_mul_kick || stream_convert_sel[10]) begin
+                pair_mul_base0_pipe[0] <= stream_convert_sel[10] ?
                     pair_stream_convert_base0 : pair_sum_accum0;
-                pair_mul_base1_pipe[0] <= stream_convert_valid ?
+                pair_mul_base1_pipe[0] <= stream_convert_sel[10] ?
                     pair_stream_convert_base1 : pair_sum_accum1;
-                pair_mul_base2_pipe[0] <= stream_convert_valid ?
+            end
+            if (mul_kick || exp_mul_kick || stream_convert_sel[11]) begin
+                pair_mul_base2_pipe[0] <= stream_convert_sel[11] ?
                     pair_stream_convert_base2 : pair_sum_accum2;
-                pair_mul_base3_pipe[0] <= stream_convert_valid ?
+                pair_mul_base3_pipe[0] <= stream_convert_sel[11] ?
                     pair_stream_convert_base3 : pair_sum_accum3;
             end
 
