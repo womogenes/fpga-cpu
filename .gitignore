@@ -6,3 +6,13 @@
 # Generated output outside a self-contained project directory.
 /build/
 *.obj
+
+# Bitstreams, checkpoints, and logs stay local.
+*.bit
+*.bit.gz
+/checkpoints/
+*.log
+node_modules/
+
+# Copyrighted source video for the bad apple demo.
+proj/sw/bad_apple/assets/*.mp4

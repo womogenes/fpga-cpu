@@ -2,7 +2,6 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -12,7 +11,6 @@
 #include <unistd.h>
 
 #define MAX_ITERATIONS 48u
-#define RENDER_THREADS 4u
 #define ZOOM_FACTOR 0.992f
 /* Below this span, adjacent 160-pixel samples approach the float ULP around
    the chosen center and the picture degenerates into repeated columns. */
@@ -21,22 +19,6 @@
 static const float center_real = -0.7436439f;
 static const float center_imag = 0.1318259f;
 static volatile sig_atomic_t stop_requested;
-
-struct render_pool {
-  pthread_barrier_t begin;
-  pthread_barrier_t done;
-  pthread_t threads[RENDER_THREADS - 1u];
-  uint8_t *frame;
-  float span;
-  int stop;
-};
-
-struct worker_arg {
-  struct render_pool *pool;
-  unsigned index;
-};
-
-static struct worker_arg worker_args[RENDER_THREADS - 1u];
 
 static void request_stop(int signal_number) {
   (void)signal_number;
@@ -92,67 +74,28 @@ static uint8_t sample(float cr, float ci) {
   return palette(iteration);
 }
 
-static void render_rows(struct render_pool *pool, unsigned worker) {
-  float span = pool->span;
+static void render_frame(uint8_t *frame, float span) {
   float vertical_span = span * (float)VIDEO_HEIGHT / (float)VIDEO_WIDTH;
   float real_step = (2.0f * span) / (float)VIDEO_WIDTH;
   float imag_step = (2.0f * vertical_span) / (float)VIDEO_HEIGHT;
   float first_real = center_real - span + 0.5f * real_step;
   float first_imag = center_imag - vertical_span + 0.5f * imag_step;
 
-  for (unsigned y = worker; y < VIDEO_HEIGHT; y += RENDER_THREADS) {
-    float ci = first_imag + (float)y * imag_step;
-    uint8_t *row = pool->frame + y * VIDEO_WIDTH;
-    for (unsigned x = 0; x < VIDEO_WIDTH; ++x)
-      row[x] = sample(first_real + (float)x * real_step, ci);
-  }
-}
-
-static void *render_worker(void *opaque) {
-  struct worker_arg *arg = opaque;
-  for (;;) {
-    (void)pthread_barrier_wait(&arg->pool->begin);
-    if (arg->pool->stop)
+  for (unsigned y = 0; y < VIDEO_HEIGHT; ++y) {
+    /* Avoid pthreads here: the target's minimal futex implementation can
+       wedge during pool/barrier startup. Poll every row so the foreground
+       renderer remains reliably interruptible even on its first frame. */
+    poll_stop_key();
+    if (stop_requested)
       break;
-    render_rows(arg->pool, arg->index);
-    (void)pthread_barrier_wait(&arg->pool->done);
-  }
-  return NULL;
-}
-
-static int render_pool_open(struct render_pool *pool, uint8_t *frame) {
-  pool->frame = frame;
-  if (pthread_barrier_init(&pool->begin, NULL, RENDER_THREADS) != 0 ||
-      pthread_barrier_init(&pool->done, NULL, RENDER_THREADS) != 0)
-    return 1;
-  for (unsigned i = 1; i < RENDER_THREADS; ++i) {
-    worker_args[i - 1u].pool = pool;
-    worker_args[i - 1u].index = i;
-    if (pthread_create(&pool->threads[i - 1u], NULL, render_worker,
-                       &worker_args[i - 1u]) != 0) {
-      pool->stop = 1;
-      /* A partial pool cannot satisfy the barrier, so terminate cleanly
-         instead of entering it. The process exit reclaims those threads. */
-      return 1;
+    float ci = first_imag + (float)y * imag_step;
+    uint8_t *row = frame + y * VIDEO_WIDTH;
+    for (unsigned x = 0; x < VIDEO_WIDTH; ++x) {
+      if ((x & 31u) == 0u && stop_requested)
+        break;
+      row[x] = sample(first_real + (float)x * real_step, ci);
     }
   }
-  return 0;
-}
-
-static void render_frame(struct render_pool *pool, float span) {
-  pool->span = span;
-  (void)pthread_barrier_wait(&pool->begin);
-  render_rows(pool, 0u);
-  (void)pthread_barrier_wait(&pool->done);
-}
-
-static void render_pool_close(struct render_pool *pool) {
-  pool->stop = 1;
-  (void)pthread_barrier_wait(&pool->begin);
-  for (unsigned i = 1; i < RENDER_THREADS; ++i)
-    (void)pthread_join(pool->threads[i - 1u], NULL);
-  (void)pthread_barrier_destroy(&pool->done);
-  (void)pthread_barrier_destroy(&pool->begin);
 }
 
 static double elapsed_seconds(const struct timespec *start,
@@ -162,13 +105,25 @@ static double elapsed_seconds(const struct timespec *start,
 }
 
 int main(void) {
+  /* Bonsai and the legacy software-video plane share the AXI GPIO command
+     register. Sending a video command while the Bonsai accelerator owns that
+     register can leave the CPU in an uninterruptible MMIO transaction. The
+     attention reservation uniquely identifies those bitstreams, so refuse
+     before touching /dev/mem rather than risking a machine-wide hang. */
+  if (access("/proc/device-tree/reserved-memory/attention-kv@a0000000",
+             F_OK) == 0) {
+    fputs("mandelbrot: unavailable while the Bonsai accelerator owns the "
+          "shared HDMI command port\n",
+          stderr);
+    return 2;
+  }
+
   struct video_hw video = {0};
   if (video_hw_open(&video) != 0)
     return 1;
 
   uint8_t *frame = malloc(VIDEO_PIXELS);
-  struct render_pool pool = {0};
-  if (frame == NULL || render_pool_open(&pool, frame) != 0) {
+  if (frame == NULL) {
     free(frame);
     video_hw_close(&video);
     return 1;
@@ -182,6 +137,11 @@ int main(void) {
   if (terminal_valid) {
     struct termios raw = saved_terminal;
     cfmakeraw(&raw);
+    /* cfmakeraw() disables ISIG, which turns Ctrl-C into an ordinary queued
+       byte. Retain signal generation so SIGINT can stop render or HDMI work
+       immediately; poll_stop_key() still accepts q and literal byte 3. */
+    raw.c_lflag |= ISIG;
+    raw.c_cc[VINTR] = 3;
     (void)tcsetattr(STDIN_FILENO, TCSANOW, &raw);
   }
   if (saved_flags >= 0)
@@ -192,7 +152,7 @@ int main(void) {
   float span = 1.6f;
   int status = 0;
 
-  render_frame(&pool, span);
+  render_frame(frame, span);
   while (!stop_requested) {
     poll_stop_key();
     if (stop_requested)
@@ -205,12 +165,11 @@ int main(void) {
     span *= ZOOM_FACTOR;
     if (span < MIN_SPAN)
       span = 1.6f;
-    render_frame(&pool, span);
+    render_frame(frame, span);
   }
 
   struct timespec finished;
   clock_gettime(CLOCK_MONOTONIC, &finished);
-  render_pool_close(&pool);
   video_hw_terminal(&video);
   video_hw_close(&video);
   if (saved_flags >= 0)

@@ -96,7 +96,7 @@ def main() -> None:
         "BONSAI_SERIAL", "/dev/ttyUSB0"))
     parser.add_argument("--baud", type=int, default=3_000_000)
     parser.add_argument("--binary", default=os.environ.get(
-        "BONSAI_FPGA_RUNTIME", "/root/bonsai-lite-fp32-argmax"))
+        "BONSAI_FPGA_RUNTIME", "/root/bonsai-lite-4tps"))
     args, _ = parser.parse_known_args()
 
     pending = bytearray()
@@ -133,24 +133,25 @@ def main() -> None:
         else:
             runtime_binary = "/tmp/bonsai-lite.run"
             prepare_runtime = (
+                f"test -x {runtime_binary} || {{ "
                 f"cp {source_binary} {runtime_binary} && "
-                f"chmod 0755 {runtime_binary} && "
+                f"chmod 0755 {runtime_binary}; }}; "
             )
         command = (
             prepare_runtime +
             "BONSAI_STARTUP_PROFILE=1 BONSAI_MODEL_PRESTAGED=1 "
             "BONSAI_MODEL_DDR=1 "
-            "BONSAI_CACHED_INPUT=0 BONSAI_CACHED_OUTPUT=0 "
-            "BONSAI_COMPACT_OUTPUT=1 "
-            "BONSAI_GQA_ATTENTION=1 BONSAI_STREAM_TOKENS=1 "
+            "BONSAI_CACHED_INPUT=1 BONSAI_CACHED_OUTPUT=1 "
+            "BONSAI_COMPACT_OUTPUT=1 BONSAI_PACKED_INPUT=1 "
+            "BONSAI_REFERENCE_PACK=0 BONSAI_STREAM_PHASES=1 "
             "BONSAI_PARALLEL_ROWS=1 BONSAI_HW_TRANSFORMS=1 "
             "BONSAI_HW_RESIDUAL=1 "
-            "BONSAI_HW_ATTENTION=1 BONSAI_HW_ATTENTION_SKIP_MASK=0x6 "
+            "BONSAI_HW_ATTENTION=1 BONSAI_HW_ATTENTION_SKIP_MASK=0 "
             "BONSAI_HW_ARGMAX=1 "
             f"exec {runtime_binary} --model /root/models/"
             f"Bonsai-1.7B-packed.gguf --server --threads {args.threads}\r"
         ).encode()
-        write_paced(port, command, rate=300)
+        write_paced(port, command, rate=1_000)
         report_phase("runtime-command-sent")
 
         deadline = time.monotonic() + 900
@@ -158,15 +159,14 @@ def main() -> None:
             line = read_line(port, pending, deadline).strip(b"\r\n")
             if line == b"READY":
                 report_phase("runtime-ready")
-                sys.stdout.write("READY\n")
-                sys.stdout.flush()
-                # Make the interactive prompt visible immediately, then warm
-                # the immutable ChatML user-role prefix while the client is
-                # waiting for input. Any early request simply remains queued
-                # in the decoder pipe until this private request completes.
+                # Warm the immutable ChatML user-role prefix before publishing
+                # readiness. The first visible prompt is therefore genuinely
+                # ready to accept a request, with no hidden work still queued.
                 write_paced(port, b"RUN 0 3 151644 872 198\r")
                 wait_for(port, pending, b"DONE\r\n", 30)
                 report_phase("prefix-ready")
+                sys.stdout.write("READY\n")
+                sys.stdout.flush()
                 break
             if line:
                 print(f"[fpga +{time.monotonic() - started:.3f}s] "

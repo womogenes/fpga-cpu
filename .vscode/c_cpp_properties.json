@@ -8,11 +8,16 @@
                 "-mabi=ilp32"
             ],
             "defines": [
-                "__vexriscv__"
+                "__vexriscv__",
+                "MICROPY_FLOAT_IMPL=MICROPY_FLOAT_IMPL_FLOAT"
             ],
             "includePath": [
                 "${workspaceFolder}/proj/build/fpga_soc/software/include",
-                "${workspaceFolder}/proj/sw/runtime/include"
+                "${workspaceFolder}/proj/sw/runtime/include",
+                "${workspaceFolder}/proj/sw/text_console/include",
+                "${workspaceFolder}/proj/sw/micropython_repl",
+                "${workspaceFolder}/proj/sw/micropython_repl/vendor/micropython",
+                "${workspaceFolder}/proj/sw/micropython_repl/build"
             ],
             "cStandard": "gnu99"
         }

@@ -139,14 +139,18 @@ def send_file(
 
     if not data_only:
         wait_for(port, {CRC_REQUEST}, timeout, "initial CRC request")
+        # U-Boot is still transitioning into the receive loop for block zero.
+        # Give that small control packet conservative FIFO pacing independently
+        # of the bulk-data delay, which can safely be much shorter.
+        header_delay = max(chunk_delay, 0.001)
         send_with_retries(
             port,
             packet(0, header_data.ljust(128, b"\0")),
             0,
             timeout,
             retries,
-            chunk_size,
-            chunk_delay,
+            min(chunk_size, 16),
+            header_delay,
         )
         wait_for(port, {CRC_REQUEST}, timeout, "data CRC request")
 
@@ -203,8 +207,8 @@ def send_file(
         0,
         timeout,
         retries,
-        chunk_size,
-        chunk_delay,
+        min(chunk_size, 16),
+        max(chunk_delay, 0.001),
     )
 
 

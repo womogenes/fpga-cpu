@@ -1,0 +1,5 @@
+#N R-pentomino
+#O John Conway, 1969
+#C A five-cell methuselah that stabilizes after 1103 generations.
+x = 3, y = 3, rule = B3/S23
+b2o$2o$bo!

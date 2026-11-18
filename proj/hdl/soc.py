@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+from pathlib import Path
+
 from migen import Cat, ClockDomain, ClockDomainsRenamer, If, Mux, Signal
 from migen.genlib.cdc import MultiReg
 
@@ -330,6 +332,16 @@ def main():
         **parser.soc_argdict,
     )
     builder = Builder(soc, **parser.builder_argdict)
+    # The stock interrupt-driven LiteX UART drains the hardware FIFO into a
+    # hardcoded 128-byte software ring and silently drops the rest. SFL's
+    # normal 255-byte serial-boot frames therefore cannot work at high baud
+    # rates. Use the project libbase override, which polls the 512-byte FIFO
+    # directly and leaves the upstream LiteX installation untouched.
+    project_libbase = Path(__file__).resolve().parents[1] / "software" / "libbase"
+    builder.software_packages = [
+        (name, str(project_libbase) if name == "libbase" else source)
+        for name, source in builder.software_packages
+    ]
     if args.build:
         builder.build(**parser.toolchain_argdict)
 

@@ -31,11 +31,8 @@ static uint8_t candidate_state[FB_PIXELS] DDR_BSS;
 static uint32_t live_cells[FB_PIXELS] DDR_NOINIT;
 static uint32_t candidate_cells[FB_PIXELS] DDR_NOINIT;
 
-/* Standard 36-cell, period-30 Gosper glider gun in RLE format. */
-static const char initial_pattern[] =
-    "24bo11b$22bobo11b$12b2o6b2o12b2o$11bo3bo4b2o12b2o$"
-    "2o8bo5bo3b2o14b$2o8bo3bob2o4bobo11b$10bo5bo7bo11b$"
-    "11bo3bo20b$12b2o!";
+/* Packed by rle_to_bin.py: little-endian width/height, then RLE text. */
+extern const uint8_t _binary_initial_pattern_bin_start[];
 
 static inline uint32_t pack_coord(unsigned int x, unsigned int y) {
   return (y << COORD_X_BITS) | x;
@@ -238,11 +235,22 @@ int main(void) {
   puts("Welcome to game of life!");
 
   clear_framebuffer(framebuffer);
+  const uint8_t* pattern = _binary_initial_pattern_bin_start;
+  unsigned int pattern_width =
+      (unsigned int)pattern[0] | ((unsigned int)pattern[1] << 8);
+  unsigned int pattern_height =
+      (unsigned int)pattern[2] | ((unsigned int)pattern[3] << 8);
+  unsigned int origin_x = pattern_width < FB_WIDTH
+                              ? (FB_WIDTH - pattern_width) / 2u
+                              : 0u;
+  unsigned int origin_y = pattern_height < FB_HEIGHT
+                              ? (FB_HEIGHT - pattern_height) / 2u
+                              : 0u;
   unsigned int live_count = load_rle(
       framebuffer,
-      initial_pattern,
-      (FB_WIDTH - 36u) / 2u,
-      64u);
+      (const char*)(pattern + 4u),
+      origin_x,
+      origin_y);
 
   flush_cpu_dcache();
   flush_l2_cache();

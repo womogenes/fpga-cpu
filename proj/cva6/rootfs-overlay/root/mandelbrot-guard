@@ -1,0 +1,6 @@
+#!/bin/sh
+if [ -e /proc/device-tree/reserved-memory/attention-kv@a0000000 ]; then
+    echo "mandelbrot: unavailable on the Bonsai bitstream (shared HDMI/accelerator port)" >&2
+    exit 2
+fi
+exec /root/mandelbrot-unsafe.old "$@"
