@@ -84,6 +84,7 @@ write_checkpoint -force $out/post_route.dcp
 report_timing_summary -max_paths 20 -file $out/timing.rpt
 report_utilization -hierarchical -hierarchical_depth 4 -file $out/utilization.rpt
 report_route_status -file $out/route_status.rpt
+report_clock_interaction -delay_type min_max -file $out/clock_interaction.rpt
 report_drc -file $out/drc.rpt
 write_bitstream -force $out/bonsai_solo_ddr$ddr.bit
 set wns [get_property SLACK [get_timing_paths -max_paths 1 -nworst 1 -setup]]

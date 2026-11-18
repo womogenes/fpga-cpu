@@ -60,6 +60,17 @@ module solo_core #(
     wire clk = clk_i;
     wire rst_n = rst_ni;
 
+    // rst_ni reaches the accelerator under a 4-cycle multicycle constraint
+    // (scripts/timing_hook.tcl); the controller leaves reset 6 cycles later
+    // through this short chain, so the CPU only starts once every
+    // accelerator register is out of reset.
+    logic [5:0] ctrl_rst_chain;
+    always_ff @(posedge clk or negedge rst_ni) begin
+        if (!rst_ni) ctrl_rst_chain <= '0;
+        else ctrl_rst_chain <= {ctrl_rst_chain[4:0], 1'b1};
+    end
+    wire ctrl_rst_n = ctrl_rst_chain[5];
+
     AXI_BUS #(
         .AXI_ADDR_WIDTH(ADDR_WIDTH), .AXI_DATA_WIDTH(DATA_WIDTH),
         .AXI_ID_WIDTH(ID_WIDTH), .AXI_USER_WIDTH(USER_WIDTH)
@@ -112,7 +123,7 @@ module solo_core #(
     // ----------------------------------------------------------- controller
     solo_ctrl #(.BOOT_HEX(BOOT_HEX)) i_ctrl (
         .clk_i          (clk),
-        .rst_ni         (rst_n),
+        .rst_ni         (ctrl_rst_n),
         .calib_done_i   (calib_done_i),
         .uart_rx_i      (rx),
         .uart_tx_o      (tx),

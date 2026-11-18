@@ -194,3 +194,21 @@ if {[llength $lfm_reader_state] > 0 && [llength $lfm_mode_static_targets] > 0} {
     set_multicycle_path -setup 2 -from $lfm_reader_state -to $lfm_mode_static_targets
     set_multicycle_path -hold 1 -from $lfm_reader_state -to $lfm_mode_static_targets
 }
+
+# Solo build: the accelerator/arbiter reset is a single synchronizer flop with
+# ~60k loads. Its domain is idle until the controller (which leaves reset six
+# cycles later, ctrl_rst_chain) issues a command, so allow four cycles.
+set solo_reset [get_cells -hier -filter {NAME =~ rst_sync_reg[2]}]
+if {[llength $solo_reset] > 0} {
+    set_multicycle_path -setup 4 -from $solo_reset
+    set_multicycle_path -hold 3 -from $solo_reset
+}
+set solo_fp_reset [get_cells -hier -filter {NAME =~ fp_rst_sync_reg[2]}]
+if {[llength $solo_fp_reset] > 0} {
+    set_multicycle_path -setup 4 -from $solo_fp_reset
+    set_multicycle_path -hold 3 -from $solo_fp_reset
+}
+# Debug-state synchronizers from the 125 MHz FP domain are status-only.
+set solo_debug_meta [get_cells -hier -filter {NAME =~ *debug*_meta_reg* && REF_NAME =~ FD*}]
+puts "SOLO_HOOK reset=[llength $solo_reset] fp_reset=[llength $solo_fp_reset] debug_meta=[llength $solo_debug_meta]"
+if {[llength $solo_debug_meta] > 0} { set_false_path -to $solo_debug_meta }
