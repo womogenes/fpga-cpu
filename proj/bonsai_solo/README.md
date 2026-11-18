@@ -42,23 +42,22 @@ With zero control overhead this is already 10–12 tok/s. Reaching the streaming
 
 Target after all three: ≈50 ms/token, about 20 tok/s.
 
-## Going past the streaming floor
+## Reaching the streaming floor
 
-The ≈24 tok/s floor assumes one full weight pass per generated token. Four further levers, all exact (greedy output is unchanged):
+Production decodes at batch 1, one token per weight pass, so the target is to make the ≈41 ms/token weight-streaming time the actual token time and then raise the bandwidth itself. Greedy output stays bit-exact throughout.
 
-1. Keep DDR busy 100% of the time. Attention, norms and packing currently leave the bus idle. A ≈1 MiB on-chip weight prefetch FIFO (the part has ≈2 MiB of BRAM, mostly freed by removing CVA6) streams the next matrix while those kernels run, so the 41 ms floor becomes the actual token time instead of a lower bound.
-2. Verify several tokens per weight pass. With 1-bit weights a matvec is only adds, so applying each 256-bit weight beat to K activation vectors costs ≈K×256 int8 adds per cycle and no extra bandwidth. K = 4 is affordable in the freed LUTs. Draft tokens come from prompt lookup (n-gram match against the context) or from a small draft head computed on the FPGA, and greedy speculative verification accepts the longest matching prefix. Typical acceptance gives 1.5–2.5 tokens per pass on chat/code text, and up to K on repetitive text.
-3. Batched prefill. The same K-wide datapath processes prompt tokens K at a time, so a 100-token prompt costs ≈25 weight passes instead of 100.
-4. Faster DDR. The Kintex-7 -2 HP banks support DDR3-1866. The board's DDR3 is rated 1600, but running it at 1866 MT/s is a MIG setting worth one experiment: +17% bandwidth if it trains and passes a memory test.
+1. Maximal pipelining: DDR is never idle. Attention, norms, residual and packing currently leave the bus idle between matrices. A ≈1 MiB on-chip weight prefetch FIFO (the part has ≈2 MiB of BRAM, mostly freed by removing CVA6) keeps streaming the next matrix while those kernels run, and kernels start on partial results (row-streamed residual, packing and norm) instead of waiting for whole vectors.
+2. Faster DDR. The Kintex-7 -2 HP banks support DDR3-1866. The board's DDR3 is rated 1600, so running it at 1866 MT/s is an experiment: +17% bandwidth if it calibrates and passes an on-board memory test.
 
 | Stage                                    | Est. ms/token | Est. tok/s |
 |------------------------------------------|---------------|------------|
 | CVA6 image today                          | 210           | 4.75       |
 | Solo build, existing blocks               | 80–100        | 10–12      |
 | + quad attention, residual fold, wide FFN | ≈50           | ≈20        |
-| + weight prefetch FIFO (bus never idle)   | ≈41           | ≈24        |
+| + weight prefetch, overlapped kernels     | ≈41           | ≈24        |
 | + DDR3-1866                               | ≈35           | ≈28        |
-| + K=4 speculative verification            | ≈35 per pass  | ≈40–60     |
+
+Deliberately out of scope for now: batched prefill and speculative multi-token verification. Both need a K-vector matvec datapath; they remain the route past ≈28 tok/s if batch-1 production requirements change.
 
 For reference, the same model on the host laptop (Ryzen 9 7940HS) decodes at 83 tok/s on 8 CPU threads and 107 tok/s on the Radeon 780M iGPU through llama.cpp Vulkan.
 
@@ -104,4 +103,4 @@ Prompt token IDs `12522,5193,264,882` must produce the prefix `11,1052,572,264` 
 1. Copy the newest accelerator RTL (sequencer, quad attention, rms scale) from the `cva6-smp` worktree into `rtl/`, and write the new top: MIG, accelerator, PicoRV32, UART, native SD.
 2. Write firmware and the host tool, and simulate the full token loop with a DDR model (on `vivado-v0`, never locally).
 3. First synthesis on `vivado-v0`: existing blocks plus quad attention, per-phase cycle counters, and a DDR3-1866 MIG variant built in parallel. Measure on the board.
-4. Second synthesis: residual fold, wide FFN pack, weight prefetch FIFO, and the K-wide matvec datapath, chosen by what the counters show. Speculative drafting and verification policy then live entirely in firmware.
+4. Second synthesis: residual fold, wide FFN pack, weight prefetch FIFO, and kernel overlap, chosen by what the counters show.
