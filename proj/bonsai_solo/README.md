@@ -44,7 +44,7 @@ Target after all three: ≈50 ms/token, about 20 tok/s.
 
 ## Reaching the streaming floor
 
-Production decodes at batch 1, one token per weight pass, so the target is to make the ≈41 ms/token weight-streaming time the actual token time and then raise the bandwidth itself. Greedy output stays bit-exact throughout.
+Production decodes a single batch-1 stream. The first target is to make the ≈41 ms/token weight-streaming time the actual token time and then raise the bandwidth itself. Greedy output stays bit-exact throughout.
 
 1. Maximal pipelining: DDR is never idle. Attention, norms, residual and packing currently leave the bus idle between matrices. A ≈1 MiB on-chip weight prefetch FIFO (the part has ≈2 MiB of BRAM, mostly freed by removing CVA6) keeps streaming the next matrix while those kernels run, and kernels start on partial results (row-streamed residual, packing and norm) instead of waiting for whole vectors.
 2. Faster DDR. The Kintex-7 -2 HP banks support DDR3-1866. The board's DDR3 is rated 1600, so running it at 1866 MT/s is an experiment: +17% bandwidth if it calibrates and passes an on-board memory test.
@@ -56,8 +56,9 @@ Production decodes at batch 1, one token per weight pass, so the target is to ma
 | + quad attention, residual fold, wide FFN | ≈50           | ≈20        |
 | + weight prefetch, overlapped kernels     | ≈41           | ≈24        |
 | + DDR3-1866                               | ≈35           | ≈28        |
+| + K=4 speculative verification            | ≈35 per pass  | ≈40–60     |
 
-Deliberately out of scope for now: batched prefill and speculative multi-token verification. Both need a K-vector matvec datapath; they remain the route past ≈28 tok/s if batch-1 production requirements change.
+3. Speculative decoding, still a single batch-1 stream. Decode is bandwidth-bound: each weight beat is used by one dot product while the adders idle. A K-vector matvec datapath (K = 4) applies every 256-bit weight beat to the current token plus K−1 draft tokens, costing ≈K×256 int8 adds per cycle and no extra DDR traffic, so one weight pass yields the model's prediction at all K positions. Greedy acceptance keeps the longest prefix of drafts that match the model's own argmax and then emits the model's token at the first mismatch, so the output is token-for-token identical to plain greedy decoding (the integer Q30 arithmetic makes batch-K logits bit-identical to batch-1). The worst case is one token per pass. Drafts come from prompt lookup (n-gram match against the context) first, with a small on-FPGA draft head as a later option; the drafting policy lives in firmware. Attention and KV writes run per position; rejected positions are overwritten on the next pass. Batched prefill is not a goal, though it falls out of the same datapath for free.
 
 For reference, the same model on the host laptop (Ryzen 9 7940HS) decodes at 83 tok/s on 8 CPU threads and 107 tok/s on the Radeon 780M iGPU through llama.cpp Vulkan.
 
@@ -103,4 +104,4 @@ Prompt token IDs `12522,5193,264,882` must produce the prefix `11,1052,572,264` 
 1. Copy the newest accelerator RTL (sequencer, quad attention, rms scale) from the `cva6-smp` worktree into `rtl/`, and write the new top: MIG, accelerator, PicoRV32, UART, native SD.
 2. Write firmware and the host tool, and simulate the full token loop with a DDR model (on `vivado-v0`, never locally).
 3. First synthesis on `vivado-v0`: existing blocks plus quad attention, per-phase cycle counters, and a DDR3-1866 MIG variant built in parallel. Measure on the board.
-4. Second synthesis: residual fold, wide FFN pack, weight prefetch FIFO, and kernel overlap, chosen by what the counters show.
+4. Second synthesis: residual fold, wide FFN pack, weight prefetch FIFO, kernel overlap, and the K=4 verification datapath, chosen by what the counters show. Speculative drafting and acceptance then live entirely in firmware.
