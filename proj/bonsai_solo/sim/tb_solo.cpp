@@ -37,7 +37,14 @@ static void load(const char *path, uint64_t offset) {
 }
 
 // ------------------------------------------------------------- AXI model
-struct Burst { uint64_t address; uint32_t beats; uint32_t id; uint64_t ready_at; };
+struct Burst { uint64_t address; uint32_t beats; uint32_t id; uint64_t ready_at; uint32_t size; };
+
+// INCR burst: beat 0 at the start address, later beats at size-aligned steps.
+static uint64_t beat_address(const Burst &b, uint32_t beat) {
+  uint64_t bytes = 1ull << b.size;
+  uint64_t aligned = b.address & ~(bytes - 1);
+  return (beat == 0 ? b.address : aligned + bytes * beat) & (DDR_BYTES - 1);
+}
 static std::deque<Burst> reads, writes;
 static std::deque<std::pair<uint32_t, uint64_t>> responses;  // id, ready_at
 static uint32_t read_beat;
@@ -50,8 +57,8 @@ static void axi_inputs() {
   top->m_axi_rvalid = 0;
   if (!reads.empty() && cycle >= reads.front().ready_at) {
     const Burst &b = reads.front();
-    uint64_t address = (b.address & ~31ull) + 32ull * read_beat;
-    memcpy(top->m_axi_rdata.data(), ddr + (address & (DDR_BYTES - 1)), 32);
+    uint64_t address = beat_address(b, read_beat) & ~31ull;
+    memcpy(top->m_axi_rdata.data(), ddr + address, 32);
     top->m_axi_rvalid = 1;
     top->m_axi_rid = b.id;
     top->m_axi_rresp = 0;
@@ -69,16 +76,32 @@ static void axi_inputs() {
 static void axi_handshakes() {
   if (top->m_axi_arvalid && top->m_axi_arready)
     reads.push_back({top->m_axi_araddr, top->m_axi_arlen + 1u,
-                     top->m_axi_arid, cycle + READ_LATENCY});
-  if (top->m_axi_awvalid && top->m_axi_awready)
+                     top->m_axi_arid, cycle + READ_LATENCY,
+                     top->m_axi_arsize});
+  if (top->m_axi_awvalid && top->m_axi_awready) {
     writes.push_back({top->m_axi_awaddr, top->m_axi_awlen + 1u,
-                      top->m_axi_awid, 0});
+                      top->m_axi_awid, 0, top->m_axi_awsize});
+    static int logged;
+    if (getenv("TB_LOG_WRITES") && logged < 200000 && cycle > 100000) {
+      ++logged;
+      fprintf(stderr, "AW cyc=%llu addr=0x%08x len=%u size=%u id=%u\n",
+              (unsigned long long)cycle, top->m_axi_awaddr, top->m_axi_awlen,
+              top->m_axi_awsize, top->m_axi_awid);
+    }
+  }
   if (top->m_axi_wvalid && top->m_axi_wready) {
     Burst &b = writes.front();
-    uint64_t address = ((b.address & ~31ull) + 32ull * write_beat) &
-                       (DDR_BYTES - 1);
+    uint64_t address = beat_address(b, write_beat) & ~31ull;
     const uint32_t *data = top->m_axi_wdata.data();
     uint32_t strobe = top->m_axi_wstrb;
+    static int kv_logged;
+    if (getenv("TB_LOG_WRITES") && kv_logged < 40 &&
+        (b.address >> 23) == (0x20000000u >> 23)) {
+      ++kv_logged;
+      fprintf(stderr, "KVW addr=0x%08llx strobe=%08x data=%08x %08x %08x %08x %08x %08x %08x %08x\n",
+              (unsigned long long)address, strobe, data[0], data[1], data[2],
+              data[3], data[4], data[5], data[6], data[7]);
+    }
     for (int i = 0; i < 32; ++i)
       if (strobe & (1u << i))
         ddr[address + i] = (uint8_t)(data[i / 4] >> (8 * (i % 4)));
@@ -274,6 +297,17 @@ int main(int argc, char **argv) {
     fflush(stdout);
   }
   fprintf(stderr, "done in %llu cycles\n", (unsigned long long)(cycle - start));
+  if (const char *dump = getenv("TB_DUMP_SCRATCH")) {
+    FILE *f = fopen(dump, "wb");
+    fwrite(ddr + 0x3e000000ull, 1, 32u << 20, f);
+    fclose(f);
+    fprintf(stderr, "dumped scratch to %s\n", dump);
+  }
+  if (const char *dump = getenv("TB_DUMP_KV")) {
+    FILE *f = fopen(dump, "wb");
+    fwrite(ddr + 0x20000000ull, 1, 1u << 20, f);
+    fclose(f);
+  }
   delete top;
   return 0;
 }

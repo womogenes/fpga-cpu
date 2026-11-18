@@ -3,13 +3,14 @@
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 out="${1:-$root/sim/obj}"
+boot_hex="${BOOT_HEX:-$root/fw/build/sim_boot.hex}"
 cd "$root"
 verilator --cc --exe --build -j "$(nproc)" -O3 --x-assign fast --x-initial fast \
     -Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNUSEDSIGNAL \
     -Wno-UNUSEDPARAM -Wno-DECLFILENAME -Wno-TIMESCALEMOD \
     -Wno-PINCONNECTEMPTY -Wno-GENUNNAMED -Wno-UNOPTFLAT \
     -Ivendor/pulp_axi/include -Ivendor/common_cells/include -Ivendor/cvfpu \
-    --top-module solo_core -GBOOT_HEX="\"$root/fw/build/sim_boot.hex\"" \
+    --top-module solo_core -GBOOT_HEX="\"$boot_hex\"" \
     --Mdir "$out" -CFLAGS -O2 -o tb_solo \
     vendor/pulp_axi/axi_pkg.sv vendor/pulp_axi/axi_intf.sv \
     vendor/cvfpu/fpnew_pkg.sv vendor/common_cells/cf_math_pkg.sv \

@@ -57,7 +57,10 @@ synth_design -top solo_top -part $part \
     -include_dirs [list $root/vendor/pulp_axi/include \
                         $root/vendor/common_cells/include $root/vendor/cvfpu] \
     -generic BOOT_HEX=$root/fw/build/boot.hex \
-    -flatten_hierarchy rebuilt
+    -flatten_hierarchy rebuilt -keep_equivalent_registers -fanout_limit 400 \
+    -resource_sharing off -no_lc -shreg_min_size 5 -retiming
+# Same settings as the CVA6 build (Flow_PerfOptimized_high + retiming): the
+# accelerator relies on its replicated registers surviving synthesis.
 source $root/scripts/timing_hook.tcl
 report_utilization -file $out/utilization_synth.rpt
 write_checkpoint -force $out/post_synth.dcp

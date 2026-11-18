@@ -2,9 +2,12 @@
    DDR must already hold the compact model (0xaf000000), the runtime scratch
    image (0xbe000000) and the per-token layer-0 sum table (SUM_TABLE).
 
-   Each token issues exactly the CVA6 runtime's production sequence
-   (host/trace/production_trace_2tok.txt): layer-0 norm pack, one 28-layer
-   sequencer command, output norm pack, hardware argmax.
+   Each token issues the CVA6 runtime's validated command-by-command layer
+   path (host/trace/production_trace_legacy.txt): per layer a norm pack,
+   fused QKV, attention, o-proj + residual, norm pack, fused up/gate, FFN
+   pack, down + residual; then the output norm and hardware argmax. The
+   one-command layer sequencer is not used: its retained-QKV attention mode
+   produces zero K/V (found in full-system simulation).
 
    Protocol (little-endian):
      'G' n_prompt n_generate token[n_prompt]
@@ -118,64 +121,182 @@ static uint32_t ddr_word(uint32_t address) {
   return *(volatile uint32_t *)address;
 }
 
+/* 30-bit physical byte address of a scratch offset, in 8-byte words. */
+static uint32_t scratch_words(uint32_t local) {
+  return ((SCRATCH_PHYS + local) & 0x3fffffffu) >> 3;
+}
+
+/* The 57 norm slots: 0-49 from 0xd0000, 50-56 from 0x202000, 24 KiB each:
+   output workspace at +0, FP32 residual at +0x2000, norm weight at +0x4000.
+   Layer l uses slot 2l (attention norm) and 2l+1 (FFN norm); slot 56 holds
+   the output norm. */
+static uint32_t slot_base(uint32_t slot) {
+  return slot < 50u ? 0x000d0000u + slot * 0x6000u
+                    : 0x00202000u + (slot - 50u) * 0x6000u;
+}
+
+static uint32_t layer_weights[LAYERS][4]; /* qkv, attn_out, up/gate, down */
+
+/* Packed Q1 matvec (mode 5) writing compact FP32 rows. */
+static int matvec(uint32_t weight_words, uint32_t config, uint32_t output_words,
+                  uint32_t columns, uint32_t rows, uint32_t stage) {
+  uint32_t done = old_done();
+  write_register(0u, weight_words);
+  write_register(1u, INPUT_WORDS & 0x01ffffffu);
+  write_register(6u, config);
+  write_register(2u, output_words & 0x01ffffffu);
+  write_register(3u, columns);
+  write_register(4u, rows);
+  uint32_t status = run(5u, done);
+  if (status & STATUS_ERROR) {
+    fail(stage, status);
+    return 0;
+  }
+  return 1;
+}
+
+/* Projection followed by the chained residual add into next_residual.
+   Returns the FP32 sum of squares of the new residual, or 0xffffffff. */
+static uint32_t matvec_residual(uint32_t weight_words, uint32_t columns,
+                                uint32_t workspace_local,
+                                uint32_t next_residual_local, uint32_t stage) {
+  uint32_t output_words = scratch_words(workspace_local);
+  uint32_t chain_words = scratch_words(next_residual_local);
+  uint32_t done = old_done();
+  write_register(0u, weight_words);
+  write_register(1u, INPUT_WORDS & 0x01ffffffu);
+  write_register(7u, chain_words & 0x01ffffffu);
+  write_register(6u, (INPUT_WORDS >> 25) | ((output_words >> 25) << 3) | 32u |
+                     64u | (1u << 10) | (((chain_words >> 25) & 3u) << 11) |
+                     (1u << 13));
+  write_register(2u, output_words & 0x01ffffffu);
+  write_register(3u, columns);
+  write_register(4u, DIM);
+  uint32_t status = run(5u, done);
+  if (status & STATUS_ERROR) {
+    fail(stage, status);
+    return 0xffffffffu;
+  }
+  uint32_t sum_bits = (status >> 8) & 0x0003ffffu;
+  write_register(6u, (output_words >> 25) | 4u | ((chain_words >> 25) << 3) |
+                     32u | 0x01000000u);
+  sum_bits |= ((ACCEL_STATUS >> 8) & 0x00003fffu) << 18;
+  return sum_bits;
+}
+
+#define ATTENTION_TABLE_LOCAL 0x00200000u
+#define QK_TABLE_LOCAL 0x00291000u
+#define ROPE_TABLE_LOCAL 0x00300000u
+
+static void copy_beats(uint32_t destination, uint32_t source, uint32_t beats) {
+  BEAT_STROBE = 0xffffffffu;
+  for (uint32_t beat = 0; beat < beats; ++beat) {
+    beat_read(source + 32u * beat);
+    BEAT_ADDRESS = (destination + 32u * beat) & 0x3fffffffu;
+    BEAT_CONTROL = BEAT_WRITE;
+  }
+}
+
+/* The attention command reads a 1,536-byte table: the layer's fixed-point
+   Q/K norm weights (1,024 bytes) then the position's RoPE cos/sin (512). */
+static void stage_attention_table(uint32_t layer, uint32_t position) {
+  uint32_t table = SCRATCH_PHYS + ATTENTION_TABLE_LOCAL;
+  copy_beats(table, SCRATCH_PHYS + QK_TABLE_LOCAL + 1024u * layer, 32u);
+  copy_beats(table + 1024u, SCRATCH_PHYS + ROPE_TABLE_LOCAL + 512u * position,
+             16u);
+}
+
+/* Accelerator mode 7 sub-commands (attention, FFN packing). */
+static int transform(uint32_t input_words, uint32_t config, uint32_t ne0,
+                     uint32_t ne1, uint32_t stage) {
+  uint32_t done = old_done();
+  write_register(1u, input_words & 0x01ffffffu);
+  write_register(2u, INPUT_WORDS & 0x01ffffffu);
+  write_register(6u, config);
+  write_register(3u, ne0);
+  write_register(4u, ne1);
+  uint32_t status = run(7u, done);
+  if (status & STATUS_ERROR) {
+    fail(stage, status);
+    return 0;
+  }
+  return 1;
+}
+
+static void load_layer_weights(void) {
+  for (uint32_t layer = 0; layer < LAYERS; ++layer)
+    for (uint32_t i = 0; i < 4u; ++i)
+      layer_weights[layer][i] =
+          ddr_word(SCRATCH_PHYS + DESCRIPTOR_LOCAL + 64u * layer + 8u + 4u * i);
+}
+
+/* One token through the CVA6 runtime's validated eight-command layer path
+   (host/trace/production_trace_legacy.txt). */
 static uint32_t forward(uint32_t token, uint32_t position,
                         uint32_t profile[6]) {
   uint64_t t0 = cycles();
   embed(token);
   uint32_t sum_bits = ddr_word(SUM_TABLE + 4u * token);
-  uint32_t scale_bits = rms_scale_bits(sum_bits, 11u);
   uint64_t t1 = cycles();
-  if (!pack_norm(LAYER0_SLOT_RESIDUAL, scale_bits, 1u)) return 0xffffffffu;
-  uint64_t t2 = cycles();
-
-  /* All 28 layers in one sequencer command (accelerator mode 7, ne1 = 6). */
-  uint32_t descriptor_address = (SCRATCH_PHYS + DESCRIPTOR_LOCAL) & 0x3fffffffu;
-  uint32_t descriptor_words = descriptor_address >> 3;
-  uint32_t incoming_sum_bits = 0u;
-  uint32_t address_config = (descriptor_words >> 25) | 4u |
-      ((incoming_sum_bits >> 25) << 7) | (1u << 14);
-  uint32_t done = old_done();
-  write_register(0u, descriptor_words & 0x01ffffffu);
-  write_register(1u, 0u);
-  write_register(2u, 0u);
-  write_register(3u, (0u << 17) | (LAYERS << 11) | position);
-  write_register(4u, 6u);
-  write_register(6u, address_config);
-  write_register(7u, incoming_sum_bits & 0x01ffffffu);
-  uint32_t status = run(7u, done);
-  if (status & STATUS_ERROR) {
-    fail(2u, status);
-    return 0xffffffffu;
+  uint64_t norm_cycles = 0u;
+  for (uint32_t layer = 0; layer < LAYERS; ++layer) {
+    uint32_t attn_slot = slot_base(2u * layer);
+    uint32_t ffn_slot = slot_base(2u * layer + 1u);
+    uint32_t next_slot = slot_base(2u * layer + 2u);
+    uint64_t n0 = cycles();
+    if (!pack_norm(attn_slot + 0x2000u, rms_scale_bits(sum_bits, 11u),
+                   0x10u + layer))
+      return 0xffffffffu;
+    norm_cycles += cycles() - n0;
+    if (!matvec(layer_weights[layer][0], 64u, OUTPUT_WORDS, DIM, 4096u,
+                0x40u + layer))
+      return 0xffffffffu;
+    stage_attention_table(layer, position);
+    if (!transform(OUTPUT_WORDS, 0u, (layer << 11) | position, 4u,
+                   0x60u + layer))
+      return 0xffffffffu;
+    sum_bits = matvec_residual(layer_weights[layer][1], DIM, attn_slot,
+                               ffn_slot + 0x2000u, 0x80u + layer);
+    if (sum_bits == 0xffffffffu) return sum_bits;
+    n0 = cycles();
+    if (!pack_norm(ffn_slot + 0x2000u, rms_scale_bits(sum_bits, 11u),
+                   0xa0u + layer))
+      return 0xffffffffu;
+    norm_cycles += cycles() - n0;
+    if (!matvec(layer_weights[layer][2], 64u | (1u << 14), OUTPUT_WORDS, DIM,
+                12288u, 0xc0u + layer))
+      return 0xffffffffu;
+    if (!transform(OUTPUT_WORDS, 64u | (1u << 14), 6144u, 1u, 0xe0u + layer))
+      return 0xffffffffu;
+    sum_bits = matvec_residual(layer_weights[layer][3], 6144u, ffn_slot,
+                               next_slot + 0x2000u, 0x100u + layer);
+    if (sum_bits == 0xffffffffu) return sum_bits;
   }
-  uint32_t final_sum_bits = (status >> 8) & 0x0003ffffu;
-  write_register(6u, address_config | 0x01000000u);
-  final_sum_bits |= ((ACCEL_STATUS >> 8) & 0x00003fffu) << 18;
   uint64_t t3 = cycles();
 
-  if (!pack_norm(OUTPUT_SLOT_RESIDUAL, rms_scale_bits(final_sum_bits, 11u),
-                 3u))
+  if (!pack_norm(OUTPUT_SLOT_RESIDUAL, rms_scale_bits(sum_bits, 11u), 3u))
     return 0xffffffffu;
   uint64_t t4 = cycles();
 
   /* Hardware argmax over the tied embedding (packed Q1 argmax, mode 6). */
-  done = old_done();
+  uint32_t done = old_done();
   write_register(0u, EMBEDDING_OFFSET >> 3);
   write_register(1u, INPUT_WORDS & 0x01ffffffu);
   write_register(6u, 0u);
   write_register(2u, OUTPUT_WORDS & 0x01ffffffu);
   write_register(3u, DIM);
   write_register(4u, VOCAB);
-  status = run(6u, done);
+  uint32_t status = run(6u, done);
   if (status & STATUS_ERROR) {
     fail(4u, status);
     return 0xffffffffu;
   }
   uint64_t t5 = cycles();
-  profile[0] = (uint32_t)(t1 - t0); /* embedding + layer-0 scale */
-  profile[1] = (uint32_t)(t2 - t1); /* layer-0 norm pack */
-  profile[2] = (uint32_t)(t3 - t2); /* 28-layer sequencer */
-  profile[3] = (uint32_t)(t4 - t3); /* output norm pack */
-  profile[4] = (uint32_t)(t5 - t4); /* argmax */
+  profile[0] = (uint32_t)(t1 - t0);          /* embedding */
+  profile[1] = (uint32_t)norm_cycles;        /* 56 norm packs */
+  profile[2] = (uint32_t)(t3 - t1 - norm_cycles); /* layer kernels */
+  profile[3] = (uint32_t)(t4 - t3);          /* output norm pack */
+  profile[4] = (uint32_t)(t5 - t4);          /* argmax */
   profile[5] = (uint32_t)(t5 - t0);
   return (status >> 8) & 0x0003ffffu;
 }
@@ -193,6 +314,7 @@ __attribute__((section(".text.start"))) void app_main(void) {
     }
     toggle = 0u;
     position = 0u;
+    load_layer_weights();
     initialized = 0x50504153u;
   }
   LEDS = 0x08u;
