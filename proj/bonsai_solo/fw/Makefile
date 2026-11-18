@@ -4,7 +4,7 @@ CFLAGS := -march=rv32im -mabi=ilp32 -O2 -ffreestanding -fno-builtin \
 	-nostdlib -nostartfiles -Wall -Wextra -fno-pic -mcmodel=medlow
 BUILD := build
 
-all: $(BUILD)/boot.hex $(BUILD)/bonsai.bin
+all: $(BUILD)/boot.hex $(BUILD)/bonsai.bin $(BUILD)/sim_boot.hex
 
 $(BUILD):
 	mkdir -p $@
@@ -24,3 +24,7 @@ $(BUILD)/boot.hex: $(BUILD)/monitor.bin
 
 clean:
 	rm -rf $(BUILD)
+
+# Simulation image: monitor plus the Bonsai app preloaded at 0x1000.
+$(BUILD)/sim_boot.hex: $(BUILD)/monitor.bin $(BUILD)/bonsai.bin
+	python3 -c "import struct; m=open('$(BUILD)/monitor.bin','rb').read(); a=open('$(BUILD)/bonsai.bin','rb').read(); d=bytearray(65536); d[0:len(m)]=m; d[0x1000:0x1000+len(a)]=a; w=struct.unpack('<16384I',bytes(d)); open('$@','w').write(''.join('%08x\n'%x for x in w))"

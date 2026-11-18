@@ -16,3 +16,6 @@ node_modules/
 
 # Copyrighted source video for the bad apple demo.
 proj/sw/bad_apple/assets/*.mp4
+proj/bonsai_solo/fw/build/
+proj/bonsai_solo/build/
+proj/bonsai_solo/sim/obj/

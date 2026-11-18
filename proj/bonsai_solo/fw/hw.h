@@ -62,11 +62,22 @@ static inline void beat_read(uint32_t ddr_address) {
   BEAT_CONTROL = BEAT_READ;
 }
 
+/* Table-driven CRC32; the monitor builds the table at boot. BRAM layout:
+   monitor 0x0000-0x0fff, app 0x1000-0xcfff, CRC table 0xd000-0xd3ff,
+   stack below 0x10000. */
+#define CRC_TABLE ((volatile uint32_t *)0x0000d000u)
+
+static inline void crc32_init_table(void) {
+  for (uint32_t i = 0; i < 256u; ++i) {
+    uint32_t crc = i;
+    for (int bit = 0; bit < 8; ++bit)
+      crc = (crc >> 1) ^ ((crc & 1u) ? 0xedb88320u : 0u);
+    CRC_TABLE[i] = crc;
+  }
+}
+
 static inline uint32_t crc32_update(uint32_t crc, uint8_t byte) {
-  crc ^= byte;
-  for (int bit = 0; bit < 8; ++bit)
-    crc = (crc >> 1) ^ ((crc & 1u) ? 0xedb88320u : 0u);
-  return crc;
+  return (crc >> 8) ^ CRC_TABLE[(crc ^ byte) & 0xffu];
 }
 
 #endif

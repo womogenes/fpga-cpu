@@ -33,19 +33,23 @@ module solo_top #(
     output logic        fan_pwm
 );
 
-    localparam integer ADDR_WIDTH = 64;
-    localparam integer DATA_WIDTH = 256;
-    localparam integer ID_WIDTH   = 5;
-    localparam integer USER_WIDTH = 1;
-
     logic clk;
     logic ui_reset;
     logic calib_done;
 
-    AXI_BUS #(
-        .AXI_ADDR_WIDTH(ADDR_WIDTH), .AXI_DATA_WIDTH(DATA_WIDTH),
-        .AXI_ID_WIDTH(ID_WIDTH), .AXI_USER_WIDTH(USER_WIDTH)
-    ) ctrl_bus (), accel_bus (), accel_cut (), mig_bus ();
+    logic [4:0]   m_axi_awid, m_axi_bid, m_axi_arid, m_axi_rid;
+    logic [29:0]  m_axi_awaddr, m_axi_araddr;
+    logic [7:0]   m_axi_awlen, m_axi_arlen;
+    logic [2:0]   m_axi_awsize, m_axi_arsize, m_axi_awprot, m_axi_arprot;
+    logic [1:0]   m_axi_awburst, m_axi_arburst, m_axi_bresp, m_axi_rresp;
+    logic         m_axi_awlock, m_axi_arlock;
+    logic [3:0]   m_axi_awcache, m_axi_arcache, m_axi_awqos, m_axi_arqos;
+    logic         m_axi_awvalid, m_axi_awready, m_axi_wlast, m_axi_wvalid;
+    logic         m_axi_wready, m_axi_bready, m_axi_bvalid, m_axi_arvalid;
+    logic         m_axi_arready, m_axi_rready, m_axi_rlast, m_axi_rvalid;
+    logic [255:0] m_axi_wdata, m_axi_rdata;
+    logic [31:0]  m_axi_wstrb;
+    logic [7:0]   ctrl_led;
 
     // --------------------------------------------------------------- resets
     // Logic leaves reset once the UI clock is stable and DDR has calibrated.
@@ -84,63 +88,22 @@ module solo_top #(
         else fp_rst_sync <= {fp_rst_sync[1:0], rst_n};
     end
 
-    // ---------------------------------------------------------- accelerator
-    logic [31:0] accel_command;
-    logic [31:0] accel_status;
-    logic        bus_request;
-    logic        bus_grant;
-
-    lfm_matvec_accelerator #(
-        .ID_WIDTH  (ID_WIDTH),
-        .DATA_WIDTH(DATA_WIDTH)
-    ) i_accelerator (
-        .clk_i        (clk),
-        .fp_clk_i     (fp_clk),
-        .rst_ni       (rst_n),
-        .fp_rst_ni    (fp_rst_sync[2]),
-        .command_i    (accel_command),
-        .status_o     (accel_status),
-        .bus_request_o(bus_request),
-        .bus_grant_i  (bus_grant),
-        .axi          (accel_bus)
-    );
-
-    axi_cut_intf #(
-        .BYPASS    (1'b0),
-        .ADDR_WIDTH(ADDR_WIDTH),
-        .DATA_WIDTH(DATA_WIDTH),
-        .ID_WIDTH  (ID_WIDTH),
-        .USER_WIDTH(USER_WIDTH)
-    ) i_accel_cut (
-        .clk_i (clk),
-        .rst_ni(rst_n),
-        .in    (accel_bus),
-        .out   (accel_cut)
-    );
-
-    lfm_axi_arbiter i_arbiter (
-        .clk_i                (clk),
-        .rst_ni               (rst_n),
-        .accelerator_request_i(bus_request),
-        .accelerator_grant_o  (bus_grant),
-        .cpu                  (ctrl_bus),
-        .accelerator          (accel_cut),
-        .ddr                  (mig_bus)
-    );
-
-    // ----------------------------------------------------------- controller
-    logic [7:0] ctrl_led;
-
-    solo_ctrl #(.BOOT_HEX(BOOT_HEX)) i_ctrl (
-        .clk_i          (clk),
-        .rst_ni         (rst_n),
-        .calib_done_i   (calib_done),
-        .uart_rx_i      (rx),
-        .uart_tx_o      (tx),
-        .accel_command_o(accel_command),
-        .accel_status_i (accel_status),
-        .led_o          (ctrl_led),
-        .ddr            (ctrl_bus)
+    solo_core #(.BOOT_HEX(BOOT_HEX)) i_core (
+        .clk_i       (clk),
+        .fp_clk_i    (fp_clk),
+        .rst_ni      (rst_n),
+        .fp_rst_ni   (fp_rst_sync[2]),
+        .calib_done_i(calib_done),
+        .rx, .tx, .ctrl_led,
+        .m_axi_awid, .m_axi_awaddr, .m_axi_awlen, .m_axi_awsize,
+        .m_axi_awburst, .m_axi_awlock, .m_axi_awcache, .m_axi_awprot,
+        .m_axi_awqos, .m_axi_awvalid, .m_axi_awready, .m_axi_wdata,
+        .m_axi_wstrb, .m_axi_wlast, .m_axi_wvalid, .m_axi_wready,
+        .m_axi_bready, .m_axi_bid, .m_axi_bresp, .m_axi_bvalid,
+        .m_axi_arid, .m_axi_araddr, .m_axi_arlen, .m_axi_arsize,
+        .m_axi_arburst, .m_axi_arlock, .m_axi_arcache, .m_axi_arprot,
+        .m_axi_arqos, .m_axi_arvalid, .m_axi_arready, .m_axi_rready,
+        .m_axi_rid, .m_axi_rdata, .m_axi_rresp, .m_axi_rlast, .m_axi_rvalid
     );
 
     logic [26:0] heartbeat;
@@ -177,48 +140,46 @@ module solo_top #(
         .ui_clk             (clk),
         .ui_clk_sync_rst    (ui_reset),
         .aresetn            (!ui_reset),
-        .s_axi_awid         (mig_bus.aw_id),
-        .s_axi_awaddr       (mig_bus.aw_addr[29:0]),
-        .s_axi_awlen        (mig_bus.aw_len),
-        .s_axi_awsize       (mig_bus.aw_size),
-        .s_axi_awburst      (mig_bus.aw_burst),
-        .s_axi_awlock       (mig_bus.aw_lock),
-        .s_axi_awcache      (mig_bus.aw_cache),
-        .s_axi_awprot       (mig_bus.aw_prot),
-        .s_axi_awqos        (mig_bus.aw_qos),
-        .s_axi_awvalid      (mig_bus.aw_valid),
-        .s_axi_awready      (mig_bus.aw_ready),
-        .s_axi_wdata        (mig_bus.w_data),
-        .s_axi_wstrb        (mig_bus.w_strb),
-        .s_axi_wlast        (mig_bus.w_last),
-        .s_axi_wvalid       (mig_bus.w_valid),
-        .s_axi_wready       (mig_bus.w_ready),
-        .s_axi_bready       (mig_bus.b_ready),
-        .s_axi_bid          (mig_bus.b_id),
-        .s_axi_bresp        (mig_bus.b_resp),
-        .s_axi_bvalid       (mig_bus.b_valid),
-        .s_axi_arid         (mig_bus.ar_id),
-        .s_axi_araddr       (mig_bus.ar_addr[29:0]),
-        .s_axi_arlen        (mig_bus.ar_len),
-        .s_axi_arsize       (mig_bus.ar_size),
-        .s_axi_arburst      (mig_bus.ar_burst),
-        .s_axi_arlock       (mig_bus.ar_lock),
-        .s_axi_arcache      (mig_bus.ar_cache),
-        .s_axi_arprot       (mig_bus.ar_prot),
-        .s_axi_arqos        (mig_bus.ar_qos),
-        .s_axi_arvalid      (mig_bus.ar_valid),
-        .s_axi_arready      (mig_bus.ar_ready),
-        .s_axi_rready       (mig_bus.r_ready),
-        .s_axi_rid          (mig_bus.r_id),
-        .s_axi_rdata        (mig_bus.r_data),
-        .s_axi_rresp        (mig_bus.r_resp),
-        .s_axi_rlast        (mig_bus.r_last),
-        .s_axi_rvalid       (mig_bus.r_valid),
+        .s_axi_awid         (m_axi_awid),
+        .s_axi_awaddr       (m_axi_awaddr),
+        .s_axi_awlen        (m_axi_awlen),
+        .s_axi_awsize       (m_axi_awsize),
+        .s_axi_awburst      (m_axi_awburst),
+        .s_axi_awlock       (m_axi_awlock),
+        .s_axi_awcache      (m_axi_awcache),
+        .s_axi_awprot       (m_axi_awprot),
+        .s_axi_awqos        (m_axi_awqos),
+        .s_axi_awvalid      (m_axi_awvalid),
+        .s_axi_awready      (m_axi_awready),
+        .s_axi_wdata        (m_axi_wdata),
+        .s_axi_wstrb        (m_axi_wstrb),
+        .s_axi_wlast        (m_axi_wlast),
+        .s_axi_wvalid       (m_axi_wvalid),
+        .s_axi_wready       (m_axi_wready),
+        .s_axi_bready       (m_axi_bready),
+        .s_axi_bid          (m_axi_bid),
+        .s_axi_bresp        (m_axi_bresp),
+        .s_axi_bvalid       (m_axi_bvalid),
+        .s_axi_arid         (m_axi_arid),
+        .s_axi_araddr       (m_axi_araddr),
+        .s_axi_arlen        (m_axi_arlen),
+        .s_axi_arsize       (m_axi_arsize),
+        .s_axi_arburst      (m_axi_arburst),
+        .s_axi_arlock       (m_axi_arlock),
+        .s_axi_arcache      (m_axi_arcache),
+        .s_axi_arprot       (m_axi_arprot),
+        .s_axi_arqos        (m_axi_arqos),
+        .s_axi_arvalid      (m_axi_arvalid),
+        .s_axi_arready      (m_axi_arready),
+        .s_axi_rready       (m_axi_rready),
+        .s_axi_rid          (m_axi_rid),
+        .s_axi_rdata        (m_axi_rdata),
+        .s_axi_rresp        (m_axi_rresp),
+        .s_axi_rlast        (m_axi_rlast),
+        .s_axi_rvalid       (m_axi_rvalid),
         .init_calib_complete(calib_done),
         .device_temp        (),
         .sys_rst            (cpu_resetn)
     );
-    assign mig_bus.b_user = '0;
-    assign mig_bus.r_user = '0;
 
 endmodule

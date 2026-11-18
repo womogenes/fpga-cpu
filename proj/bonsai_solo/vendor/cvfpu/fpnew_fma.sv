@@ -105,15 +105,15 @@ module fpnew_fma #(
   // Input pipeline
   // ---------------
   // Input pipeline signals, index i holds signal after i register stages
-  logic                  [0:NUM_INP_REGS][2:0][WIDTH-1:0] inp_pipe_operands_q;
-  logic                  [0:NUM_INP_REGS][2:0]            inp_pipe_is_boxed_q;
-  fpnew_pkg::roundmode_e [0:NUM_INP_REGS]                 inp_pipe_rnd_mode_q;
-  fpnew_pkg::operation_e [0:NUM_INP_REGS]                 inp_pipe_op_q;
-  logic                  [0:NUM_INP_REGS]                 inp_pipe_op_mod_q;
-  TagType                [0:NUM_INP_REGS]                 inp_pipe_tag_q;
-  logic                  [0:NUM_INP_REGS]                 inp_pipe_mask_q;
-  AuxType                [0:NUM_INP_REGS]                 inp_pipe_aux_q;
-  logic                  [0:NUM_INP_REGS]                 inp_pipe_valid_q;
+  logic                  [0:NUM_INP_REGS][2:0][WIDTH-1:0] inp_pipe_operands_q /* verilator split_var */;
+  logic                  [0:NUM_INP_REGS][2:0]            inp_pipe_is_boxed_q /* verilator split_var */;
+  fpnew_pkg::roundmode_e [0:NUM_INP_REGS]                 inp_pipe_rnd_mode_q /* verilator split_var */;
+  fpnew_pkg::operation_e [0:NUM_INP_REGS]                 inp_pipe_op_q /* verilator split_var */;
+  logic                  [0:NUM_INP_REGS]                 inp_pipe_op_mod_q /* verilator split_var */;
+  TagType                [0:NUM_INP_REGS]                 inp_pipe_tag_q /* verilator split_var */;
+  logic                  [0:NUM_INP_REGS]                 inp_pipe_mask_q /* verilator split_var */;
+  AuxType                [0:NUM_INP_REGS]                 inp_pipe_aux_q /* verilator split_var */;
+  logic                  [0:NUM_INP_REGS]                 inp_pipe_valid_q /* verilator split_var */;
   // Ready signal is combinatorial for all stages
   logic [0:NUM_INP_REGS] inp_pipe_ready;
 
@@ -411,22 +411,22 @@ module fpnew_fma #(
   fp_t                           special_result_q;
   fpnew_pkg::status_t            special_status_q;
   // Internal pipeline signals, index i holds signal after i register stages
-  logic                  [0:NUM_MID_REGS]                         mid_pipe_eff_sub_q;
-  logic signed           [0:NUM_MID_REGS][EXP_WIDTH-1:0]          mid_pipe_exp_prod_q;
-  logic signed           [0:NUM_MID_REGS][EXP_WIDTH-1:0]          mid_pipe_exp_diff_q;
-  logic signed           [0:NUM_MID_REGS][EXP_WIDTH-1:0]          mid_pipe_tent_exp_q;
-  logic                  [0:NUM_MID_REGS][SHIFT_AMOUNT_WIDTH-1:0] mid_pipe_add_shamt_q;
-  logic                  [0:NUM_MID_REGS]                         mid_pipe_sticky_q;
-  logic                  [0:NUM_MID_REGS][3*PRECISION_BITS+3:0]   mid_pipe_sum_q;
-  logic                  [0:NUM_MID_REGS]                         mid_pipe_final_sign_q;
-  fpnew_pkg::roundmode_e [0:NUM_MID_REGS]                         mid_pipe_rnd_mode_q;
-  logic                  [0:NUM_MID_REGS]                         mid_pipe_res_is_spec_q;
-  fp_t                   [0:NUM_MID_REGS]                         mid_pipe_spec_res_q;
-  fpnew_pkg::status_t    [0:NUM_MID_REGS]                         mid_pipe_spec_stat_q;
-  TagType                [0:NUM_MID_REGS]                         mid_pipe_tag_q;
-  logic                  [0:NUM_MID_REGS]                         mid_pipe_mask_q;
-  AuxType                [0:NUM_MID_REGS]                         mid_pipe_aux_q;
-  logic                  [0:NUM_MID_REGS]                         mid_pipe_valid_q;
+  logic                  [0:NUM_MID_REGS]                         mid_pipe_eff_sub_q /* verilator split_var */;
+  logic signed           [0:NUM_MID_REGS][EXP_WIDTH-1:0]          mid_pipe_exp_prod_q /* verilator split_var */;
+  logic signed           [0:NUM_MID_REGS][EXP_WIDTH-1:0]          mid_pipe_exp_diff_q /* verilator split_var */;
+  logic signed           [0:NUM_MID_REGS][EXP_WIDTH-1:0]          mid_pipe_tent_exp_q /* verilator split_var */;
+  logic                  [0:NUM_MID_REGS][SHIFT_AMOUNT_WIDTH-1:0] mid_pipe_add_shamt_q /* verilator split_var */;
+  logic                  [0:NUM_MID_REGS]                         mid_pipe_sticky_q /* verilator split_var */;
+  logic                  [0:NUM_MID_REGS][3*PRECISION_BITS+3:0]   mid_pipe_sum_q /* verilator split_var */;
+  logic                  [0:NUM_MID_REGS]                         mid_pipe_final_sign_q /* verilator split_var */;
+  fpnew_pkg::roundmode_e [0:NUM_MID_REGS]                         mid_pipe_rnd_mode_q /* verilator split_var */;
+  logic                  [0:NUM_MID_REGS]                         mid_pipe_res_is_spec_q /* verilator split_var */;
+  fp_t                   [0:NUM_MID_REGS]                         mid_pipe_spec_res_q /* verilator split_var */;
+  fpnew_pkg::status_t    [0:NUM_MID_REGS]                         mid_pipe_spec_stat_q /* verilator split_var */;
+  TagType                [0:NUM_MID_REGS]                         mid_pipe_tag_q /* verilator split_var */;
+  logic                  [0:NUM_MID_REGS]                         mid_pipe_mask_q /* verilator split_var */;
+  AuxType                [0:NUM_MID_REGS]                         mid_pipe_aux_q /* verilator split_var */;
+  logic                  [0:NUM_MID_REGS]                         mid_pipe_valid_q /* verilator split_var */;
   // Ready signal is combinatorial for all stages
   logic [0:NUM_MID_REGS] mid_pipe_ready;
 
@@ -652,12 +652,12 @@ module fpnew_fma #(
   // Output Pipeline
   // ----------------
   // Output pipeline signals, index i holds signal after i register stages
-  fp_t                [0:NUM_OUT_REGS] out_pipe_result_q;
-  fpnew_pkg::status_t [0:NUM_OUT_REGS] out_pipe_status_q;
-  TagType             [0:NUM_OUT_REGS] out_pipe_tag_q;
-  logic               [0:NUM_OUT_REGS] out_pipe_mask_q;
-  AuxType             [0:NUM_OUT_REGS] out_pipe_aux_q;
-  logic               [0:NUM_OUT_REGS] out_pipe_valid_q;
+  fp_t                [0:NUM_OUT_REGS] out_pipe_result_q /* verilator split_var */;
+  fpnew_pkg::status_t [0:NUM_OUT_REGS] out_pipe_status_q /* verilator split_var */;
+  TagType             [0:NUM_OUT_REGS] out_pipe_tag_q /* verilator split_var */;
+  logic               [0:NUM_OUT_REGS] out_pipe_mask_q /* verilator split_var */;
+  AuxType             [0:NUM_OUT_REGS] out_pipe_aux_q /* verilator split_var */;
+  logic               [0:NUM_OUT_REGS] out_pipe_valid_q /* verilator split_var */;
   // Ready signal is combinatorial for all stages
   logic [0:NUM_OUT_REGS] out_pipe_ready;
 

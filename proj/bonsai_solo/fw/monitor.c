@@ -126,6 +126,7 @@ static void command_test(void) {
 }
 
 void monitor_main(void) {
+  crc32_init_table();
   LEDS = 0x04u;
   for (;;) {
     uint8_t command = uart_getc();
