@@ -164,6 +164,7 @@ module solo_ctrl #(
     logic         mmio_ready;
     logic [31:0]  mmio_rdata;
     logic         rx_read_wait;
+    logic         rx_read_valid;
 
     // DDR bridge requests from the MMIO beat port or the word window.
     typedef enum logic [2:0] {
@@ -196,6 +197,7 @@ module solo_ctrl #(
             rx_head             <= '0;
             rx_tail             <= '0;
             rx_read_wait        <= 1'b0;
+            rx_read_valid       <= 1'b0;
         end else begin
             cycles     <= cycles + 64'd1;
             mmio_ready <= 1'b0;
@@ -209,12 +211,16 @@ module solo_ctrl #(
                     end
                     8'h04: begin
                         // Wait one cycle so rx_head_byte reflects rx_head.
+                        // Validity is sampled in the same cycle as the
+                        // byte, so a byte landing mid-read is not returned
+                        // as a stale FIFO slot.
                         if (!rx_read_wait) begin
-                            rx_read_wait <= 1'b1;
+                            rx_read_wait  <= 1'b1;
+                            rx_read_valid <= rx_nonempty;
                         end else begin
                             rx_read_wait <= 1'b0;
-                            mmio_rdata   <= {rx_nonempty, 23'b0, rx_head_byte};
-                            if (rx_nonempty) rx_head <= rx_head + 1'b1;
+                            mmio_rdata   <= {rx_read_valid, 23'b0, rx_head_byte};
+                            if (rx_read_valid) rx_head <= rx_head + 1'b1;
                             mmio_ready   <= 1'b1;
                         end
                     end

@@ -34,11 +34,12 @@ static inline uint64_t cycles(void) {
 
 static inline void uart_putc(uint8_t c) { UART_TX = c; }
 
+/* Poll the status register first: on the first gateware the RX data
+   register can return a stale FIFO slot if a byte lands during the read. */
 static inline uint8_t uart_getc(void) {
-  for (;;) {
-    uint32_t value = UART_RX;
-    if (value & 0x80000000u) return (uint8_t)value;
+  while ((UART_STATUS & 1u) == 0u) {
   }
+  return (uint8_t)UART_RX;
 }
 
 static inline void uart_put_u32(uint32_t value) {

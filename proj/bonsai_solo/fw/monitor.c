@@ -134,7 +134,9 @@ void monitor_main(void) {
     case 'P':
       uart_putc(ACK);
       uart_putc('S'); uart_putc('O'); uart_putc('L'); uart_putc('O');
-      uart_putc((uint8_t)SYSTEM);
+      /* Bit 7 marks the relocated monitor running from 0xc000. */
+      uart_putc((uint8_t)(SYSTEM |
+                ((uint32_t)monitor_main >= 0xc000u ? 0x80u : 0u)));
       break;
     case 'W': command_write(); break;
     case 'R': command_read(); break;

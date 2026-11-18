@@ -21,6 +21,8 @@ import serial
 
 ACK, DONE, NAK = 0x06, 0x04, 0x15
 APP_ADDRESS = 0x1000
+MONITOR_RAM_ADDRESS = 0xC000
+FW_BUILD = Path(__file__).resolve().parent.parent / "fw/build"
 MODEL_PHYS = 0xAF000000
 SCRATCH_PHYS = 0xBE000000
 SUM_TABLE_PHYS = 0xBF000000
@@ -32,12 +34,22 @@ CHUNK = 1 << 20
 
 class Board:
     def __init__(self, port: str, baud: int = 3_000_000) -> None:
-        self.serial = serial.Serial(port, baud, timeout=5)
+        # exclusive=True takes an flock; other tools that scan USB serial
+        # ports (a drone bridge on this host) skip locked ports.
+        self.serial = serial.Serial(port, baud, timeout=5, exclusive=True)
         self.serial.reset_input_buffer()
 
     def read(self, count: int, timeout: float = 5.0) -> bytes:
         self.serial.timeout = timeout
-        data = self.serial.read(count)
+        data = b""
+        deadline = time.monotonic() + timeout
+        while len(data) < count and time.monotonic() < deadline:
+            try:
+                data += self.serial.read(count - len(data))
+            except serial.SerialException:
+                # pyserial reports a spurious "readiness but no data" on
+                # this FT232R; the bytes arrive on the next read.
+                time.sleep(0.01)
         if len(data) != count:
             raise TimeoutError(f"expected {count} bytes, got {data!r}")
         return data
@@ -50,14 +62,45 @@ class Board:
     def u32(self, timeout: float = 5.0) -> int:
         return struct.unpack("<I", self.read(4, timeout))[0]
 
-    def ping(self) -> bool:
-        self.serial.reset_input_buffer()
-        self.serial.write(b"P")
-        self.expect_ack()
+    def ping(self, attempts: int = 5) -> bool:
+        # The first bytes after opening the port are sometimes dropped.
+        for attempt in range(attempts):
+            self.serial.reset_input_buffer()
+            self.serial.write(b"P")
+            try:
+                self.expect_ack(timeout=1.0)
+                break
+            except TimeoutError:
+                if attempt + 1 == attempts:
+                    raise
         ident = self.read(5)
         if ident[:4] != b"SOLO":
             raise RuntimeError(f"unexpected monitor id {ident!r}")
+        self.relocated = bool(ident[4] & 0x80)
         return bool(ident[4] & 1)
+
+    def bootstrap(self, monitor: bytes) -> None:
+        """Replace the boot ROM monitor (whose UART reads can race on the
+        first gateware) with the fixed copy at 0xc000."""
+        self.ping()
+        if self.relocated:
+            return
+        for attempt in range(5):
+            try:
+                self.write(MONITOR_RAM_ADDRESS, monitor)
+                break
+            except RuntimeError as error:
+                print(f"monitor upload retry: {error}")
+                time.sleep(0.2)
+                self.ping()
+        else:
+            raise RuntimeError("could not upload the relocated monitor")
+        self.serial.write(b"J" + struct.pack("<I", MONITOR_RAM_ADDRESS))
+        self.expect_ack()
+        time.sleep(0.05)
+        self.ping()
+        if not self.relocated:
+            raise RuntimeError("relocated monitor did not start")
 
     def write(self, address: int, data: bytes) -> None:
         self.serial.write(b"W" + struct.pack("<II", address, len(data)))
@@ -140,7 +183,9 @@ def main() -> None:
 
     board = Board(args.port)
     calibrated = board.ping()
-    print(f"monitor up, DDR calibrated={calibrated}")
+    board.bootstrap((FW_BUILD / "monitor_ram.bin").read_bytes())
+    print(f"monitor up (relocated={board.relocated}), "
+          f"DDR calibrated={calibrated}")
     if args.command == "ping":
         return
     if args.command == "memtest":
